@@ -1272,6 +1272,9 @@ pub(crate) struct Owner {
     history: Option<Arc<nzbd_state::history::HistoryDb>>,
 
     state_dir: PathBuf,
+    /// Where the terminal store (`artifacts.sqlite`, the artifact inventory)
+    /// lives: the path an out-of-space terminal write is reported against.
+    terminal_store_dir: PathBuf,
     persistence: Persistence,
     persistence_callbacks: HashMap<u64, Continuation>,
     // Saturated journal admission is covered by one coalesced owner snapshot.
@@ -1795,6 +1798,7 @@ impl Owner {
             applied_torrent_limit: None,
             history,
             state_dir: state_dir.to_path_buf(),
+            terminal_store_dir: artifact_dir.unwrap_or(state_dir).to_path_buf(),
             persistence: Persistence::start(
                 journal,
                 SnapshotStore::open(state_dir)?,
@@ -9226,6 +9230,7 @@ impl Owner {
             op,
             crate::space_probe::SpaceFailure {
                 path,
+                whence: whence.to_string(),
                 observed: self.enospc_observed,
                 volumes,
             },
@@ -9237,8 +9242,8 @@ impl Owner {
             tracing::error!(
                 whence,
                 observed = self.enospc_observed,
-                "out of space on a configured write volume — holding all downloads (observed from a \
-                 write, not from the free-space probe)"
+"out of space — holding all downloads (reported by a write or a capacity reservation, \
+                 not by the free-space probe)"
             );
         }
         if !self.disk_low {
@@ -9246,6 +9251,41 @@ impl Owner {
             self.pause_incomplete_torrents_for_storage();
             self.publish_now();
         }
+    }
+
+    /// The latched failures as the operator reads them: what failed, where,
+    /// and which configured volume that is — resolved against the same
+    /// readings the storage panel shows, so the banner and the panel name
+    /// the volume the same way.
+    fn space_failure_snapshots(
+        &self,
+        reading: &DiskGuardReading,
+    ) -> Vec<crate::snapshot::SpaceFailureSnapshot> {
+        use crate::space_probe::SpaceOp;
+        self.enospc_failures
+            .iter()
+            .map(|(op, failure)| {
+                let path = failure.path.clone();
+                let volume = path
+                    .as_deref()
+                    .and_then(|path| crate::volumes::volume_containing(&reading.volumes, path));
+                crate::snapshot::SpaceFailureSnapshot {
+                    operation: match op {
+                        SpaceOp::Write { .. } => "download write",
+                        SpaceOp::Finalize { .. } => "publish",
+                        SpaceOp::Post { .. } => "post-processing",
+                        SpaceOp::Terminal => "terminal store",
+                        SpaceOp::Directory(_) => "write",
+                    }
+                    .to_owned(),
+                    detail: failure.whence.clone(),
+                    path: path.map(|path| path.to_string_lossy().into_owned()),
+                    volume: volume.map(|(volume, _)| volume.name()),
+                    volume_label: volume.map(|(volume, _)| volume.label.clone()),
+                    volume_path: volume.map(|(_, root)| root.to_string_lossy().into_owned()),
+                }
+            })
+            .collect()
     }
 
     /// Operator resume clears the latch: they have been told what
@@ -10923,6 +10963,7 @@ impl Owner {
                 .collect(),
             enospc_observed: self.enospc_observed,
             enospc_where: self.enospc_where.clone(),
+            enospc_failures: self.space_failure_snapshots(disk_guard),
             blocked_servers,
             health_abort: self.tuning.health_abort,
             server_volumes: {

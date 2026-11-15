@@ -71,6 +71,9 @@ pub(crate) struct GuardedVolume {
 pub(crate) struct SpaceFailure {
     /// The file whose write failed (Write) or the directory (Directory).
     pub path: Option<PathBuf>,
+    /// What the reporter said it was doing, as the operator should read it
+    /// (operation and path when the reporter knew one).
+    pub whence: String,
     /// The engine's ENOSPC count when this failure was last reported: a
     /// probe started before a newer report of the same failure proves nothing.
     pub observed: u64,
@@ -605,6 +608,7 @@ mod tests {
         }
         let mut failure = SpaceFailure {
             path: None,
+            whence: String::new(),
             observed: 1,
             volumes: vec![GuardedVolume {
                 root: root.clone(),
@@ -637,6 +641,7 @@ mod tests {
     fn the_failure_records_its_deepest_volume() {
         let failure = SpaceFailure {
             path: None,
+            whence: String::new(),
             observed: 1,
             volumes: vec![
                 volume("/mnt", Some(1)),
@@ -667,6 +672,7 @@ mod tests {
     fn grouped_member_roots_are_bounded_and_probed_once() {
         let failure = SpaceFailure {
             path: None,
+            whence: String::new(),
             observed: 1,
             volumes: vec![
                 volume("/downloads", Some(7)),
@@ -700,6 +706,7 @@ mod tests {
         let device = device_of(&downloads);
         let failure = SpaceFailure {
             path: None,
+            whence: String::new(),
             observed: 1,
             volumes: vec![
                 GuardedVolume {

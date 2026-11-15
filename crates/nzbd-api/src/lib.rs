@@ -515,6 +515,10 @@ pub struct StatusDto {
     pub enospc_observed: u64,
     /// Operation and path of the last one.
     pub enospc_where: Option<String>,
+    /// Every out-of-space failure currently holding intake: what failed,
+    /// the path, and the configured volume that path is on (named as the
+    /// `storage` rows name it). Empty when no write-observed hold is set.
+    pub enospc_failures: Vec<nzbd_engine::snapshot::SpaceFailureSnapshot>,
     pub quota_reached: bool,
     pub blocked_servers: Vec<u32>,
     /// Critical-health abort armed (`[post] health_action` park/delete)?
@@ -689,6 +693,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         disk_guard_all_roots_known: snap.disk_guard_all_roots_known,
         enospc_observed: snap.enospc_observed,
         enospc_where: snap.enospc_where.clone(),
+        enospc_failures: snap.enospc_failures.clone(),
         quota_reached: snap.quota_reached,
         blocked_servers: snap.blocked_servers.clone(),
         health_abort: snap.health_abort,

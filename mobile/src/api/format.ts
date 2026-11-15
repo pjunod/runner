@@ -1,4 +1,4 @@
-import { JobStatus, JobSummary, StatusDto, StoragePath } from './types';
+import { JobStatus, JobSummary, SpaceFailure, StatusDto, StoragePath } from './types';
 
 const UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
 export const DEFAULT_NZBD_PORT = 6789;
@@ -27,6 +27,20 @@ export function formatDuration(seconds: number): string {
   return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
 }
 
+/** Where a write ran out of space, named as the storage panel names the
+ * volume; a failure with no recorded path says the volume is unknown. */
+export function spaceFailureText(failure: SpaceFailure): string {
+  const where = failure.volume
+    ? `${failure.volume} (${failure.volume_path ?? ''})`
+    : failure.path
+      ? `${failure.path} (not under any configured storage root)`
+      : 'an unknown volume (the failing write recorded no path)';
+  const detail = failure.detail || failure.operation;
+  const path =
+    failure.path && !detail.includes(failure.path) ? ` [${failure.path}]` : '';
+  return `${where} — ${detail}${path}`;
+}
+
 export function diskGuardMessage(status: StatusDto): string | null {
   if (!status.disk_low) return null;
   const hasMultiRootEvidence =
@@ -39,9 +53,15 @@ export function diskGuardMessage(status: StatusDto): string | null {
     return 'Downloads are held because the destination volume is low on space.';
   }
   if (status.disk_guard_write_latched) {
-    return `Downloads are held because a write ran out of space${
-      status.enospc_where ? `: ${status.enospc_where}` : ''
-    }.`;
+    const failures = status.enospc_failures ?? [];
+    if (failures.length === 0) {
+      return `Downloads are held because a write ran out of space${
+        status.enospc_where ? `: ${status.enospc_where}` : ''
+      }.`;
+    }
+    return `Downloads are held because a write ran out of space on ${failures
+      .map(spaceFailureText)
+      .join('; ')}.`;
   }
   if (status.disk_guard_all_roots_known === false) {
     const known = status.disk_guard_free_bytes;

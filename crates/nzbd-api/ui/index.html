@@ -3418,6 +3418,27 @@ function applyStorageRow(row, m, d) {
 }
 KINDS.storage = { build: buildStorageRow, apply: applyStorageRow };
 
+// A write-observed out-of-space hold names the volume and path that
+// failed, as the storage panel names the volume. A failure whose writer
+// recorded no path says the volume is unknown rather than implying it was
+// one of the configured ones.
+function enospcHoldText(s) {
+  const failures = Array.isArray(s.enospc_failures) ? s.enospc_failures : [];
+  if (!failures.length) {
+    return `out of space — downloads held${s.enospc_where ? " (" + s.enospc_where + ")" : ""}; resume the queue once space is free`;
+  }
+  const one = f => {
+    const where = f.volume
+      ? `${f.volume.toUpperCase()} ${f.volume_path}`
+      : f.path ? `${f.path} (not under any configured storage root)`
+      : "an unknown volume (the failing write recorded no path)";
+    const detail = f.detail || f.operation;
+    const path = f.path && !detail.includes(f.path) ? ` [${f.path}]` : "";
+    return `${where} — ${detail}${path}`;
+  };
+  return `out of space on ${failures.map(one).join("; ")} — downloads held; resume the queue once space is free`;
+}
+
 function renderStorage(s) {
   const overview = $("overview"), panel = $("storage-panel"), list = $("storage-list");
   if (!panel || !list) return;
@@ -3724,7 +3745,7 @@ function renderStatus() {
       : !s.disk_guard_write_latched && s.disk_guard_free_bytes == null
       ? "checking configured storage before downloads begin"
       : s.disk_guard_write_latched
-      ? `out of space on a configured write volume — downloads held (observed from a write${s.enospc_where ? ": " + s.enospc_where : ""}); resume the queue once space is free`
+      ? enospcHoldText(s)
       : `low disk space on ${limitingRoot}${limitingFree} — downloads held until space is freed`);
   }
   if (s.quota_reached) holds.push("download quota reached — normal jobs held (force-priority still runs)");

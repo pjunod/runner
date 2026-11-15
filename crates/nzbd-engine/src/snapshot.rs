@@ -240,6 +240,27 @@ pub struct ServerVolume {
     pub rate_bps: u64,
 }
 
+/// One out-of-space failure that is currently holding intake.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpaceFailureSnapshot {
+    /// What kind of write failed: `download write`, `publish`,
+    /// `post-processing`, `terminal store` or `write`.
+    pub operation: String,
+    /// What the reporter said, verbatim (operation and path when known).
+    pub detail: String,
+    /// The file or directory whose write failed. `None` when the reporter
+    /// could not say — the volume is then unknown, not "one of them".
+    pub path: Option<String>,
+    /// The storage-panel name of the volume holding `path` (`processing`,
+    /// `completed`, …), from the same readings the panel shows. `None`
+    /// when `path` is unknown or on no configured root.
+    pub volume: Option<String>,
+    /// The configured roles on that volume, joined with ` · `.
+    pub volume_label: Option<String>,
+    /// The configured root `path` is under.
+    pub volume_path: Option<String>,
+}
+
 /// The enforcing disk guard's cached evidence for one filesystem.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageVolumeSnapshot {
@@ -338,6 +359,12 @@ pub struct QueueSnapshot {
     /// (operation and path, as the fsx layer stamped it).
     #[serde(default)]
     pub enospc_where: Option<String>,
+    /// Every out-of-space failure currently holding intake, one per failed
+    /// operation, each resolved to the configured volume its path is on.
+    /// `enospc_where` is only the latest report's text; this is what says
+    /// which volume and which path.
+    #[serde(default)]
+    pub enospc_failures: Vec<SpaceFailureSnapshot>,
     /// Per-server session/day/month volume counters (this node).
     pub server_volumes: Vec<ServerVolume>,
     /// Servers currently blocked after connect failures (retrying on a

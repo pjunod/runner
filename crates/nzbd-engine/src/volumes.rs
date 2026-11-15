@@ -276,6 +276,31 @@ pub struct StorageVolumeReading {
     pub members: Vec<StorageMemberReading>,
 }
 
+/// The volume holding `path` and the configured root it is under: the
+/// deepest member root that contains it (a volume with no members is its
+/// own root). `None` when no configured root contains the path.
+pub fn volume_containing<'a>(
+    volumes: &'a [StorageVolumeReading],
+    path: &Path,
+) -> Option<(&'a StorageVolumeReading, &'a Path)> {
+    volumes
+        .iter()
+        .flat_map(|volume| {
+            let roots: Vec<&Path> = if volume.members.is_empty() {
+                vec![volume.path.as_path()]
+            } else {
+                volume
+                    .members
+                    .iter()
+                    .map(|member| member.path.as_path())
+                    .collect()
+            };
+            roots.into_iter().map(move |root| (volume, root))
+        })
+        .filter(|(_, root)| !root.as_os_str().is_empty() && path.starts_with(root))
+        .max_by_key(|(_, root)| root.components().count())
+}
+
 /// One configured root of a [`StorageVolumeReading`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageMemberReading {
@@ -957,6 +982,56 @@ pub fn free_space(path: &Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    fn reading(path: &str, members: &[&str]) -> StorageVolumeReading {
+        StorageVolumeReading {
+            label: path.to_owned(),
+            path: PathBuf::from(path),
+            available_bytes: None,
+            total_bytes: None,
+            device_id: None,
+            current: true,
+            roles: Vec::new(),
+            members: members
+                .iter()
+                .map(|member| StorageMemberReading {
+                    path: PathBuf::from(member),
+                    parent_device_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_failing_path_resolves_to_its_volume_by_whole_components() {
+        let volumes = [reading("/processing", &[]), reading("/processing2", &[])];
+        let (volume, root) =
+            volume_containing(&volumes, Path::new("/processing2/job/a.mkv")).unwrap();
+        assert_eq!(volume.path, Path::new("/processing2"));
+        assert_eq!(root, Path::new("/processing2"));
+        assert!(volume_containing(&volumes, Path::new("/processingx/a")).is_none());
+        assert!(volume_containing(&volumes, Path::new("/state/a")).is_none());
+    }
+
+    #[test]
+    fn the_deepest_configured_root_wins_across_members_and_nested_volumes() {
+        // Two bind mounts of one filesystem share a volume whose `path` is
+        // their common parent; a nested root on another filesystem is its own.
+        let volumes = [
+            reading("/", &["/downloads", "/media"]),
+            reading("/downloads/incoming", &[]),
+        ];
+        let (volume, root) = volume_containing(&volumes, Path::new("/media/tv/x.mkv")).unwrap();
+        assert_eq!(volume.path, Path::new("/"));
+        assert_eq!(root, Path::new("/media"));
+        let (volume, root) =
+            volume_containing(&volumes, Path::new("/downloads/incoming/x.part")).unwrap();
+        assert_eq!(volume.path, Path::new("/downloads/incoming"));
+        assert_eq!(root, Path::new("/downloads/incoming"));
+        // A volume with members is matched by its members, not its common
+        // parent: `/` is not a configured root.
+        assert!(volume_containing(&volumes, Path::new("/etc/passwd")).is_none());
+    }
     use super::*;
 
     struct ReleaseProbeGateOnDrop(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
