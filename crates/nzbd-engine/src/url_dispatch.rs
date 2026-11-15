@@ -42,6 +42,13 @@ pub(crate) async fn run_with_retry(
             .map(|job| job.id)
             .collect();
         attempts.retain(|job, _| pending.contains(job));
+        // An operator "retry now" is the one hint that may cut a dispatch
+        // backoff short; queue epochs and worker exits never do.
+        for job in handle.url_retry_kicks.take_dispatch() {
+            if let Some(attempt) = attempts.get_mut(&job) {
+                attempt.retry_at = None;
+            }
+        }
         duplicates.retain(|job, _| pending.contains(job));
         let active = handle
             .url_fetches

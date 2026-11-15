@@ -53,7 +53,7 @@ use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
 use nzbd_types::{Job, JobId, ServerDef, TlsMode};
 use owner::{EngineMsg, Owner, QueueCommand};
 use rate::{RateLimiter, SpeedMeter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -810,6 +810,7 @@ impl Engine {
             budget_tracker,
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
             url_fetch_wakeup: Arc::new(tokio::sync::Notify::new()),
+            url_retry_kicks: Default::default(),
             hold_probes: Arc::new(Mutex::new(HashSet::new())),
             recovery_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             post_scope: None,
@@ -927,6 +928,7 @@ pub struct EngineHandle {
     budget_tracker: Arc<pool::BudgetTracker>,
     url_fetches: Arc<Mutex<HashSet<JobId>>>,
     url_fetch_wakeup: Arc<tokio::sync::Notify>,
+    url_retry_kicks: Arc<UrlRetryKicks>,
     hold_probes: Arc<Mutex<HashSet<JobId>>>,
     recovery_cursor: Arc<std::sync::atomic::AtomicUsize>,
     post_scope: Option<PostAdmission>,
@@ -935,7 +937,65 @@ pub struct EngineHandle {
     shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Operator "retry now" for URL jobs waiting on the NZB fetch ladder. A
+/// worker parked in a backoff wait registers its kick in `waiting`; a row
+/// whose worker exited and sits in the dispatcher's own backoff is named in
+/// `dispatch`, which the dispatcher drains on its next pass.
+#[derive(Default)]
+pub(crate) struct UrlRetryKicks {
+    waiting: Mutex<HashMap<JobId, Arc<tokio::sync::Notify>>>,
+    dispatch: Mutex<HashSet<JobId>>,
+}
+
+impl UrlRetryKicks {
+    fn register(&self, job: JobId) -> Arc<tokio::sync::Notify> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(job)
+            .or_default()
+            .clone()
+    }
+
+    fn release(&self, job: JobId) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&job);
+    }
+
+    /// `waiting_on_ladder`: the job's published state shows a scheduled
+    /// retry. Only then is the fetch kicked, and with a stored permit, so a
+    /// kick landing between that publication and the sleep starting is not
+    /// lost; an in-flight request is never pre-armed to skip its next wait.
+    fn kick(&self, job: JobId, waiting_on_ladder: bool) {
+        if let Some(kick) = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&job)
+            .filter(|_| waiting_on_ladder)
+        {
+            kick.notify_one();
+        }
+        self.dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job);
+    }
+
+    pub(crate) fn take_dispatch(&self) -> HashSet<JobId> {
+        std::mem::take(
+            &mut *self
+                .dispatch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
 struct UrlFetchGuard {
+    kicks: Arc<UrlRetryKicks>,
     jobs: Arc<Mutex<HashSet<JobId>>>,
     job: JobId,
     wakeup: Arc<tokio::sync::Notify>,
@@ -947,6 +1007,7 @@ struct UrlFetchGuard {
 
 impl Drop for UrlFetchGuard {
     fn drop(&mut self) {
+        self.kicks.release(self.job);
         match self.jobs.lock() {
             Ok(mut jobs) => {
                 jobs.remove(&self.job);
@@ -1351,6 +1412,7 @@ impl EngineHandle {
         let handle = self.clone();
         self.tracker.spawn(async move {
             let mut fetch_guard = UrlFetchGuard {
+                kicks: handle.url_retry_kicks.clone(),
                 jobs: handle.url_fetches.clone(), job: id,
                 wakeup: handle.url_fetch_wakeup.clone(), phase: "initial owner lookup",
                 identity: None, shared: handle.shared.clone(), cancel: handle.cancel.clone(),
@@ -1414,6 +1476,7 @@ impl EngineHandle {
             if received.is_none() && failure.is_none() {
                 fetch_guard.phase = "HTTP acquisition";
                 let mut events = handle.subscribe();
+                let kick = handle.url_retry_kicks.register(id);
                 let fetched = tokio::select! {
                     _ = handle.cancel.cancelled() => return,
                     _ = async {
@@ -1446,7 +1509,7 @@ impl EngineHandle {
                                 }
                             }
                         }
-                    }) => result,
+                    }, kick) => result,
                 };
                 match fetched {
                     Ok(bytes) => received = Some(bytes),
@@ -1777,6 +1840,34 @@ impl EngineHandle {
         // The dispatcher reads the local snapshot without owner round trips.
         self.url_fetch_wakeup.notify_one();
         Ok(())
+    }
+
+    /// Operator "retry now" for a URL job still fetching its NZB: ends the
+    /// current backoff wait (fetch ladder or dispatcher) so the request goes
+    /// out at once; a request already in flight is left alone. The attempt count and ladder position are kept, so a
+    /// repeat refusal waits on the same step. `false` when the job is not
+    /// fetching.
+    pub fn retry_url_fetch_now(&self, job: JobId) -> bool {
+        let snapshot = self.shared.load();
+        let Some(row) = snapshot
+            .jobs
+            .iter()
+            .find(|row| row.id == job && row.status == nzbd_types::JobStatus::Fetching)
+        else {
+            return false;
+        };
+        let waiting = row
+            .url_fetch
+            .as_ref()
+            .is_some_and(|retry| retry.next_retry_at_unix.is_some());
+        tracing::info!(
+            job = job.0,
+            waiting,
+            "operator requested an immediate NZB fetch retry"
+        );
+        self.url_retry_kicks.kick(job, waiting);
+        self.url_fetch_wakeup.notify_one();
+        true
     }
 
     async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {
