@@ -1,5 +1,39 @@
 # nzbd — Project Status
 
+## NZB fetch retry ladder + retry now — 2026-11-15 (0.9.6, app 1.1.9)
+
+**Status:** built; branch `claude/nzb-fetch-retry-ladder`, draft PR. Owner:
+Claude (Opus 5.5 session). Adversarial review done (5 findings, all fixed). Next:
+fast-check → CI → merge → deploy (Paul).
+
+Field report: items sat in **Fetching NZB** after an indexer 429 with the
+next retry ~12 h out and no way to move them. Root cause: the fetch ladder
+treated the provider's `Retry-After` as a lower bound (`max(Retry-After,
+30/60/120/300 s)`), and quota-exhausted indexers answer with 12–22 h values
+(same mechanism as the 2026-11-01 report). The job panel's **retry now**
+only covered holds and failed-source cleanup.
+
+Changes:
+- Ladder is now 1, 5, 10, then every 30 min (429/503, timeouts, transport
+  errors). A `Retry-After` up to 30 min is a floor for that step; a longer
+  one is not obeyed, and the job's last error says what the indexer asked
+  (`indexer asked to wait 12h`).
+- A restarted fetch clamps a persisted deadline to its step, so rows parked
+  under the old policy come back within 30 min of the deploy.
+- `POST /api/v1/jobs/{id}/retry` on a fetching job ends the current wait
+  (fetch ladder or URL dispatcher backoff) and requests the NZB now; a repeat
+  refusal continues up the ladder. A kick names the deadline it saw, so a
+  double click cannot skip a later wait; in flight, held, or without queue
+  authority it answers 409. Web UI detail panel and the app's
+  expanded Fetching card (1.1.9) show **retry now** while a retry is
+  scheduled.
+- Unchanged: the URL dispatcher's worker-exit backoff (30/60/120/300 s) and
+  storage/coordination retry lanes.
+
+Post-deploy check: a fetching row with a 429 shows `next` within 1 min of
+its first refusal; **retry now** on it sends a request immediately (runner
+log: `operator requested an immediate NZB fetch retry`).
+
 ## Park ENOENT (job 2710) — 2026-11-12 (0.9.4)
 
 **Status:** built; branch `claude/park-enoent` (from main 5e15dd3, pushed;

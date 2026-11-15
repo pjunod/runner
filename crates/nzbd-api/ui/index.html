@@ -2908,9 +2908,11 @@ function detailModel(j, nowMs) {
     recoverMax,
     lifecycleHidden: (torrent && !controlPendingText(j)) || (!lifecycleStatus && !(j.lifecycleEligible && j.status === "failed")),
     lifecycleStatus: lifecycleStatus || (j.lifecycleEligible && j.status === "failed" ? "Failed source cleanup is ready for an immediate retry." : ""),
-    // Every hold answers "retry now"; cleanup retries stay lifecycle-only.
-    lifecycleRetryHidden: torrent || !(heldControl || (j.lifecycleEligible && cleanupRetry)),
-    lifecycleRetryDisabled: !!(j.urlFetch && j.urlFetch.nextRetryAtUnix && j.status === "fetching"),
+    // Every hold answers "retry now", and so does an NZB fetch waiting on
+    // its backoff; cleanup retries stay lifecycle-only. While the fetch is
+    // in flight (no next retry time) there is nothing to cut short.
+    lifecycleRetryHidden: torrent || !(heldControl || (j.lifecycleEligible && cleanupRetry) || (urlRetry && j.status === "fetching")),
+    lifecycleRetryDisabled: !!(urlRetry && j.status === "fetching" && !(urlRetry.nextRetryAtUnix && urlRetry.nextRetryAtUnix * 1000 > nowMs)),
     meta: bits.join("  ·  "),
     metaHidden: false,
     metaClient: "", metaElapsed: "", metaPar: "", metaSource: "",
@@ -4776,9 +4778,10 @@ document.addEventListener("click", (ev) => {
       jobAction(id, "resume").then(() => refreshAll(true));
       return;
     }
+    const fetching = job && job.status === "fetching";
     post("/api/v1/jobs/" + id + "/retry").then(result => {
       if (!result.ok) toast({ text: "Retry failed — " + result.error, kind: "error" });
-      else toast({ text: "Retrying lifecycle work for “" + name + "”" });
+      else toast({ text: (fetching ? "Retrying NZB fetch for “" : "Retrying lifecycle work for “") + name + "”" });
       refreshAll(true);
     });
     return;

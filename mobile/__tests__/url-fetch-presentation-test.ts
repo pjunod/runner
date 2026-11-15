@@ -1,4 +1,4 @@
-import { urlFetchDetail } from '../src/urlFetchPresentation';
+import { canRetryFetchNow, urlFetchDetail } from '../src/urlFetchPresentation';
 
 const now = 1_793_539_000_000; // 2026-11-01T13:16:40Z
 
@@ -40,4 +40,13 @@ test('only an HTTP status is an indexer refusal', () => {
 test('a retry in flight (no deadline) reads as retrying now; a future blocked-since clamps to zero', () => {
   expect(urlFetchDetail({ url_fetch: { attempts: 1, lastError: '', nextRetryAtUnix: null, blockedSinceUnix: now / 1000 + 30 } }, now))
     .toBe('Fetch failed · retrying now · waiting 0s · attempt 1');
+});
+
+test('retry now is offered only while a refused fetch is waiting', () => {
+  const waiting = { url_fetch: { attempts: 2, nextRetryAtUnix: now / 1000 + 300, blockedSinceUnix: null, lastError: 'http: status 429 Too Many Requests' } };
+  expect(canRetryFetchNow(waiting, now)).toBe(true);
+  expect(canRetryFetchNow({ url_fetch: { ...waiting.url_fetch, nextRetryAtUnix: null } }, now)).toBe(false);
+  expect(canRetryFetchNow({ url_fetch: { ...waiting.url_fetch, nextRetryAtUnix: now / 1000 - 1 } }, now)).toBe(false);
+  expect(canRetryFetchNow({ url_fetch: null }, now)).toBe(false);
+  expect(canRetryFetchNow({}, now)).toBe(false);
 });
