@@ -43,7 +43,7 @@ pub(crate) enum SpaceOp {
     Write { job: JobId, file: FileId },
     /// Publishing one job file (link, directory sync).
     Finalize { job: JobId, file: FileId },
-    /// The terminal store / history database.
+    /// The terminal store (`artifacts.sqlite`, the artifact inventory).
     Terminal,
     /// A post-processing write for one job.
     Post { job: JobId },

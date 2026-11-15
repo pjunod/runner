@@ -9242,8 +9242,8 @@ impl Owner {
             tracing::error!(
                 whence,
                 observed = self.enospc_observed,
-"out of space — holding all downloads (reported by a write or a capacity reservation, \
-                 not by the free-space probe)"
+                "out of space — holding all downloads (reported by a write or a write's capacity \
+                 reservation, not by the free-space probe)"
             );
         }
         if !self.disk_low {
@@ -9544,7 +9544,13 @@ impl Owner {
                         if self.space_retry_runnable(op) {
                             return None;
                         }
-                        job_dir(*job, failure)
+                        // A post report's path is already the directory the
+                        // write went into (`report_out_of_space_for`), not a
+                        // file whose parent is the job's directory.
+                        match &failure.path {
+                            Some(dir) => Target::Dirs(vec![(dir.clone(), failure.bound(dir))]),
+                            None => job_dir(*job, failure),
+                        }
                     }
                     SpaceOp::Directory(dir) if dir.as_os_str().is_empty() => {
                         Target::Dirs(failure.probe_roots())

@@ -68,11 +68,11 @@ describe('API presentation helpers', () => {
       disk_low: true,
       disk_guard_write_latched: true,
       enospc_observed: 1,
-      enospc_where: 'post-processing job 7: io: create /processing/job-7/a.mkv: No space left on device (os error 28)',
+      enospc_where: 'post-processing job 7: create /processing/job-7/a.mkv: No space left on device (os error 28)',
       enospc_failures: [
         {
           operation: 'post-processing',
-          detail: 'post-processing job 7: io: create /processing/job-7/a.mkv: No space left on device (os error 28)',
+          detail: 'post-processing job 7: create /processing/job-7/a.mkv: No space left on device (os error 28)',
           path: '/processing/job-7/a.mkv',
           volume: 'processing',
           volume_label: 'working · intermediate',
@@ -90,7 +90,7 @@ describe('API presentation helpers', () => {
     } as unknown as StatusDto;
     expect(diskGuardMessage(latched)).toBe(
       'Downloads are held because a write ran out of space on processing (/processing) — ' +
-        'post-processing job 7: io: create /processing/job-7/a.mkv: No space left on device (os error 28); ' +
+        'post-processing job 7: create /processing/job-7/a.mkv: No space left on device (os error 28); ' +
         'an unknown volume (the failing write recorded no path) — ' +
         'post-processing job 8: io: No space left on device (os error 28).',
     );

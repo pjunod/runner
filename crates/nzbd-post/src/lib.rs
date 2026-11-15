@@ -90,6 +90,22 @@ impl PostError {
         }
     }
 
+    /// The refused capacity reservation behind this error, if that is what
+    /// it is: a forecast, not a failed write.
+    pub fn capacity_shortfall(&self) -> Option<&nzbd_state::capacity::CapacityShortfall> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(error) = current {
+            if let Some(shortfall) = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(nzbd_state::capacity::CapacityShortfall::of)
+            {
+                return Some(shortfall);
+            }
+            current = error.source();
+        }
+        None
+    }
+
     /// The underlying `io::Error`, for callers that match its kind.
     pub fn io(&self) -> Option<&std::io::Error> {
         match self {

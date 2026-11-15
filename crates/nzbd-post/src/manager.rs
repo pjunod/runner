@@ -1789,10 +1789,14 @@ async fn extract_complete_failed_archives(
             inventory.abandon_workspace(&workspace)?;
             // The extractor reported a full volume: a capacity wait, not a
             // verdict on the bytes (the obligation stays pending).
-            return Err(PostError::Io(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                "archive salvage needs free capacity; retry extraction when space is available",
-            )));
+            return Err(PostError::Fs {
+                op: "extract into",
+                path: staging.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "archive salvage needs free capacity; retry extraction when space is available",
+                ),
+            });
         }
         if result.password_error {
             assessment.password_required.extend(paths);
@@ -2536,8 +2540,14 @@ fn spawn_job(
                     // PP writes as much as the downloader does — unpack,
                     // move, script output. An ENOSPC here is the same ground
                     // truth about the volume and must stop intake too, not
-                    // just fail this job.
-                    if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
+                    // just fail this job. A refused reservation is not: it
+                    // is a forecast from statvfs, which the free-space guard
+                    // already owns for intake, so it holds this job on
+                    // capacity (its verdict above) and nothing else.
+                    if let Some(shortfall) = e.capacity_shortfall() {
+                        tracing::warn!(job = job.0, %shortfall,
+                            "post-processing waits for capacity; downloads are not held for a forecast");
+                    } else if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
                         engine.report_out_of_space_for(
                             job,
                             format!("post-processing job {}: {e}", job.0),
@@ -9862,6 +9872,24 @@ mod decision_tests {
         assert!(
             !shortfall.to_string().contains("os error 28"),
             "{shortfall}"
+        );
+        // The forecast holds its job only; the real ENOSPC also stops intake.
+        assert!(shortfall.capacity_shortfall().is_some());
+        assert!(write.capacity_shortfall().is_none());
+        let wrapped = PostError::Artifact(nzbd_state::artifacts::Error::Io(
+            nzbd_state::capacity::CapacityShortfall {
+                root: PathBuf::from("/completed"),
+                needed: 1,
+                claimed: 0,
+                headroom: 1,
+                free: 0,
+            }
+            .into(),
+        ));
+        assert_eq!(
+            wrapped.capacity_shortfall().map(|s| s.root.as_path()),
+            Some(std::path::Path::new("/completed")),
+            "a relocation's refused reservation is found through the inventory error"
         );
     }
 

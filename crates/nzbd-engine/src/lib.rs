@@ -277,7 +277,12 @@ pub fn stderr_hold_cause(stderr: &str) -> Option<nzbd_types::HoldCause> {
     if lower.contains("disk quota exceeded") {
         return Some(nzbd_types::HoldCause::Quota);
     }
-    if lower.contains("no space left on device") || lower.contains("no storage space") {
+    // `capacity::CapacityShortfall`'s own wording, for when a refused
+    // reservation reaches here already rendered to text.
+    if lower.contains("no space left on device")
+        || lower.contains("no storage space")
+        || lower.contains("not enough free space forecast on ")
+    {
         return Some(nzbd_types::HoldCause::Capacity);
     }
     // Only the std suffix names an errno; free text (payload names,
@@ -3604,6 +3609,18 @@ mod out_of_space_tests {
         assert_eq!(
             stderr_hold_cause("io: No space left on device"),
             Some(HoldCause::Capacity)
+        );
+        let shortfall = nzbd_state::capacity::CapacityShortfall {
+            root: "/processing".into(),
+            needed: 1,
+            claimed: 2,
+            headroom: 3,
+            free: 4,
+        };
+        assert_eq!(
+            stderr_hold_cause(&format!("relocate: {shortfall}")),
+            Some(HoldCause::Capacity),
+            "a reservation shortfall rendered to text is still a capacity hold"
         );
         assert_eq!(
             stderr_hold_cause("Disk quota exceeded (os error 122)"),

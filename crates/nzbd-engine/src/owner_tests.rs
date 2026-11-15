@@ -9884,3 +9884,25 @@ async fn a_latched_failure_names_its_volume_and_path() {
     assert_eq!(unknown.path, None);
     assert_eq!(unknown.volume, None, "no path means no volume, not a guess");
 }
+
+/// Review #338-1: a post report's path is the directory the write went
+/// into. When that directory is a configured root itself, the probe goes
+/// there — not to its parent, which is another filesystem.
+#[tokio::test]
+async fn a_post_failure_is_probed_in_its_own_directory() {
+    use crate::space_probe::{SpaceOp, Target};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(3));
+    owner.state.post_paused = true;
+    let root = tmp.path().join("dest");
+    owner.observe_space_failure("post", SpaceOp::Post { job: JobId(3) }, Some(root.clone()));
+    let plan = owner.space_probe_plan();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    match &plan[0].target {
+        Target::Dirs(dirs) => {
+            assert_eq!(dirs.iter().map(|(d, _)| d).collect::<Vec<_>>(), vec![&root])
+        }
+        other => panic!("unexpected target {other:?}"),
+    }
+}

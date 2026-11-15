@@ -982,56 +982,6 @@ pub fn free_space(path: &Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
-
-    fn reading(path: &str, members: &[&str]) -> StorageVolumeReading {
-        StorageVolumeReading {
-            label: path.to_owned(),
-            path: PathBuf::from(path),
-            available_bytes: None,
-            total_bytes: None,
-            device_id: None,
-            current: true,
-            roles: Vec::new(),
-            members: members
-                .iter()
-                .map(|member| StorageMemberReading {
-                    path: PathBuf::from(member),
-                    parent_device_id: None,
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn a_failing_path_resolves_to_its_volume_by_whole_components() {
-        let volumes = [reading("/processing", &[]), reading("/processing2", &[])];
-        let (volume, root) =
-            volume_containing(&volumes, Path::new("/processing2/job/a.mkv")).unwrap();
-        assert_eq!(volume.path, Path::new("/processing2"));
-        assert_eq!(root, Path::new("/processing2"));
-        assert!(volume_containing(&volumes, Path::new("/processingx/a")).is_none());
-        assert!(volume_containing(&volumes, Path::new("/state/a")).is_none());
-    }
-
-    #[test]
-    fn the_deepest_configured_root_wins_across_members_and_nested_volumes() {
-        // Two bind mounts of one filesystem share a volume whose `path` is
-        // their common parent; a nested root on another filesystem is its own.
-        let volumes = [
-            reading("/", &["/downloads", "/media"]),
-            reading("/downloads/incoming", &[]),
-        ];
-        let (volume, root) = volume_containing(&volumes, Path::new("/media/tv/x.mkv")).unwrap();
-        assert_eq!(volume.path, Path::new("/"));
-        assert_eq!(root, Path::new("/media"));
-        let (volume, root) =
-            volume_containing(&volumes, Path::new("/downloads/incoming/x.part")).unwrap();
-        assert_eq!(volume.path, Path::new("/downloads/incoming"));
-        assert_eq!(root, Path::new("/downloads/incoming"));
-        // A volume with members is matched by its members, not its common
-        // parent: `/` is not a configured root.
-        assert!(volume_containing(&volumes, Path::new("/etc/passwd")).is_none());
-    }
     use super::*;
 
     struct ReleaseProbeGateOnDrop(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
@@ -1782,5 +1732,55 @@ mod tests {
         ]);
         assert_eq!(readings.len(), 2);
         assert!(readings.iter().all(|reading| reading.current));
+    }
+
+    fn reading(path: &str, members: &[&str]) -> StorageVolumeReading {
+        StorageVolumeReading {
+            label: path.to_owned(),
+            path: PathBuf::from(path),
+            available_bytes: None,
+            total_bytes: None,
+            device_id: None,
+            current: true,
+            roles: Vec::new(),
+            members: members
+                .iter()
+                .map(|member| StorageMemberReading {
+                    path: PathBuf::from(member),
+                    parent_device_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_failing_path_resolves_to_its_volume_by_whole_components() {
+        let volumes = [reading("/processing", &[]), reading("/processing2", &[])];
+        let (volume, root) =
+            volume_containing(&volumes, Path::new("/processing2/job/a.mkv")).unwrap();
+        assert_eq!(volume.path, Path::new("/processing2"));
+        assert_eq!(root, Path::new("/processing2"));
+        assert!(volume_containing(&volumes, Path::new("/processingx/a")).is_none());
+        assert!(volume_containing(&volumes, Path::new("/state/a")).is_none());
+    }
+
+    #[test]
+    fn the_deepest_configured_root_wins_across_members_and_nested_volumes() {
+        // Two bind mounts of one filesystem share a volume whose `path` is
+        // their common parent; a nested root on another filesystem is its own.
+        let volumes = [
+            reading("/", &["/downloads", "/media"]),
+            reading("/downloads/incoming", &[]),
+        ];
+        let (volume, root) = volume_containing(&volumes, Path::new("/media/tv/x.mkv")).unwrap();
+        assert_eq!(volume.path, Path::new("/"));
+        assert_eq!(root, Path::new("/media"));
+        let (volume, root) =
+            volume_containing(&volumes, Path::new("/downloads/incoming/x.part")).unwrap();
+        assert_eq!(volume.path, Path::new("/downloads/incoming"));
+        assert_eq!(root, Path::new("/downloads/incoming"));
+        // A volume with members is matched by its members, not its common
+        // parent: `/` is not a configured root.
+        assert!(volume_containing(&volumes, Path::new("/etc/passwd")).is_none());
     }
 }
