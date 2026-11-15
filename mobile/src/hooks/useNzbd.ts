@@ -38,7 +38,8 @@ interface HookResult {
       | 'move-top'
       | 'move-up'
       | 'move-down'
-      | 'move-bottom',
+      | 'move-bottom'
+      | 'retry-fetch',
   ) => Promise<JobActionResult>;
   setSeedPolicy: (id: number, policy: SeedPolicy & { use_defaults: boolean }) => Promise<void>;
   setJobPriority: (id: number, priority: number) => Promise<void>;

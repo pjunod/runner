@@ -53,7 +53,7 @@ use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
 use nzbd_types::{Job, JobId, ServerDef, TlsMode};
 use owner::{EngineMsg, Owner, QueueCommand};
 use rate::{RateLimiter, SpeedMeter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -810,6 +810,7 @@ impl Engine {
             budget_tracker,
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
             url_fetch_wakeup: Arc::new(tokio::sync::Notify::new()),
+            url_retry_kicks: Default::default(),
             hold_probes: Arc::new(Mutex::new(HashSet::new())),
             recovery_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             post_scope: None,
@@ -927,6 +928,7 @@ pub struct EngineHandle {
     budget_tracker: Arc<pool::BudgetTracker>,
     url_fetches: Arc<Mutex<HashSet<JobId>>>,
     url_fetch_wakeup: Arc<tokio::sync::Notify>,
+    url_retry_kicks: Arc<UrlRetryKicks>,
     hold_probes: Arc<Mutex<HashSet<JobId>>>,
     recovery_cursor: Arc<std::sync::atomic::AtomicUsize>,
     post_scope: Option<PostAdmission>,
@@ -935,7 +937,63 @@ pub struct EngineHandle {
     shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Operator "retry now" for URL jobs waiting on the NZB fetch ladder. A
+/// worker parked in a backoff wait registers its kick in `waiting`; a row
+/// whose worker exited and sits in the dispatcher's own backoff is named in
+/// `dispatch`, which the dispatcher drains on its next pass.
+#[derive(Default)]
+pub(crate) struct UrlRetryKicks {
+    waiting: Mutex<HashMap<JobId, Arc<crate::fetch::FetchKick>>>,
+    dispatch: Mutex<HashSet<JobId>>,
+}
+
+impl UrlRetryKicks {
+    fn register(&self, job: JobId) -> Arc<crate::fetch::FetchKick> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(job)
+            .or_default()
+            .clone()
+    }
+
+    fn release(&self, job: JobId) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&job);
+    }
+
+    /// Ends a ladder wait on the published `deadline`, if a worker is in it.
+    fn kick_fetch(&self, job: JobId, deadline: i64) -> bool {
+        let kick = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&job)
+            .cloned();
+        kick.is_some_and(|kick| kick.kick(deadline))
+    }
+
+    fn kick_dispatch(&self, job: JobId) {
+        self.dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job);
+    }
+
+    pub(crate) fn take_dispatch(&self) -> HashSet<JobId> {
+        std::mem::take(
+            &mut *self
+                .dispatch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
 struct UrlFetchGuard {
+    kicks: Arc<UrlRetryKicks>,
     jobs: Arc<Mutex<HashSet<JobId>>>,
     job: JobId,
     wakeup: Arc<tokio::sync::Notify>,
@@ -947,6 +1005,7 @@ struct UrlFetchGuard {
 
 impl Drop for UrlFetchGuard {
     fn drop(&mut self) {
+        self.kicks.release(self.job);
         match self.jobs.lock() {
             Ok(mut jobs) => {
                 jobs.remove(&self.job);
@@ -1351,6 +1410,7 @@ impl EngineHandle {
         let handle = self.clone();
         self.tracker.spawn(async move {
             let mut fetch_guard = UrlFetchGuard {
+                kicks: handle.url_retry_kicks.clone(),
                 jobs: handle.url_fetches.clone(), job: id,
                 wakeup: handle.url_fetch_wakeup.clone(), phase: "initial owner lookup",
                 identity: None, shared: handle.shared.clone(), cancel: handle.cancel.clone(),
@@ -1414,6 +1474,7 @@ impl EngineHandle {
             if received.is_none() && failure.is_none() {
                 fetch_guard.phase = "HTTP acquisition";
                 let mut events = handle.subscribe();
+                let kick = handle.url_retry_kicks.register(id);
                 let fetched = tokio::select! {
                     _ = handle.cancel.cancelled() => return,
                     _ = async {
@@ -1446,7 +1507,7 @@ impl EngineHandle {
                                 }
                             }
                         }
-                    }) => result,
+                    }, kick) => result,
                 };
                 match fetched {
                     Ok(bytes) => received = Some(bytes),
@@ -1777,6 +1838,61 @@ impl EngineHandle {
         // The dispatcher reads the local snapshot without owner round trips.
         self.url_fetch_wakeup.notify_one();
         Ok(())
+    }
+
+    /// Operator "retry now" for a URL job still fetching its NZB: ends the
+    /// current backoff wait (fetch ladder or dispatcher) so the request goes
+    /// out at once. A repeat refusal continues up the ladder. `false` when
+    /// nothing would happen: not a fetching URL job, held (its retry is the
+    /// hold release), a request already in flight, or no queue authority on
+    /// this node.
+    pub fn retry_url_fetch_now(&self, job: JobId) -> bool {
+        let snapshot = self.shared.load();
+        let Some(row) = snapshot.jobs.iter().find(|row| {
+            row.id == job
+                && row.kind == nzbd_types::JobKind::Url
+                && row.status == nzbd_types::JobStatus::Fetching
+        }) else {
+            return false;
+        };
+        let held = row
+            .control
+            .as_ref()
+            .is_some_and(|control| control.lifecycle == "held" || control.version != 1);
+        // The dispatcher's own authority test: without it nothing fetches.
+        let authority = !self.url_outbox_external
+            || (snapshot.queue_authority
+                && self
+                    .owner_persist_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard()));
+        if held || !authority {
+            return false;
+        }
+        let deadline = row
+            .url_fetch
+            .as_ref()
+            .and_then(|retry| retry.next_retry_at_unix);
+        let has_worker = self
+            .url_fetches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&job);
+        let retried = if has_worker {
+            deadline.is_some_and(|deadline| self.url_retry_kicks.kick_fetch(job, deadline))
+        } else {
+            // No worker: the row is in (or about to enter) the dispatcher's
+            // backoff, which the dispatcher clears on its next pass.
+            self.url_retry_kicks.kick_dispatch(job);
+            self.url_fetch_wakeup.notify_one();
+            true
+        };
+        tracing::info!(
+            job = job.0,
+            retried,
+            "operator requested an immediate NZB fetch retry"
+        );
+        retried
     }
 
     async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {

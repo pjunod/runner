@@ -134,8 +134,12 @@ export class NzbdClient {
       | 'move-top'
       | 'move-up'
       | 'move-down'
-      | 'move-bottom',
+      | 'move-bottom'
+      | 'retry-fetch',
   ): Promise<{ ok: boolean; parked?: boolean }> {
+    // "Retry now" for an NZB fetch waiting out an indexer refusal: the same
+    // per-job retry endpoint the web UI's button uses.
+    if (action === 'retry-fetch') return this.json(`/api/v1/jobs/${id}/retry`, { method: 'POST' });
     return this.json(`/api/v1/jobs/${id}/actions/${action}`, { method: 'POST' });
   }
 

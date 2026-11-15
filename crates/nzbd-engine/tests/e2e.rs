@@ -1706,8 +1706,35 @@ async fn url_jobs_fetch_then_download() {
         .iter()
         .any(|j| j.id == id && matches!(j.status, JobStatus::Fetching)));
 
-    // Retry-After: 0 cannot undercut the production 30-second first backoff.
-    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 90).await;
+    // The 429 parks the job on the production one-minute first step; the
+    // operator's "retry now" ends that wait well inside it.
+    let parked = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let waiting = engine.snapshot().jobs.iter().any(|j| {
+            j.id == id
+                && j.url_fetch
+                    .as_ref()
+                    .is_some_and(|retry| retry.next_retry_at_unix.is_some())
+        });
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < parked,
+            "429 never parked the fetch"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let kicked = tokio::time::Instant::now();
+    assert!(
+        engine.retry_url_fetch_now(id),
+        "a fetching job accepts retry now"
+    );
+    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 45).await;
+    assert!(
+        kicked.elapsed() < Duration::from_secs(45),
+        "retry now must not wait out the one-minute step"
+    );
     assert_eq!(status, JobStatus::Completed);
     let payload = engine.artifacts().for_job(id.0).unwrap().unwrap().path;
     assert_eq!(std::fs::read(payload.join("u.bin")).unwrap(), data);

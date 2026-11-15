@@ -52,7 +52,7 @@ import { useCollapsedSections } from '../storage/queuePreferences';
 import { SeedPolicyEditor } from '../components/SeedPolicyEditor';
 import { controlPendingLabel, controlPendingText } from '../controlPending';
 import { acquisitionStatus, torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText, isTorrentAcquisition, isSeedTorrent } from '../torrentPresentation';
-import { urlFetchDetail, useNow } from '../urlFetchPresentation';
+import { canRetryFetchNow, urlFetchDetail, useNow } from '../urlFetchPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
 import { holdAction } from '../holdAction';
@@ -120,12 +120,14 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
       | 'move-top'
       | 'move-up'
       | 'move-down'
-      | 'move-bottom',
+      | 'move-bottom'
+      | 'retry-fetch',
   ) => {
     try {
       const result = await jobAction(job.id, action);
       if (activeConfig.current !== config) return;
       if (result.message) setNotice(result.message);
+      if (action === 'retry-fetch') setNotice(`Retrying the NZB fetch for ${job.name}.`);
       if (result.seedOptions != null) {
         setExpanded(result.seedOptions); setSeedExplanation(result.message ?? null); setSeedEditor(result.seedOptions);
       }
@@ -704,7 +706,7 @@ export function JobCard({
   busy: boolean;
   onToggle: () => void;
   onAction: (
-    action: 'pause' | 'resume' | 'move-top' | 'move-up' | 'move-down' | 'move-bottom',
+    action: 'pause' | 'resume' | 'move-top' | 'move-up' | 'move-down' | 'move-bottom' | 'retry-fetch',
   ) => void;
   onDelete: () => void;
   onPriorityChange: (priority: number) => void;
@@ -861,6 +863,9 @@ export function JobCard({
             ) : null}
             {!phase && canResume ? (
               <ActionButton compact disabled={busy} label="Resume" onPress={() => onAction('resume')} />
+            ) : null}
+            {fetchingNzb && !hold && canRetryFetchNow(job, now) ? (
+              <ActionButton compact disabled={busy} label="Retry now" onPress={() => onAction('retry-fetch')} />
             ) : null}
             {!phase && heldAction ? (
               <ActionButton compact disabled={busy} label={heldAction.label} onPress={() => onAction(heldAction.action)} />
