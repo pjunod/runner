@@ -3085,7 +3085,7 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn completed_text_document_is_one_publish_failure_with_bytes_retained() {
+async fn completed_text_document_is_one_publish_failure_with_default_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let text=b"An intended plain text book. Chapter one. This complete document must remain available for review.".to_vec();
     let post = build_post("Text.Book", &[("Novel.txt", text.clone())], 20_000);
@@ -3128,7 +3128,8 @@ async fn completed_text_document_is_one_publish_failure_with_bytes_retained() {
     // Contract v2 §2.2/§2.3: a completed download with nothing publishable
     // is the terminal `failed/publish` (no review hold any more), recorded
     // once — here by the worker, which holds the history store because the
-    // authority runs no post-processing — and its bytes always park.
+    // authority runs no post-processing. Its owned failed bytes follow the
+    // default deletion policy once terminal and custody settlement finish.
     wait_for("unsupported text ends failed/publish", 25, || {
         [&authority, &worker].iter().any(|node| {
             node.runtime
@@ -3164,11 +3165,18 @@ async fn completed_text_document_is_one_publish_failure_with_bytes_retained() {
         .for_job(held.0)
         .unwrap()
         .unwrap();
-    assert!(source.path.exists());
-    assert!(std::fs::read_dir(&source.path)
-        .unwrap()
-        .flatten()
-        .any(|entry| std::fs::read(entry.path()).ok().as_deref() == Some(text.as_slice())));
+    wait_for("unkept failed text bytes are deleted", 25, || {
+        worker
+            .runtime
+            .engine
+            .artifacts()
+            .get(&source.id)
+            .unwrap()
+            .state
+            == "deleted"
+            && !source.path.exists()
+    })
+    .await;
     assert!(get_json(
         &authority.url,
         "/api/v1/deliveries?after=0&includeAccepted=true"
