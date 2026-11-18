@@ -1139,6 +1139,7 @@ try {
   </div>
 
   <div id="hold"></div>
+  <button id="retry-storage" hidden>retry storage now</button>
 
   <div class="controls">
     <button id="btn-pause" class="lane-toggle" aria-pressed="false"><span class="lane-glyph" aria-hidden="true"></span>Downloads</button>
@@ -3425,7 +3426,7 @@ KINDS.storage = { build: buildStorageRow, apply: applyStorageRow };
 function enospcHoldText(s) {
   const failures = Array.isArray(s.enospc_failures) ? s.enospc_failures : [];
   if (!failures.length) {
-    return `out of space — downloads held${s.enospc_where ? " (" + s.enospc_where + ")" : ""}; resume the queue once space is free`;
+    return `out of space — downloads held${s.enospc_where ? " (" + s.enospc_where + ")" : ""}; checking automatically every 30–60 seconds; clear space or retry now`;
   }
   const one = f => {
     const where = f.volume
@@ -3436,7 +3437,7 @@ function enospcHoldText(s) {
     const path = f.path && !detail.includes(f.path) ? ` [${f.path}]` : "";
     return `${where} — ${detail}${path}`;
   };
-  return `out of space on ${failures.map(one).join("; ")} — downloads held; resume the queue once space is free`;
+  return `out of space on ${failures.map(one).join("; ")} — downloads held; checking automatically every 30–60 seconds; clear space or retry now`;
 }
 
 function renderStorage(s) {
@@ -3755,6 +3756,7 @@ function renderStatus() {
   const hold = $("hold");
   setText(hold, holds.length ? "⚠ " + holds.join(" · ") : "");
   setClass(hold, holds.length ? "show" : "");
+  setProp($("retry-storage"), "hidden", !s.disk_low);
   if (s.speed_limit_bps && !$("limit").matches(":focus"))
     $("limit").value = Math.round(s.speed_limit_bps / 1024);
   // Unlike the limit this always has a value, so it is written on every
@@ -4932,6 +4934,18 @@ async function laneAction(lane) {
 }
 $("btn-pause").onclick = () => laneAction("download");
 $("btn-pause-post").onclick = () => laneAction("post");
+$("retry-storage").onclick = async () => {
+  const button = $("retry-storage");
+  button.disabled = true;
+  try {
+    const res = await post("/api/v1/queue/actions/retry-storage");
+    if (!res.ok) toast({ text: "storage retry failed — " + res.error, kind: "error", ttlMs: 10000 });
+    else toast({ text: "Checking storage. Work resumes when writes succeed; manual pauses stay in place." });
+  } finally {
+    button.disabled = false;
+    refreshAll();
+  }
+};
 $("btn-limit").onclick = async () => {
   const kib = parseInt($("limit").value || "0", 10);
   const res = await post("/api/v1/queue/speed-limit", {
@@ -6561,12 +6575,8 @@ const SETTINGS_SECTIONS = [
     ["post.cleanup", "delete archives after unpack", "check"],
     ["post.deobfuscate_final", "deobfuscate file names", "check"],
     ["post.strategy", "strategy", "select", SEL(["sequential", "balanced", "aggressive", "rocket"])],
-    ["post.failure_action", "files from failed downloads",
-      "select",
-      [["none", "none — keep failed files in place"],
-       ["park", "park — move failed files to the failed directory"],
-       ["delete", "delete — remove failed files (default)"]],
-      "Applies when a download fails, including repair, unpack and health failures. Failed jobs remain in history; requeue downloads them again."],
+    ["post.keep_failed_downloads", "keep failed downloads", "check", null,
+      "Off by default: delete failed download files after recovery finishes. Enable to move them to the failed directory. Failed jobs stay in history and can be downloaded again. A download’s individual Keep setting still takes precedence."],
     ["post.scripts_dir", "extension scripts dir (optional)", "text?"],
     ["post.par2_cmd", "par2 command", "text"],
     ["post.unrar_cmd", "unrar command", "text"],

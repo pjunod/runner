@@ -317,7 +317,17 @@ async fn run_leases(conn: &mut NntpConnection, leases: &[Lease], ctx: &ConnCtx) 
     }
 
     for (i, lease) in leases.iter().enumerate() {
-        match handle_one(conn, lease, ctx).await {
+        let result = tokio::select! {
+            biased;
+            _ = lease.cancel.cancelled() => {
+                // A pipelined response cannot be skipped: retire the connection,
+                // returning the other jobs' leases for a fresh connection.
+                fail_leases(ctx, &leases[i..], AttemptOutcome::ConnectionFailed).await;
+                return Err(());
+            }
+            result = handle_one(conn, lease, ctx) => result,
+        };
+        match result {
             Ok(()) => {}
             Err(e) => {
                 tracing::debug!(server = %ctx.server.name, error = %e, "connection lost mid-lease");
@@ -541,6 +551,59 @@ mod adaptive_tests {
     }
 
     #[tokio::test]
+    async fn canceling_a_lease_interrupts_a_stalled_body_response() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (requested, request) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"200 ready\r\n").await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut command = String::new();
+            socket.read_line(&mut command).await.unwrap();
+            requested.send(()).unwrap();
+            // No response: cancellation must interrupt the actual network wait.
+            let _ = socket.read_line(&mut command).await;
+        });
+        let (engine_tx, mut engine_rx) = mpsc::channel(8);
+        let (ctx, _epoch, _budget) =
+            context(test_server(port), engine_tx, CancellationToken::new());
+        let mut conn = connect_and_auth(&ctx).await.unwrap();
+        let (writer, _written) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let lease = Lease {
+            r: SegRef {
+                job: JobId(3),
+                file: FileId(4),
+                seg_number: 5,
+            },
+            message_id: "stalled@example".into(),
+            writer,
+            generation: 7,
+            cancel: cancel.clone(),
+        };
+        let canceler = tokio::spawn(async move {
+            request.await.unwrap();
+            cancel.cancel();
+        });
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            run_leases(&mut conn, &[lease], &ctx)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(matches!(
+            engine_rx.recv().await,
+            Some(EngineMsg::ScopedOutcome { .. })
+        ));
+        canceler.await.unwrap();
+        drop(conn);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn bad_ypart_terminator_does_not_become_a_connection_timeout() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -563,6 +626,7 @@ mod adaptive_tests {
             context(test_server(port), engine_tx, CancellationToken::new());
         let (writer, mut written) = mpsc::channel(1);
         let lease = Lease {
+            cancel: CancellationToken::new(),
             r: SegRef {
                 job: JobId(3),
                 file: FileId(4),
@@ -722,6 +786,7 @@ mod adaptive_tests {
             context(test_server(port), engine_tx, CancellationToken::new());
         let (writer, mut written) = mpsc::channel(4);
         let lease = |seg_number| Lease {
+            cancel: CancellationToken::new(),
             r: SegRef {
                 job: JobId(3),
                 file: FileId(4),
@@ -843,6 +908,7 @@ mod adaptive_tests {
         let (ctx, _epoch, _budget) = context(test_server(port), engine_tx, cancel.clone());
         let (writer, _writer_rx) = mpsc::channel(1);
         let lease = Lease {
+            cancel: CancellationToken::new(),
             r: SegRef {
                 job: JobId(3),
                 file: FileId(4),

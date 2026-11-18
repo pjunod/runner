@@ -444,11 +444,8 @@ pub struct Tuning {
     pub monthly_quota_bytes: u64,
     /// Day of month the monthly quota window starts (1–28).
     pub quota_start_day: u32,
-    /// Abort a download the moment its health falls below critical health
-    /// (unrepairable even with all par2): remaining segments are failed
-    /// instead of downloaded, and the job finishes as Failed — the PP
-    /// health gate then parks/deletes per `[post] health_action`. Wired
-    /// from `health_action != "none"`.
+    /// End a below-critical download immediately, canceling active writers.
+    /// Failed payload retention is a separate operator setting.
     pub health_abort: bool,
     /// Contract §2.3: how long an environmental hold may last before the
     /// hold-recovery task ends it `failed/hold_expired` (`[post]
@@ -2591,6 +2588,44 @@ impl EngineHandle {
         let source = source.to_string();
         self.roundtrip_unit(|reply| QueueCommand::PauseAll { source, reply })
             .await
+    }
+
+    /// Recheck disk-full failures without changing either lane's pause state.
+    pub async fn retry_storage(&self) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::RetryStorage { reply })
+            .await?;
+        let snapshot = self.snapshot();
+        let mut retries = tokio::task::JoinSet::new();
+        for job in snapshot
+            .jobs
+            .iter()
+            .filter(|job| job.assigned_node.is_none())
+        {
+            let Some(control) = job.control.as_ref().filter(|control| {
+                control.lifecycle == "held"
+                    && !control.manual_pause
+                    && (control.hold_cause().is_storage()
+                        || control.hold_cause() == nzbd_types::HoldCause::StorageUnavailable)
+            }) else {
+                continue;
+            };
+            let handle = self.clone();
+            let (id, revision) = (job.id, control.revision.clone());
+            retries
+                .spawn(async move { handle.release_hold(id, revision, RetryBy::Operator).await });
+            if retries.len() >= 8 {
+                break;
+            }
+        }
+        while let Some(result) = retries.join_next().await {
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(reason))) => tracing::info!(%reason, "storage retry remains held"),
+                Ok(Err(error)) => return Err(error),
+                Err(error) => tracing::warn!(%error, "storage retry task stopped"),
+            }
+        }
+        Ok(())
     }
 
     pub async fn resume_all(&self, source: &str) -> Result<(), EngineError> {

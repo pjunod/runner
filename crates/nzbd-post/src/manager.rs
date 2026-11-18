@@ -1022,13 +1022,8 @@ async fn fail_and_follow_up(
     failure_followup(engine, cfg, dest_dir, gate, job, true).await
 }
 
-/// Cluster worker, after the leader accepted a failed post-processing result
-/// (so the job's terminal is durable there, contract §2.1): dispose of this
-/// node's own attempt copy by the same rule as single-node disposal —
-/// Keep retains, park-always reasons retain in place, a source assessed `recoverable`
-/// (or not assessed) is retained, anything else follows `failure_action`.
-/// The cluster cleanup ledger then finds the copy already settled. Before
-/// v2 this ran inside the attempt, ahead of the stamp.
+/// Dispose a cluster worker's failed attempt after its terminal is durable.
+/// Honor per-download Keep, then the configured retention policy.
 pub async fn dispose_remote_failure(
     engine: &EngineHandle,
     cfg: &PostConfig,
@@ -1044,27 +1039,8 @@ pub async fn dispose_remote_failure(
     if !param(PP_DONE_PARAM).is_some_and(|status| !status.starts_with("SUCCESS")) {
         return true;
     }
-    let reason = param("Failure:Reason").and_then(nzbd_types::FailureReason::parse);
     let inventory = engine.artifacts();
-    let assessed = inventory
-        .for_job(job.id.0)
-        .ok()
-        .flatten()
-        .and_then(|artifact| artifact.failure_assessment)
-        .map(|assessment| assessment.disposition);
     let action = if nzbd_engine::terminal::keeps_failed_source(job) {
-        FailureAction::None
-    } else if reason == Some(nzbd_types::FailureReason::HoldExpired) {
-        FailureAction::Park
-    } else if nzbd_types::transfer_of(&job.params).is_some() {
-        // W3: a curator-admitted failure follows `failure_action`.
-        cfg.failure_action
-    } else if reason.is_some_and(|reason| reason.park_always()) {
-        // Contract §2.2 park-always: the copy stays under runner custody
-        // where it is; the cluster ledger retains it (`artifacts::cluster`).
-        FailureAction::None
-    } else if assessed.as_deref() != Some("unusable") {
-        // `recoverable` holds payload; no assessment proves nothing.
         FailureAction::None
     } else {
         cfg.failure_action
@@ -1295,9 +1271,8 @@ async fn assess_and_publish_salvage(
 }
 
 /// Contract §2.6: dispose of a failed source once its salvage obligation has
-/// settled. The job's own keep-on-failure retains it; `publish`, `io`,
-/// `identity` and `hold_expired` always park; otherwise `[post]
-/// failure_action` means what it says. Returns true once the disposal is
+/// settled. The job's own keep-on-failure retains it; otherwise the
+/// configured failure policy applies to every failure reason. Returns true once the disposal is
 /// recorded on the terminal row.
 async fn dispose_failed_source(
     engine: &EngineHandle,
@@ -1369,27 +1344,6 @@ async fn dispose_failed_source(
             Err(_) => false,
         };
     }
-    // Review #280-7 (the pre-v2 "recoverable/unknown → retain" rule): only a
-    // source positively assessed `unusable` may be deleted; a recoverable
-    // or unassessed one is parked for recovery instead.
-    let assessed_unusable = {
-        let inventory = inventory.clone();
-        tokio::task::spawn_blocking(move || inventory.job_source(job.0))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-            .and_then(|source| source.failure_assessment)
-            .is_some_and(|assessment| assessment.disposition == "unusable")
-    };
-    // A curator-admitted failure's salvage already took whatever verified
-    // payload it held; the assessment gate is for jobs nobody re-grabs.
-    let action =
-        if action == FailureAction::Delete && !assessed_unusable && terminal.transfer.is_none() {
-            FailureAction::Park
-        } else {
-            action
-        };
     let mut failure_cfg = cfg.clone();
     failure_cfg.failure_action = action;
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
@@ -1574,30 +1528,13 @@ async fn dispose_failed_source(
     record(disposition.note).await
 }
 
-/// Contract §2.6 precedence: the job's keep-on-failure; then, for a
-/// curator-admitted job, `[post] failure_action` as configured (its salvage
-/// has settled, curator has re-grabbed — Paul, 2026-11-11, W3); for any
-/// other job the park-always reasons, then `failure_action`.
+/// Per-download Keep takes precedence; otherwise use the operator's policy.
 fn disposal_action(
     cfg: &PostConfig,
     terminal: &nzbd_state::artifacts::JobTerminal,
 ) -> FailureAction {
     if terminal.keep_on_failure {
         FailureAction::None
-    } else if terminal.reason == Some(nzbd_types::FailureReason::HoldExpired)
-        && (terminal.salvage != nzbd_state::artifacts::SalvageState::Published
-            || terminal.salvage_error.is_some()
-            || terminal
-                .entry
-                .params
-                .iter()
-                .any(|(key, _)| key == "Failure:ExpiredWorkerHold"))
-    {
-        FailureAction::Park
-    } else if terminal.transfer.is_some() {
-        cfg.failure_action
-    } else if terminal.reason.is_some_and(|reason| reason.park_always()) {
-        FailureAction::Park
     } else {
         cfg.failure_action
     }
@@ -2957,10 +2894,10 @@ mod admission_tests {
             failure_action: FailureAction::Delete,
             ..Default::default()
         };
-        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Park);
+        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Delete);
         terminal.salvage = nzbd_state::artifacts::SalvageState::Published;
         terminal.salvage_error = Some("deadline-abandoned assessment".into());
-        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Park);
+        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Delete);
         terminal.salvage_error = None;
         assert_eq!(
             disposal_action(&cfg, &terminal),
@@ -2973,8 +2910,8 @@ mod admission_tests {
         ));
         assert_eq!(
             disposal_action(&cfg, &terminal),
-            FailureAction::Park,
-            "unresolved expiry custody cannot borrow another publication as proof"
+            FailureAction::Delete,
+            "failure policy applies after salvage and custody obligations settle"
         );
         engine.shutdown().await;
     }
@@ -7890,6 +7827,30 @@ fn script_env(
 /// the pipeline's outcome, not on these decisions.
 #[cfg(test)]
 mod decision_tests {
+    #[test]
+    fn failed_payload_policy_has_no_implicit_retention_by_reason() {
+        for reason in nzbd_types::FailureReason::ALL {
+            let request = job(vec![], vec![]);
+            let mut terminal =
+                nzbd_engine::terminal::failed_terminal(&request, reason, None, "test", "failed");
+            assert_eq!(
+                disposal_action(&PostConfig::default(), &terminal),
+                FailureAction::Delete,
+                "{reason:?}"
+            );
+            let keep = PostConfig {
+                failure_action: FailureAction::Park,
+                ..Default::default()
+            };
+            assert_eq!(disposal_action(&keep, &terminal), FailureAction::Park);
+            terminal.keep_on_failure = true;
+            assert_eq!(
+                disposal_action(&PostConfig::default(), &terminal),
+                FailureAction::None
+            );
+        }
+    }
+
     use super::*;
     use nzbd_types::{DupeInfo, FileEntry, FileId, JobKind, JobTotals, Segment, SegmentState};
     use std::os::unix::fs::PermissionsExt;
@@ -11567,7 +11528,7 @@ mod decision_tests {
         engine.shutdown().await;
     }
     #[tokio::test]
-    async fn completed_junk_only_attempt_is_a_parked_publish_failure() {
+    async fn completed_junk_only_attempt_is_deleted_after_publish_failure() {
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
         std::fs::create_dir(&downloads).unwrap();
@@ -11617,7 +11578,7 @@ mod decision_tests {
             PpFinal::UnpackFailure
         );
         // Contract §2.2: nothing publishable is `failed/publish`, recorded
-        // before anything touches the bytes, and always parked.
+        // before anything touches the bytes.
         let terminal = inventory.terminal(41).unwrap().unwrap();
         assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Publish));
         assert!(!terminal.blames_release);
@@ -11633,17 +11594,17 @@ mod decision_tests {
         assert!(entry.params.iter().any(
             |(key, value)| key == "Failure:Message" && value.contains("no publishable payload")
         ));
-        // `failure_action` is delete; publish parks anyway.
+        // Publication failures follow the same deletion policy as other failures.
         assert!(failure_followup(&engine, &cfg, &downloads, &None, JobId(41), true,).await);
         let disposal = inventory.terminal(41).unwrap().unwrap().disposal.unwrap();
         assert!(!source.exists(), "{disposal}");
-        assert!(disposal.starts_with("parked at "), "{disposal}");
+        assert_eq!(disposal, "deleted");
         engine.shutdown().await;
     }
     #[tokio::test]
     async fn held_rows_keep_the_owner_schedule_on_import_and_restart() {
-        // M6: the owner's hold ladder is the only clock a held PP job runs
-        // on; importing a row re-derives its policy without moving it.
+        // Storage holds from old builds rearm within a minute; unrelated
+        // holds keep their existing schedule. Restart preserves both.
         let temp = tempfile::tempdir().unwrap();
         let config = || {
             nzbd_engine::EngineConfig::single_node(
@@ -11697,11 +11658,13 @@ mod decision_tests {
                 .unwrap();
             assert_eq!(scheduled.cause, *cause);
             assert_eq!(scheduled.revision, "2");
-            assert_eq!(
-                scheduled.next_retry_at_unix,
-                Some(deadline),
-                "an existing deadline cannot be shortened"
-            );
+            if *cause == "missing_tool" {
+                assert_eq!(scheduled.next_retry_at_unix, Some(deadline));
+            } else {
+                assert!(scheduled
+                    .next_retry_at_unix
+                    .is_some_and(|at| at <= now() + 60 && at > now()));
+            }
             assert_eq!(scheduled.blocked_since_unix, Some(first_block));
             assert_eq!(
                 scheduled.retry_policy,

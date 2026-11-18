@@ -4820,8 +4820,11 @@ async fn a_failure_whose_job_cannot_retry_is_probed() {
         "a post-side hold is never gated by the latch; only finalize is listed"
     );
     assert!(
-        owner.space_probe_plan().is_empty(),
-        "runnable jobs retry themselves"
+        owner
+            .space_probe_plan()
+            .iter()
+            .any(|planned| planned.op == post),
+        "post failures are probed without waiting on a lane toggle"
     );
 
     owner.state.job_mut(JobId(2)).unwrap().status = JobStatus::Paused;
@@ -9440,7 +9443,12 @@ fn a_legacy_identity_hold_retries_now() {
     assert!(crate::owner::rearmed_hold(rearmed, 100).is_none());
     let mut other = control;
     other.message = "ENOTCONN".into();
-    assert!(crate::owner::rearmed_hold(other, 100).is_none());
+    assert_eq!(
+        crate::owner::rearmed_hold(other, 100)
+            .unwrap()
+            .next_retry_at_unix,
+        Some(160)
+    );
 }
 
 /// Where the simulated kill -9 lands.
@@ -9905,4 +9913,115 @@ async fn a_post_failure_is_probed_in_its_own_directory() {
         }
         other => panic!("unexpected target {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn unhealthy_restored_job_ends_with_leased_articles_and_paused_pars() {
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning {
+        health_abort: true,
+        ..Tuning::default()
+    });
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(81);
+    job.status = JobStatus::Downloading;
+    job.files[0].segments[0].state = SegmentState::Failed;
+    let mut leased = job.files[0].segments[0].clone();
+    leased.number = 2;
+    leased.state = SegmentState::Leased {
+        server: ServerId(1),
+    };
+    job.files[0].segments.push(leased);
+    let mut par = job.files[0].clone();
+    par.id = FileId(811);
+    par.is_par2 = true;
+    par.paused = true;
+    par.segments.truncate(1);
+    par.segments[0].size = 1;
+    par.segments[0].state = SegmentState::Pending;
+    job.files.push(par);
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    let (tx, _rx) = mpsc::channel(1);
+    let (_stopped, stopped) = watch::channel(false);
+    let cancel = CancellationToken::new();
+    owner.writers.insert(
+        FileId(810),
+        WriterHandle {
+            tx,
+            stopped,
+            stop: cancel.clone(),
+            generation: 1,
+        },
+    );
+    owner.maybe_abort_unhealthy(JobId(81));
+    assert!(
+        cancel.is_cancelled(),
+        "active article producer must be canceled"
+    );
+    pump(&mut owner, &mut messages).await;
+    assert_eq!(
+        owner.state.job(JobId(81)).unwrap().status,
+        JobStatus::Failed
+    );
+    assert_eq!(
+        owner.artifacts.terminal(81).unwrap().unwrap().reason,
+        Some(nzbd_types::FailureReason::Health)
+    );
+    assert!(
+        !owner.writer_epochs.contains_key(&FileId(810)),
+        "late writes are fenced"
+    );
+}
+
+#[tokio::test]
+async fn storage_retry_preserves_pause_flags_and_requires_probe_evidence() {
+    use crate::space_probe::SpaceOp;
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.download_paused = true;
+    owner.state.post_paused = true;
+    owner.observe_out_of_space_in("write", Some(tmp.path().join("dest")));
+    owner.space_probe_after = Instant::now() + Duration::from_secs(600);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::RetryStorage { reply });
+    result.await.unwrap();
+    assert!(owner.state.download_paused && owner.state.post_paused);
+    assert!(
+        owner.enospc_latched,
+        "request is not proof that space is free"
+    );
+    assert!(
+        owner.space_probe_inflight,
+        "button starts a probe immediately"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.space_probe_inflight {
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+    })
+    .await
+    .expect("storage probe did not answer");
+    assert!(
+        !owner.enospc_latched,
+        "successful real write clears the latch"
+    );
+    assert!(!owner
+        .enospc_failures
+        .contains_key(&SpaceOp::Directory(tmp.path().join("dest"))));
+    assert!(owner.state.download_paused && owner.state.post_paused);
+}
+
+#[test]
+fn old_storage_backoff_is_shortened_without_unpausing() {
+    let mut control: nzbd_types::JobControl = serde_json::from_value(serde_json::json!({
+        "version": 1, "revision": "1", "lifecycle": "held", "cause": "storage_unavailable",
+        "stage": "post", "retry_policy": "scheduled_retry", "message": "disk full",
+        "instance": "test", "manual_pause": false, "retry_attempt": 10
+    }))
+    .unwrap();
+    control.next_retry_at_unix = Some(20_000);
+    control.manual_pause = true;
+    let rearmed = rearmed_hold(control, 100).unwrap();
+    assert_eq!(rearmed.next_retry_at_unix, Some(160));
+    assert!(rearmed.manual_pause);
 }
