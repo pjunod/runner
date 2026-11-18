@@ -232,11 +232,17 @@ impl Inventory {
         copy: &ClusterArtifactCopy,
         outcome: &str,
         proof: FinalizationProof,
-        unusable: bool,
+        failure_disposal_authorized: bool,
         raw_files: Option<&[DeliveryFile]>,
     ) -> Result<ClusterCopyCleanup> {
         self.retire_cluster_artifact_copy_policy(
-            copy, outcome, proof, unusable, raw_files, false, None,
+            copy,
+            outcome,
+            proof,
+            failure_disposal_authorized,
+            raw_files,
+            false,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -245,7 +251,7 @@ impl Inventory {
         copy: &ClusterArtifactCopy,
         outcome: &str,
         proof: FinalizationProof,
-        unusable: bool,
+        failure_disposal_authorized: bool,
         raw_files: Option<&[DeliveryFile]>,
         result: &str,
     ) -> Result<ClusterCopyCleanup> {
@@ -253,19 +259,40 @@ impl Inventory {
             copy,
             outcome,
             proof,
-            unusable,
+            failure_disposal_authorized,
             raw_files,
             false,
             Some(result),
         )
     }
+    /// Apply the authority's failure-retention choice without weakening exact
+    /// generation, byte-seal, ownership, active-use or live Keep checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_cluster_artifact_copy_with_failure_retention(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        raw_files: Option<&[DeliveryFile]>,
+        result: &str,
+        keep_failed_downloads: bool,
+    ) -> Result<ClusterCopyCleanup> {
+        if keep_failed_downloads && outcome != "SUCCESS" && !copy.selected {
+            return Ok(ClusterCopyCleanup {
+                status: "retained".into(),
+                error: Some("Keep failed downloads is enabled by the authority".into()),
+            });
+        }
+        self.retire_cluster_artifact_copy_with_result(copy, outcome, proof, true, raw_files, result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn retire_cluster_artifact_copy_policy(
         &self,
         copy: &ClusterArtifactCopy,
         outcome: &str,
         proof: FinalizationProof,
-        unusable: bool,
+        failure_disposal_authorized: bool,
         raw_files: Option<&[DeliveryFile]>,
         explicit_cancellation: bool,
         result: Option<&str>,
@@ -282,7 +309,7 @@ impl Inventory {
             copy,
             outcome,
             proof,
-            unusable,
+            failure_disposal_authorized,
             raw_files,
             explicit_cancellation,
             result,
@@ -296,7 +323,7 @@ impl Inventory {
         copy: &ClusterArtifactCopy,
         outcome: &str,
         proof: FinalizationProof,
-        unusable: bool,
+        failure_disposal_authorized: bool,
         raw_files: Option<&[DeliveryFile]>,
         explicit_cancellation: bool,
         result: Option<&str>,
@@ -306,7 +333,7 @@ impl Inventory {
             copy,
             outcome,
             proof.clone(),
-            unusable,
+            failure_disposal_authorized,
             raw_files,
             explicit_cancellation,
             result,
@@ -338,7 +365,7 @@ impl Inventory {
                     copy,
                     outcome,
                     proof,
-                    unusable,
+                    failure_disposal_authorized,
                     raw_files,
                     explicit_cancellation,
                     result,
@@ -355,7 +382,7 @@ impl Inventory {
         copy: &ClusterArtifactCopy,
         outcome: &str,
         proof: FinalizationProof,
-        unusable: bool,
+        failure_disposal_authorized: bool,
         raw_files: Option<&[DeliveryFile]>,
         explicit_cancellation: bool,
         result: Option<&str>,
@@ -426,21 +453,6 @@ impl Inventory {
                 error: Some("this exact source is retained by its current Keep setting".into()),
             });
         }
-        // An expired environmental hold is never a W3 deletion proof.
-        // This precedes replay of any earlier automatic raw-delete journal.
-        if !copy.selected
-            && outcome == nzbd_types::FailureReason::HoldExpired.history_status()
-            && !explicit_cancellation
-            && !artifact.terminal()
-        {
-            if let Some(mut operation) = existing.clone().filter(|op| op.state != "succeeded") {
-                operation.state = "cancelled".into();
-                operation.error =
-                    Some("hold-expired source preserved; prior automatic delete superseded".into());
-                save_operation(&self.db.lock().unwrap(), &operation)?;
-            }
-            return Ok(ClusterCopyCleanup {status:"retained".into(),error:Some("hold-expired source remains under its owner's custody; failed assessment is not unusable proof".into())});
-        }
         if let Some(operation) = existing.as_ref().filter(|_| !copy.selected) {
             let request: DeleteRequest = serde_json::from_str(&operation.request)?;
             if operation.kind != "delete"
@@ -465,25 +477,11 @@ impl Inventory {
                 error: operation.error,
             });
         }
-        // Contract §2.2: publish/io/identity/hold_expired failures of a job
-        // curator did not admit keep their bytes. A curator-admitted job
-        // follows `failure_action` once salvage settles (W3, as single-node
-        // disposal does), so its raw copies get no park-always exemption.
         if !copy.selected
-            && !artifact.delivery_lifecycle
+            && outcome != "SUCCESS"
+            && !failure_disposal_authorized
             && !artifact.terminal()
-            && nzbd_types::FailureReason::ALL
-                .into_iter()
-                .any(|reason| reason.park_always() && reason.history_status() == outcome)
         {
-            return Ok(ClusterCopyCleanup {
-                status: "retained".into(),
-                error: Some(format!(
-                    "{outcome} always keeps its bytes (contract park-always); retained for recovery"
-                )),
-            });
-        }
-        if !copy.selected && outcome != "SUCCESS" && !unusable && !artifact.terminal() {
             return Ok(ClusterCopyCleanup { status: "retained".into(), error: Some(
                 "partial failure publication does not prove every raw source dependency redundant; retain this exact source until recovery is resolved".into()) });
         }
@@ -735,6 +733,59 @@ mod tests {
         })
         .collect()
     }
+    #[test]
+    fn failed_copy_retention_policy_applies_after_exact_raw_seal() {
+        for reason in [
+            nzbd_types::FailureReason::Health,
+            nzbd_types::FailureReason::Io,
+            nzbd_types::FailureReason::Identity,
+            nzbd_types::FailureReason::HoldExpired,
+        ] {
+            for keep_failed in [false, true] {
+                let (_temp, inventory, source, copy) = fixture();
+                let result = inventory
+                    .retire_cluster_artifact_copy_with_failure_retention(
+                        &copy,
+                        reason.history_status(),
+                        proof(),
+                        Some(&raw_seal()),
+                        "result",
+                        keep_failed,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    result.status,
+                    if keep_failed { "retained" } else { "removed" }
+                );
+                assert_eq!(source.exists(), keep_failed);
+            }
+        }
+    }
+
+    #[test]
+    fn default_failed_copy_deletion_still_requires_live_keep_and_exact_bytes() {
+        for protect in [true, false] {
+            let (_temp, inventory, source, copy) = fixture();
+            if protect {
+                inventory.set_keep_on_failure(7, true).unwrap();
+            } else {
+                std::fs::write(source.join("readme.txt"), b"replacement bytes").unwrap();
+            }
+            let result = inventory
+                .retire_cluster_artifact_copy_with_failure_retention(
+                    &copy,
+                    "FAILURE/IO",
+                    proof(),
+                    Some(&raw_seal()),
+                    "result",
+                    false,
+                )
+                .unwrap();
+            assert_eq!(result.status, "retained");
+            assert!(source.exists());
+        }
+    }
+
     #[test]
     fn raw_copy_seal_is_identity_bound_and_refuses_unrecorded_members() {
         let (_temp, inventory, source, mut copy) = fixture();

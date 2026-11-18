@@ -128,11 +128,15 @@ Rules, each with its reason:
   policy. Each producer names its reason: the owner emits `health` (articles
   missing) or `io` (writes failed), the URL fetcher emits `fetch` from its own
   site (`owner.rs:5287`), the PP manager emits the PP reasons.
-- **Health and fetch terminals are emitted by the owner**, at the point where
-  `job_finished{failed}` is emitted today (`owner.rs:7478`), with the history
-  row written in the same step. They never pass through post-processing
-  admission (`BeginPostAdmission`, `owner.rs:2507`), which can defer them for
-  a restart re-verification pass.
+- **Download failures retain their producer's reason.** A standalone owner
+  records the terminal with history. In a cluster, a download executor sends
+  a provisional Failed result with typed failure details through the sealed
+  completion outbox; it writes neither a local post-completion stamp nor
+  local terminal history. The authority assigns an unstamped failure a normal
+  post-processing lease. Verification and salvage preserve the original
+  download failure reason; only an accepted Post result records the
+  authoritative terminal and history. Download-only workers therefore do not
+  depend on a local history record to hand off failure.
 - **`pp_status` and `final_dir` are carried for one release** so a curator
   that has not yet moved to the reducer (§3) keeps working; they are removed
   in the release after both sides ship.
@@ -180,7 +184,9 @@ admission and unknown recoverability do not force Park.
 
 Health cancellation remains armed under either setting. The owner durably
 fails below-critical downloads immediately, stops writers and NNTP waits,
-and skips post-side work. Periodic reconciliation covers restored jobs.
+and stops post-side work on the download executor. Cluster verification and
+salvage use the normal post-processing handoff above. Periodic reconciliation
+covers restored jobs.
 Retention must never keep a doomed download consuming connections.
 
 **`blames_release` decides the blocklist**, not the mere fact of failure. A
@@ -341,6 +347,9 @@ After the terminal event, runner disposes the processing source per
 `[post] keep_failed_downloads` (false: Delete; true: Park), overridden by the
 job's `keep_on_failure`, and only once salvage and cleanup custody settle.
 Failure reason and recoverability do not override the retention preference.
+The authority also supplies retention and per-download Keep policy to expiry
+and cluster copy owners. If an older authority omits that policy, owners
+preserve bytes rather than assume deletion is authorized.
 
 **A job's source directory is a closed scope** *(0.9.0)*: every file in it
 came from the job's own download. Once its delivery is a success, or a

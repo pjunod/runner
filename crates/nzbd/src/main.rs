@@ -449,6 +449,7 @@ fn cluster_runtime_config(
         disk_guard_roots: disk_guard_roots(cfg),
         torrent_payload_roots: torrent_payload_roots(cfg),
         workspace_dir: cfg.configured_workspace_dir(),
+        keep_failed_downloads: cfg.post.keep_failed_downloads,
     };
     Ok((runtime, shared_dir))
 }

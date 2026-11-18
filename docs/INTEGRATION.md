@@ -280,6 +280,14 @@ URL fetcher (`fetch`), the post-processor (the PP reasons and `completed`);
 plus the operator delete path, which records `outcome: cancelled` with the
 transfer from the same record as its `DELETED` history row.
 
+In a cluster, the download executor's Failed completion is provisional: it
+carries the producer's typed reason through the sealed completion outbox,
+without local terminal history or a post-completion stamp. The authority
+assigns an unstamped failure a normal post-processing lease. Verification and
+salvage preserve the download failure reason; only the accepted Post result
+records authoritative terminal/history. Consumers continue using the terminal
+event, never the provisional download completion.
+
 | Field | Meaning |
 |---|---|
 | `job`, `name`, `category` | the job |
@@ -601,7 +609,9 @@ After the terminal, runner disposes of a failed job's processing source per
 `[post] keep_failed_downloads` (false by default: Delete; true: Park),
 overridden by the job's Keep flag, and only after salvage and cleanup custody
 settle. Legacy `failure_action`/`health_action` values do not govern runtime
-retention; reason and recoverability do not force Park. Disposal is owned by
+retention; reason and recoverability do not force Park.
+Authority retention and per-download Keep policy also reach expiry and cluster
+copy owners. Missing policy from an older authority preserves bytes safely. Disposal is owned by
 the artifact record
 and gated by the `job_terminals` row, not the queue row; it runs on the
 artifact operation's own retry ladder (`Operation.next_retry`: 30 s, 1 m,

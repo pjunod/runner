@@ -425,14 +425,19 @@ to `true` to park failed payload in `failed_dir`, subject to
 retains its source indefinitely and takes precedence. Failure reason,
 recoverability and Curator admission do not force parking. Legacy
 `failure_action` and `health_action` remain accepted for compatibility; the
-boolean supersedes them in daemon runtime.
+boolean supersedes them in daemon runtime. In a cluster, the authority's
+retention and per-download Keep policy also governs expiry and copy owners;
+a worker preserves bytes safely if an older authority supplies no policy.
 
 **Health cancellation is always armed.** When health falls below critical
 health (even all PAR2 blocks cannot repair it), the owner records the durable
 failure immediately and stops writers and NNTP waits. The periodic tick also
-reconciles restored jobs. A failed download skips post-side work; retention
-settings only decide what happens to its bytes after recovery obligations
-settle.
+reconciles restored jobs. The download executor stops doing post-side work.
+In a cluster it hands the typed failure to the authority, which assigns normal
+post-processing verification and salvage before accepting the authoritative
+terminal/history result. Download-only workers need no local history for this
+handoff. Retention settings decide what happens to bytes after recovery and
+custody obligations settle.
 
 Parked failures expire at their wall-clock deadline (`failed_retention_days`,
 default 7) whether or not file-lifecycle automation is enabled and across

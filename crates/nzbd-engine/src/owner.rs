@@ -5267,36 +5267,19 @@ impl Owner {
                 if quiescent {
                     if let Some(j) = self.state.job_mut(job) {
                         let current = j.control();
-                        let after = j
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == "*Control:probe_after")
-                            .and_then(|(_, v)| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        let count = j
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == "*Control:attempts")
-                            .and_then(|(_, v)| v.parse::<u32>().ok())
-                            .unwrap_or(0);
                         if current.is_some_and(|c| {
                             c.revision == revision
                                 && c.lifecycle == "held"
                                 && matches!(c.cause.as_str(), "capacity" | "quota")
-                        }) && (after <= now || by == RetryBy::Operator)
-                        {
-                            // The spacing paces the recovery task; a person
-                            // asking is the health probe's to answer, not
-                            // the backoff's.
+                                && (by == RetryBy::Operator
+                                    || (!c.manual_pause
+                                        && c.next_retry_at_unix.is_none_or(|after| after <= now)))
+                        }) {
+                            // JobControl owns the retry clock. Legacy probe
+                            // parameters must not delay a migrated hold.
                             j.params.retain(|(k, _)| {
                                 k != "*Control:probe_after" && k != "*Control:attempts"
                             });
-                            j.params.push((
-                                "*Control:probe_after".into(),
-                                (now + (30 * (1i64 << count.min(6))).min(60)).to_string(),
-                            ));
-                            j.params
-                                .push(("*Control:attempts".into(), (count + 1).to_string()));
                             self.dirty = true;
                             accepted = true;
                         }

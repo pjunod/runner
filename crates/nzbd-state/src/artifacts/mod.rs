@@ -3632,27 +3632,6 @@ impl Inventory {
         }
         let request: DeleteRequest = serde_json::from_str(&op.request)?;
         let (_, revision, _, automatic, generation) = request.fields();
-        // A previously queued failed-source delete is not permission to
-        // override a later park-always hold expiry. Retention and explicit
-        // human/cancellation deletes keep their existing validators.
-        if a.failure_reason.as_deref() == Some("hold_expired")
-            && (op.id.starts_with("failed-delete-") || op.id.starts_with("cluster-copy-"))
-        {
-            op.state = "cancelled".into();
-            op.error = Some(
-                "hold-expired source parked; automatic failed-source delete superseded".into(),
-            );
-            let db = self.db.lock().unwrap();
-            save_operation(&db, &op)?;
-            event(
-                &db,
-                &a.id,
-                "delete_cancelled",
-                "hold-expired park supersedes failed-source deletion",
-            )?;
-            return Ok(op);
-        }
-
         let explicit_cancellation = if let DeleteRequest::ClusterCancellation((
             _,
             _,

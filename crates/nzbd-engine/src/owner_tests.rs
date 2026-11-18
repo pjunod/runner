@@ -3536,6 +3536,7 @@ async fn operator_storage_release_runs_the_job_and_resets_the_probe() {
     pump(&mut owner, &mut messages).await;
     let mut c = owner.state.jobs[0].control().unwrap();
     c.manual_pause = true;
+    c.next_retry_at_unix = Some(unix_now() + 999);
     owner.state.jobs[0].set_control(&c);
     // A probe just ran: the recovery task must wait, a person need not.
     owner.state.jobs[0].params.extend([
@@ -7847,9 +7848,10 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
     pump(&mut owner, &mut messages).await;
     let revision = owner.state.jobs[0].control().unwrap().revision;
     for attempt in 1..=12 {
-        owner.state.jobs[0]
-            .params
-            .retain(|(key, _)| key != "*Control:probe_after");
+        let mut control = owner.state.jobs[0].control().unwrap();
+        control.next_retry_at_unix = Some(unix_now());
+        control.retry_attempt = attempt;
+        owner.state.jobs[0].set_control(&control);
         let (reply, result) = oneshot::channel();
         owner.on_command(QueueCommand::BeginResourceProbe {
             job: JobId(1),
@@ -7864,6 +7866,9 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
             "resource retry {attempt} must remain admitted"
         );
     }
+    let mut control = owner.state.jobs[0].control().unwrap();
+    control.next_retry_at_unix = Some(unix_now() + 60);
+    owner.state.jobs[0].set_control(&control);
     let (reply, result) = oneshot::channel();
     owner.on_command(QueueCommand::BeginResourceProbe {
         job: JobId(1),
@@ -7890,15 +7895,59 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
         result.await.unwrap(),
         "explicit retry can probe immediately"
     );
-    let count = owner.state.jobs[0]
+    assert!(owner.state.jobs[0]
         .params
         .iter()
-        .find(|(key, _)| key == "*Control:attempts")
-        .unwrap()
-        .1
-        .parse::<u32>()
-        .unwrap();
-    assert_eq!(count, 13);
+        .all(|(key, _)| { key != "*Control:probe_after" && key != "*Control:attempts" }));
+}
+
+#[tokio::test]
+async fn migrated_resource_probe_uses_due_control_instead_of_legacy_clock() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    owner.state.jobs.push(pending_job(1));
+    assert!(owner.hold_job(JobId(1), HoldCause::Capacity, "download_write", "disk full"));
+    pump(&mut owner, &mut messages).await;
+    let mut control = owner.state.jobs[0].control().unwrap();
+    control.next_retry_at_unix = Some(unix_now());
+    owner.state.jobs[0].set_control(&control);
+    owner.state.jobs[0].params.extend([
+        (
+            "*Control:probe_after".into(),
+            (unix_now() + 1920).to_string(),
+        ),
+        ("*Control:attempts".into(), "8".into()),
+    ]);
+    control.manual_pause = true;
+    owner.state.jobs[0].set_control(&control);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginResourceProbe {
+        job: JobId(1),
+        revision: control.revision.clone(),
+        by: RetryBy::Recovery,
+        guard: Default::default(),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(!result.await.unwrap(), "a due retry preserves manual pause");
+    control.manual_pause = false;
+    owner.state.jobs[0].set_control(&control);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginResourceProbe {
+        job: JobId(1),
+        revision: control.revision,
+        by: RetryBy::Recovery,
+        guard: Default::default(),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(
+        result.await.unwrap(),
+        "the due control owns the retry clock"
+    );
+    assert!(owner.state.jobs[0]
+        .params
+        .iter()
+        .all(|(key, _)| { key != "*Control:probe_after" && key != "*Control:attempts" }));
 }
 
 #[test]
@@ -10024,4 +10073,65 @@ fn old_storage_backoff_is_shortened_without_unpausing() {
     let rearmed = rearmed_hold(control, 100).unwrap();
     assert_eq!(rearmed.next_retry_at_unix, Some(160));
     assert!(rearmed.manual_pause);
+}
+
+#[tokio::test]
+async fn download_only_worker_reports_failure_without_local_terminal_history() {
+    for deferred in [false, true] {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning {
+            health_abort: true,
+            ..Default::default()
+        });
+        pump(&mut owner, &mut messages).await;
+        owner.history = None;
+        owner.persist = false;
+        owner.worker_mode = true;
+        let mut job = pending_job(82);
+        job.status = JobStatus::Downloading;
+        job.files[0].segments[0].state = SegmentState::Failed;
+        recompute_job_totals(&mut job);
+        job.params.push((
+            nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&nzbd_state::artifacts::WorkerControlContext {
+                lease_id: "download-82".into(),
+                job_incarnation: "job-82".into(),
+                job_revision: 1,
+                control_revision: 1,
+                epoch: 1,
+            })
+            .unwrap(),
+        ));
+        owner.state.jobs.push(job);
+        if deferred {
+            owner.pending_control_commits.insert(JobId(82));
+        }
+        owner.maybe_abort_unhealthy(JobId(82));
+        if deferred {
+            assert!(owner.deferred_terminals.contains_key(&JobId(82)));
+            owner.pending_control_commits.remove(&JobId(82));
+            owner.replay_terminals();
+        }
+        let row = owner.state.job(JobId(82)).unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Failed,
+            "completion must reach the existing authority outbox"
+        );
+        assert!(!row.held(), "no PP history is not a storage fault");
+        assert!(
+            !row.params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM),
+            "worker cannot stamp the authoritative terminal"
+        );
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Reason" && value == "health"));
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, _)| key == crate::terminal::DOWNLOAD_FAILURE_PARAM));
+        assert!(owner.artifacts.terminal(82).unwrap().is_none());
+    }
 }

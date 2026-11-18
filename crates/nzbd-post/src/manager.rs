@@ -3915,6 +3915,33 @@ async fn process_job_ctx_from_inner(
     ctx: &PpCtx,
     from: RestartPoint,
 ) -> Result<PpFinal, PostError> {
+    let download_failure = engine
+        .export_job(job_id)
+        .await
+        .map_err(|source| PostError::Engine {
+            operation: "read download failure",
+            source,
+        })?
+        .filter(|row| {
+            row.params
+                .iter()
+                .any(|(key, _)| key == nzbd_engine::terminal::DOWNLOAD_FAILURE_PARAM)
+        })
+        .map(|row| {
+            let param = |key: &str| {
+                row.params
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            };
+            let (reason, _) = unstamped_failure(&row);
+            (
+                reason,
+                param("Failure:Stage").unwrap_or_else(|| "download".into()),
+                param("Failure:Message")
+                    .unwrap_or_else(|| "download failed before post-processing".into()),
+            )
+        });
     if !engine
         .set_job_status(job_id, JobStatus::PostQueued)
         .await
@@ -4600,7 +4627,9 @@ async fn process_job_ctx_from_inner(
     }
 
     // ---- finalize ----------------------------------------------------------
-    let mut outcome = if !par_ok {
+    let mut outcome = if download_failure.is_some() {
+        PpFinal::HealthFailure
+    } else if !par_ok {
         PpFinal::ParFailure
     } else if !unpack_ok {
         PpFinal::UnpackFailure
@@ -4740,7 +4769,12 @@ async fn process_job_ctx_from_inner(
             .ok_or_else(|| PostError::Subprocess("job vanished before its terminal".into()))?;
         record_deobfuscation(&mut fin.params, &deobfuscated);
         fin.params.extend(script_receipts);
-        let (reason, stage, message) = pp_failure(outcome, unusable_source_reason.as_deref());
+        let (default_reason, default_stage, default_message) =
+            pp_failure(outcome, unusable_source_reason.as_deref());
+        let (reason, stage, message) = download_failure
+            .as_ref()
+            .map(|(reason, stage, message)| (*reason, stage.as_str(), message.clone()))
+            .unwrap_or((default_reason, default_stage, default_message));
         // Review #280-7: the failed source's assessment (`recoverable` /
         // `unusable`) is what the file lifecycle (Keep-off disposal), the
         // cluster's raw-copy cleanup and disposal below read to decide
@@ -7827,6 +7861,81 @@ fn script_env(
 /// the pipeline's outcome, not on these decisions.
 #[cfg(test)]
 mod decision_tests {
+    #[tokio::test]
+    async fn failed_download_handoff_preserves_the_original_terminal_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            Vec::new(),
+            temp.path().join("queue"),
+            downloads.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let mut request = job(
+            vec![],
+            vec![
+                (
+                    nzbd_engine::terminal::DOWNLOAD_FAILURE_PARAM.into(),
+                    "1".into(),
+                ),
+                ("Failure:Reason".into(), "health".into()),
+                ("Failure:Stage".into(), "health".into()),
+                (
+                    "Failure:Message".into(),
+                    "below critical health on download-only worker".into(),
+                ),
+            ],
+        );
+        request.delivery_lifecycle = true;
+        request.status = JobStatus::Failed;
+        let source = downloads.join(nzbd_engine::queue::job_dir_name(&request));
+        let inventory = engine.artifacts();
+        inventory
+            .allocate_for_delivery(41, &downloads, &source, true, true)
+            .unwrap();
+        std::fs::write(source.join("readme.txt"), b"junk").unwrap();
+        inventory.finish(41, &source, &downloads, "active").unwrap();
+        engine
+            .import_fixture_job(request, false, false)
+            .await
+            .unwrap();
+        let cfg = PostConfig {
+            unpack: false,
+            cleanup: false,
+            deobfuscate_final: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            process_job_ctx(
+                &engine,
+                &cfg,
+                &history,
+                &downloads,
+                JobId(41),
+                &PpCtx::default()
+            )
+            .await
+            .unwrap(),
+            PpFinal::HealthFailure
+        );
+        let terminal = inventory.terminal(41).unwrap().unwrap();
+        assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Health));
+        assert_eq!(terminal.stage.as_deref(), Some("health"));
+        assert_eq!(
+            terminal.message.as_deref(),
+            Some("below critical health on download-only worker")
+        );
+        assert!(terminal.emitted);
+        engine.shutdown().await;
+    }
+
     #[test]
     fn failed_payload_policy_has_no_implicit_retention_by_reason() {
         for reason in nzbd_types::FailureReason::ALL {

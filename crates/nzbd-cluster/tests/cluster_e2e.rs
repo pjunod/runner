@@ -220,6 +220,7 @@ async fn start_node_with_control(
         }],
         torrent_payload_roots: Vec::new(),
         workspace_dir: None,
+        keep_failed_downloads: false,
     };
     let tuning = Tuning {
         retry_interval: Duration::from_millis(400),

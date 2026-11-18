@@ -353,10 +353,12 @@ of the durable revision. Polling held facts take precedence over older history.
 `POST /api/v1/queue/{id}/resume` in Monarr calls Runner's existing
 `POST /api/v1/jobs/{id}/actions/resume`; it does not add an NZB. Runner requires
 writer quiescence, capacity reservation and a bounded 64 KiB write/flush probe.
-Attempts and exponential backoff survive restart (eight attempts; initial
-30-second backoff). Quota release is explicitly operator-triggered because
-`statvfs` supplies no authoritative quota headroom. Manual pause and review
-holds survive resource release.
+Retries continue until the hold deadline; storage backoff is 30–60 seconds
+and survives restart. `JobControl.next_retry_at_unix` is the sole automatic
+retry clock, so legacy probe parameters cannot postpone a due retry. Quota
+holds can recover automatically through actual admission and write evidence;
+`statvfs` alone supplies no authoritative quota headroom. Manual pause and
+review holds survive automatic resource release.
 
 After clearing space, automatic storage probes resume eligible work with
 storage delays capped at 30–60 seconds; persisted long storage holds are
