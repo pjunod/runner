@@ -133,10 +133,17 @@ hold on its own; **pause** stops the retries and the button becomes
 **retry**, which sends the job back to the step it stopped in. Nothing a
 release contains ever holds a job, and no hold waits for a person: a hold
 that outlives `[post] hold_deadline_secs` (a day; a week for passwords) fails
-with reason `hold_expired` and its files are parked, even while the queue is
+with reason `hold_expired` and its files follow the failure policy, even while the queue is
 paused. A newer cause replaces the shown one and restarts the clock. Over the
 API and SSE these jobs read `status: "held"` and emit
 `job_status_changed` on the way in and out.
+
+**Out of space.** Clear space and allow the automatic storage probes to
+retry; storage retry delays are capped at 30–60 seconds, including shortened
+persisted holds. **retry storage now** requests an immediate retry, including
+idle post failures. It preserves both manual lane pauses and the evidence
+latch: only a successful probe releases eligible work. Pausing or resuming a
+lane is a separate operator choice.
 
 **Parked sources in Files.** A failed job's folder shows state **failed ·
 parked** with a line saying why: the failure reason (`too few articles`,
@@ -426,7 +433,7 @@ GET  /api/v1/jobs/{id}/nzb          the job's NZB, regenerated from queue state
 GET  /api/v1/jobs/{id}/torrent      torrent lifecycle and effective policy
 PUT  /api/v1/jobs/{id}/torrent/seed-policy   edit the effective policy
 POST /api/v1/jobs/{id}/actions/{action}     pause|resume|delete|delete-files|move-*
-POST /api/v1/queue/actions/{action}    pause|resume (downloads) · pause-post|resume-post (post-processing)
+POST /api/v1/queue/actions/{action}    pause|resume (downloads) · pause-post|resume-post (post-processing) · retry-storage (probe storage)
 PUT  /api/v1/queue/speed-limit
 GET  /api/v1/history
 POST /api/v1/history/{id}/actions/{action}  hide|restore|delete|delete-files|requeue
@@ -545,19 +552,18 @@ The per-job pipeline and its knobs are described in
   header or v2 `manifest.json`), `NZBPP_*`/`NZBPR_*` environment,
   `[NZB] FINALDIR=…` and friends on stdout, exit codes 92–95. Point
   `post.scripts_dir` at your existing NZBGet scripts.
-- **Health actions**: failed-health jobs can be left (`none`), parked, or
-  deleted from disk (`delete`), mirroring NZBGet's HealthCheck.
+- **Health cancellation** always stops a download below critical health,
+  regardless of whether you retain failures. The owner records failure and
+  stops writers and NNTP waits immediately; restored jobs are reconciled too.
+- **Keep failed downloads** in Settings → Post-processing defaults off:
+  failed payload is deleted after salvage and cleanup custody settle. Enable
+  it to move failures to `failed_dir` for retention. A download's individual
+  **Keep on failure** retains its source indefinitely. Reasons and
+  recoverability do not override this choice; failed jobs remain in History.
 - **Every failure has a reason.** History and `job_pp_finished` name one of
   `health`, `fetch`, `par`, `unpack`, `script`, `publish`, `io`, `identity`
-  or `hold_expired`. A job Curator admitted follows `failure_action`
-  (default `delete`) for every reason once its salvage settles — Curator
-  has re-grabbed it. For any other job the last four (Runner's or the
-  environment's fault, not the release's) are parked in `failed_dir`
-  whatever `failure_action` says. A job with keep-on-failure is left in
-  place. A
-  failed job whose bytes still hold something usable (one bad episode in a
-  season pack, a repairable PAR set) has that part published as a salvage
-  delivery before the rest is disposed of.
+  or `hold_expired`. Any usable salvage is settled before source disposal;
+  failure alone never proves that writers stopped or remote custody ended.
 
 ## History, duplicates, quotas
 

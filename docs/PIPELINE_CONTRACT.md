@@ -148,15 +148,15 @@ Rules, each with its reason:
 
 | `reason` | `stage` | Set when (by) | `blames_release` | `salvage` may be `pending` | Bytes after (§2.6) |
 |---|---|---|---|---|---|
-| `health` | `health` | articles missing below critical (owner) | yes | **yes** — the current handler already attempts PAR repair and salvage on this path (`manager.rs:897, 955`); 32 of the last 112 on nuc3 fetched *something* | `failure_action`, after salvage settles |
+| `health` | `health` | articles missing below critical (owner) | yes | yes, where an existing salvage obligation remains | `keep_failed_downloads`, after salvage settles |
 | `fetch` | `fetch` | NZB/URL fetch exhausted (URL fetcher, own site). Carries `fetch_cause`: `gone` (the indexer answered 404/410/403 for *this* item) or `indexer_unavailable` (exhausted through 429/5xx/timeouts/transport, `fetch.rs:230`) | **only when `cause: gone`** — an indexer outage must not blocklist healthy releases; curator re-queues the want after the indexer's `retry_at` instead of grabbing an alternative | no | nothing to dispose |
-| `par` | `par_verify`/`par_repair` | repair impossible or budget exhausted (PP) | yes | yes | `failure_action`, after salvage settles |
-| `unpack` | `unpack` | extractor failed on the bytes, not the disk (PP) | yes | yes | `failure_action`, after salvage settles |
-| `script` | `script` | post script non-zero (PP) | no | yes | `failure_action` |
-| `publish` | `move`/`publication_verify` | nothing passes selection: unknown kind, missing proof, empty (PP) | no | yes if anything verified | `failure_action` after salvage settles (curator-admitted); else `park` |
-| `io` | any | write failure, digest/size mismatch, missing file, refused permission (owner or PP) | no | yes | `failure_action` after salvage settles (curator-admitted); else `park` |
-| `identity` | any | the evidence disagrees with itself — conflicting yEnc metadata, foreign journal bytes (owner or PP) | yes | no | `failure_action` (curator-admitted); else `park` |
-| `hold_expired` | the hold's stage | an environmental hold (§2.3) passed its deadline (hold recovery) | no | yes | `failure_action` after salvage settles (curator-admitted); else `park` |
+| `par` | `par_verify`/`par_repair` | repair impossible or budget exhausted (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `unpack` | `unpack` | extractor failed on the bytes, not the disk (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `script` | `script` | post script non-zero (PP) | no | yes | `keep_failed_downloads` |
+| `publish` | `move`/`publication_verify` | nothing passes selection: unknown kind, missing proof, empty (PP) | no | yes if anything verified | `keep_failed_downloads`, after salvage settles |
+| `io` | any | write failure, digest/size mismatch, missing file, refused permission (owner or PP) | no | yes | `keep_failed_downloads`, after salvage settles |
+| `identity` | any | the evidence disagrees with itself — conflicting yEnc metadata, foreign journal bytes (owner or PP) | yes | no | `keep_failed_downloads` |
+| `hold_expired` | the hold's stage | an environmental hold (§2.3) passed its deadline (hold recovery) | no | yes | `keep_failed_downloads`, after salvage settles |
 | `cancelled` | — | operator delete / curator cancel; `outcome: cancelled`, **emitted by runner's delete path as a real terminal** (curator never infers it from `job_deleted`, which carries no transfer) | no | — | runner's delete semantics |
 
 **A post-processing failure is terminal.** `HoldCause::PostFailure`,
@@ -170,19 +170,18 @@ never whether the failure is reported.** On nuc3, 24 of the last 29 `DELETED`
 history rows carry a `held` control — jobs that were deleted while held; a
 review hold's only exit.
 
-**A curator-admitted failure follows `failure_action` for every reason**
-*(Paul, 2026-11-11 — decided; replaces park-always)*. Once its salvage has
-settled, any verified payload has gone out as the salvage publication and
-curator has re-grabbed the release, so parking the rest only fills
-`/processing/failed` with bytes nobody recovers (2713, 2770, 2811, 2812,
-2856, 2885 were parked with their once-committed publication while curator
-had already replaced them). Under the default `delete` the source is
-removed; under `park` it expires after `failed_retention_days` on its
-wall-clock deadline. A job curator did not admit keeps park-always for
-`publish`, `io`, `identity` and `hold_expired`: nobody re-grabs it, so the
-bytes are the only copy. `keep_on_failure` always keeps, indefinitely
-(there is no keep TTL), and its advisory assessment settles instead of
-retrying.
+**Failure retention is independent of reason and recoverability**
+*(2026-11-18 — supersedes the 2026-11-11 retention decision).* Runtime
+`[post] keep_failed_downloads` defaults to `false` (Delete); `true` selects
+Park with `failed_retention_days`. It supersedes legacy `failure_action` and
+`health_action`. Per-download `keep_on_failure` retains indefinitely. This
+applies to all jobs after salvage and cleanup custody settle; Curator
+admission and unknown recoverability do not force Park.
+
+Health cancellation remains armed under either setting. The owner durably
+fails below-critical downloads immediately, stops writers and NNTP waits,
+and skips post-side work. Periodic reconciliation covers restored jobs.
+Retention must never keep a doomed download consuming connections.
 
 **`blames_release` decides the blocklist**, not the mere fact of failure. A
 local permission fault, a full disk or a selection-policy miss must not
@@ -209,8 +208,9 @@ missing_tool · engine_unavailable · password_required`.
 - **Persisted legacy causes are converted at boot**, before any generic
   handling: a stored `*Control:v1` with cause `io`, `identity_conflict` or
   `post_failure` becomes the terminal disposition §2.2 specifies for it
-  (`io`/`identity` → `failed`, parked; `post_failure` → `failed/publish`,
-  parked), with the event. Only a cause this build has never heard of
+  (`io`/`identity` → `failed`; `post_failure` → `failed/publish`,
+  with disposal governed by the retention preference), with the event. Only
+  a cause this build has never heard of
   (`Unrecognized`, written by a newer node) is treated as
   `storage_unavailable`: scheduled retry, deadline, never a dead end.
 - A hold is a real status on the native API and SSE: `"status": "held"`. For
@@ -236,6 +236,14 @@ missing_tool · engine_unavailable · password_required`.
   suspends its automatic recovery until they resume it; the deadline clock
   keeps running and is shown.
 - emits `job_control_changed` on every control write, as today.
+
+**Storage retry.** Clear space and let automatic probes retry eligible work;
+storage delays are capped at 30–60 seconds and persisted long storage holds
+are shortened. `POST /api/v1/queue/actions/retry-storage` (web **retry storage
+now**) requests probes, including idle post failures. It changes neither
+manual lane pause; it does not blindly clear the evidence latch. Successful
+probes release eligible work; writer-stop, custody and manual-pause gates
+still apply.
 
 ### 2.4 Status and progress — `job_status_changed`, plus `tick`
 
@@ -330,13 +338,9 @@ diffing ticks to discover transitions.
 ### 2.6 Failure disposal and runner's own cleanup
 
 After the terminal event, runner disposes the processing source per
-`[post] failure_action` (`delete` default, `park`, `none`), overridden by the
-job's `keep_on_failure` and, for a job curator did not admit, by the
-park-always reasons (§2.2), **and only
-once any salvage obligation for the job has settled** (`publication_ready`
-emitted, or `salvage: none` recorded). The lifecycle override that forces
-`Delete` regardless of config (`manager.rs:1054, 4404`) is removed: the
-config means what it says.
+`[post] keep_failed_downloads` (false: Delete; true: Park), overridden by the
+job's `keep_on_failure`, and only once salvage and cleanup custody settle.
+Failure reason and recoverability do not override the retention preference.
 
 **A job's source directory is a closed scope** *(0.9.0)*: every file in it
 came from the job's own download. Once its delivery is a success, or a

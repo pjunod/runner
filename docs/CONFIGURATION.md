@@ -265,8 +265,13 @@ same cached inventory visible in native status.
 The free-space reading is a forecast. A write that actually fails with
 ENOSPC/EDQUOT latches the hold regardless of it, and the latch clears only
 when probe writes (eight 1 MiB files, each fsynced, then removed) succeed in
-the directory that failed — retried every 30 s, doubling to 10 minutes — or
-when the operator resumes the queue. A free-space reading never clears it:
+the directory that failed — retried automatically with storage delays capped
+at 30–60 seconds.
+**Retry storage now** requests a probe without changing either manual lane
+pause or clearing the evidence latch. Idle post failures are probed too, and
+persisted long storage holds are shortened. Clear space; successful probes
+resume eligible work while preserving manual pauses. A free-space reading
+never clears it:
 on a Gluster distribute volume statvfs sums the bricks and reports space
 while one brick is full.
 
@@ -395,21 +400,11 @@ deobfuscate_final = true    # rename still-obfuscated files to the job name
                             # names are never touched
 strategy = "balanced"       # sequential | balanced | aggressive | rocket
                             # (1 / 2 / 3 / 6 concurrent PP jobs)
-failure_action = "delete"   # none | park | delete — what happens to the
-                            # FILES of a job that ended in a terminal
-                            # failure: par failure, unpack failure, script
-                            # failure, health abort, post crash. Deleting
-                            # loses nothing: the job's NZB is parked with
-                            # its history row, so requeue re-downloads it.
-                            # "none" leaves ~90 GB per failed grab in the
-                            # tree your importer watches — that is how a
-                            # terabyte of duplicates happened. Anything but
-                            # "none" also aborts a download the moment its
-                            # health drops below critical health (the point
-                            # where even all par2 blocks can't repair it),
-                            # instead of finishing a doomed download.
-                            # Accepts the old name `health_action`, which
-                            # only ever governed the health gate
+keep_failed_downloads = false # false: delete failed payload after recovery;
+                              # true: park it in failed_dir for retention.
+                              # Per-download Keep overrides either choice.
+                              # Legacy failure_action/health_action values
+                              # are accepted but do not govern runtime policy.
 failed_dir = "/data/usenet/failed"   # where "park" puts them; defaults to
                             # <main_dir>/failed — deliberately off the
                             # category tree
@@ -423,25 +418,21 @@ password_hold_deadline_secs = 604800   # the same, for an archive waiting on
                                # a password (a person has to act, so longer)
 ```
 
-**Failure disposition, by reason.** A failed job's files are disposed of
-after its terminal is recorded and after any salvage (the usable part of a
-failed job, published as a `kind: "salvage"` delivery) is settled. Precedence:
+**Failure disposition.** `[post] keep_failed_downloads` defaults to `false`:
+Runner deletes failed payload after salvage and cleanup custody settle. Set it
+to `true` to park failed payload in `failed_dir`, subject to
+`failed_retention_days`. The per-download **Keep on failure** preference
+retains its source indefinitely and takes precedence. Failure reason,
+recoverability and Curator admission do not force parking. Legacy
+`failure_action` and `health_action` remain accepted for compatibility; the
+boolean supersedes them in daemon runtime.
 
-1. `keep_on_failure` on the job — the files stay where they are, kept
-   indefinitely (no retention clock) and never re-assessed in a loop: a
-   failed assessment settles as `unknown` and the source stays.
-2. A job Curator admitted (it carries `monarr-transfer`) follows
-   `failure_action` for **every** reason once its salvage has settled —
-   Curator has already re-grabbed it, and any verified payload went out as
-   the salvage delivery. With the default `delete` the source is removed;
-   with `park` it moves to `failed_dir` and expires after
-   `failed_retention_days`. (0.9.0: this replaces "park-always" for
-   `publish`, `io`, `identity` and `hold_expired`; sources an older build
-   parked that way are expired by the normal retention path on upgrade.)
-3. Any other job: reasons `publish`, `io`, `identity` and `hold_expired`
-   are parked whatever `failure_action` says (nobody will re-grab them, so
-   the bytes are the only copy), and a source not assessed `unusable` is
-   parked rather than deleted. Everything else follows `failure_action`.
+**Health cancellation is always armed.** When health falls below critical
+health (even all PAR2 blocks cannot repair it), the owner records the durable
+failure immediately and stops writers and NNTP waits. The periodic tick also
+reconciles restored jobs. A failed download skips post-side work; retention
+settings only decide what happens to its bytes after recovery obligations
+settle.
 
 Parked failures expire at their wall-clock deadline (`failed_retention_days`,
 default 7) whether or not file-lifecycle automation is enabled and across
@@ -457,8 +448,8 @@ are published with its video at their relative path.
 never holds it — and is retried automatically on the hold ladder. Each hold
 gets a deadline when it starts (`deadline_unix` and `deadline_in_s` in the
 job's `control`); a newer cause replaces the older one and restarts the clock.
-Past the deadline the job fails with reason `hold_expired` and is parked, even
-if the queue is paused. Seed-retirement holds on torrents carry no deadline.
+Past the deadline the job fails with reason `hold_expired` and follows the
+failure policy, even if the queue is paused. Seed-retirement holds on torrents carry no deadline.
 
 Failed-file disposition is retried before the terminal history row is written.
 A stable local error such as permission denied is attempted three times, then

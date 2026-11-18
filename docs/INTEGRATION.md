@@ -313,15 +313,15 @@ transfer from the same record as its `DELETED` history row.
 
 | `reason` | `stage` | Set when (by) | `blames_release` | `salvage` may be `pending` | Bytes after (§5) |
 |---|---|---|---|---|---|
-| `health` | `health` | articles missing below critical (owner) | yes | yes | `failure_action`, after salvage settles |
+| `health` | `health` | articles missing below critical (owner) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `fetch` | `fetch` | NZB/URL fetch failed (URL fetcher); `fetch_cause` `gone` (the indexer answered 404/410/403 or another non-retried status for this item) or `indexer_unavailable` (retries exhausted on 429/503, timeouts, transport) | only for `gone` | no | nothing to dispose |
-| `par` | `par_verify`/`par_repair` | repair impossible (PP) | yes | yes | `failure_action`, after salvage settles |
-| `unpack` | `unpack` | the extractor failed on the bytes (PP) | yes | yes | `failure_action`, after salvage settles |
-| `script` | `script` | post script exited non-zero (PP) | no | yes | `failure_action` |
-| `publish` | `move`/`publication_verify` | nothing passes selection (PP) | no | yes | **park, always** |
-| `io` | any | a write or filesystem step failed in a way retrying cannot fix (owner or PP) | no | yes | **park, always** |
-| `identity` | any | the release's evidence contradicts itself (PP) | yes | no | **park, always** |
-| `hold_expired` | the hold's stage | an environmental hold passed its deadline (§2.3) | no | yes | **park, always** |
+| `par` | `par_verify`/`par_repair` | repair impossible (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `unpack` | `unpack` | the extractor failed on the bytes (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `script` | `script` | post script exited non-zero (PP) | no | yes | `keep_failed_downloads` |
+| `publish` | `move`/`publication_verify` | nothing passes selection (PP) | no | yes | `keep_failed_downloads`, after salvage settles |
+| `io` | any | a write or filesystem step failed in a way retrying cannot fix (owner or PP) | no | yes | `keep_failed_downloads`, after salvage settles |
+| `identity` | any | the release's evidence contradicts itself (PP) | yes | no | `keep_failed_downloads`, after salvage settles |
+| `hold_expired` | the hold's stage | an environmental hold passed its deadline (§2.3) | no | yes | `keep_failed_downloads`, after salvage settles |
 
 History status strings, per reason: `FAILURE/HEALTH` · `FAILURE/FETCH` ·
 `PAR_FAILURE` · `UNPACK_FAILURE` · `SCRIPT_FAILURE` · `FAILURE/PUBLISH` ·
@@ -342,7 +342,7 @@ both heal on remount) → `storage_unavailable` (SQLite `SQLITE_FULL` →
 errno is read from the `io::Error` (`raw_os_error()`, or the error it wraps)
 wherever one exists, and from its kind when only the kind survived; only a
 subprocess's stderr is read as text (`nzbd_engine::stderr_hold_cause`).
-Everything else is the job's terminal failure — `failed/io`, parked, for a
+Everything else is the job's terminal failure — `failed/io`, subject to the retention preference, for a
 filesystem error. That deliberately includes `EACCES`/`EPERM`/`ENOENT` (a
 retry repeats them) and `EMFILE`/`ENFILE`/`ENOMEM`: those are a fault in the
 daemon or the host, not the volume, and a hold would hide it.
@@ -378,23 +378,22 @@ probe. The authenticated cluster expiry decision binds the grant, job revision,
 source generation and control episode before recording `hold_expired`.
 Terminal history/event publication does not wait on the payload mount.
 
-The source owner independently joins actual writers/processes, then parks or
-preserves every stopped source and journal-bound transform generation. A hold
-deadline that ends salvage assessment records an explicit failed-assessment
-error; it does not prove the bytes unusable. An unknown or abandoned
-`hold_expired` assessment takes Park precedence over Curator-admitted
-`failure_action=delete`, including old automatic delete replay. A successfully
-published salvage with no abandonment error or unresolved remote custody still
-uses the existing generation-bound Delivery retirement under W3. Keep, legacy enrollment and ordinary retention validators still apply.
-Unproven stop/custody remains Pending with an error and durable retry outbox;
-reboot, a timeout or a missing receipt never proves physical completion.
+The source owner independently joins actual writers/processes before source
+cleanup. An unknown or abandoned assessment does not prove bytes unusable,
+but does not force Park either: disposal follows `keep_failed_downloads` and
+per-download Keep after salvage and cleanup custody settle. Unresolved remote
+custody or unproven stop remains Pending with an error and durable retry
+outbox; reboot, a timeout or a missing receipt never proves completion.
+Generation-bound Delivery retirement, legacy enrollment and ordinary
+retention validators still apply.
 
-- **One retry clock.** A timed hold is retried at 30 s, 1 m, 2 m, then every
-  5 m (`HOLD_RETRY_DELAYS_SECONDS`, jittered), by the owner; nothing else
-  schedules a held job.
+- **One retry clock.** Non-storage timed holds use 30 s, 1 m, 2 m, then
+  every 5 m (`HOLD_RETRY_DELAYS_SECONDS`, jittered). Storage holds use
+  the shorter delays described below. The owner schedules held work.
 - **A deadline runner enforces.** `[post] hold_deadline_secs` (default
   `86400`; `password_hold_deadline_secs`, default `604800`) after the episode
-  began, runner ends the job `failed/hold_expired`, bytes parked. Curator
+  began, runner ends the job `failed/hold_expired`; bytes follow the retention
+  preference. Curator
   never authors that terminal. `deadline_in_s` is the time remaining as of
   the control's last write (hosts share no clock); `deadline_unix` is for
   display.
@@ -404,6 +403,14 @@ reboot, a timeout or a missing receipt never proves physical completion.
   automatic recovery until they resume it; the deadline keeps running. The
   status stays `held`. A job a person paused before it was held keeps the
   pause: when its storage comes back it returns to `paused`, not `queued`.
+
+**Storage retry.** Clear space and let automatic probes retry eligible work;
+storage delays are capped at 30–60 seconds and persisted long storage holds
+are shortened. `POST /api/v1/queue/actions/retry-storage` (web **retry storage
+now**) requests probes, including idle post failures. It changes neither
+manual lane pause; it does not blindly clear the evidence latch. Successful
+probes release eligible work; writer-stop, custody and manual-pause gates
+still apply.
 
 ### 2.4 Status and progress
 
@@ -519,7 +526,7 @@ post-processing retry) runner reconciles each intent that is still open:
   move the rest, write the manifest;
 - any file missing from both sides, or changed → **unwind**: move the moved
   files back by identity, remove the target directory, and fail the job
-  `failed/io` (parked, no blame) on its next publication attempt.
+  `failed/io` (no blame; retention preference applies) on its next publication attempt.
 
 Exactly one of finish or unwind runs, and the decision is logged with the
 per-file evidence. A restart that had already decided to finish and stopped
@@ -548,7 +555,7 @@ abandoned from the Files detail (*Abandon move and retain original*), i.e.
 `POST /api/v1/artifact-operations/<op>/abandon-relocation` with the
 artifact's `revision` and `generation`. Runner unwinds the move — the source
 is complete and stays runner's — and the job's next publication attempt fails
-`failed/io`, parking the source. If the move cannot be put back safely,
+`failed/io`, with source disposal governed by the retention preference. If the move cannot be put back safely,
 abandoning closes it without deleting anything: the files stay where they are
 and the publication directory (no manifest, so never curator's) is registered
 in the inventory for an explicit disposition.
@@ -591,10 +598,11 @@ curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/deliveries?after=0&limit=
 ## 5. Failure disposal and the artifact inventory
 
 After the terminal, runner disposes of a failed job's processing source per
-`[post] failure_action` (`delete` by default, `park`, `none`) — overridden by
-the job's Keep flag (kept, never deleted) and, for jobs Curator did not admit,
-by the park-always reasons (§2.2) — and only once any salvage obligation has
-settled. Disposal is owned by the artifact record
+`[post] keep_failed_downloads` (false by default: Delete; true: Park),
+overridden by the job's Keep flag, and only after salvage and cleanup custody
+settle. Legacy `failure_action`/`health_action` values do not govern runtime
+retention; reason and recoverability do not force Park. Disposal is owned by
+the artifact record
 and gated by the `job_terminals` row, not the queue row; it runs on the
 artifact operation's own retry ladder (`Operation.next_retry`: 30 s, 1 m,
 2 m, then every 5 m) and, in a cluster, under the operation's lease, so one
@@ -661,8 +669,8 @@ curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/status" \
 ```
 
 **How to read it.** `health_abort` is reported by nzbd and **deliberately not
-surfaced by monarr**. It reflects `[post] health_action` being `park` or
-`delete` — an operator policy that is on by default and correct to leave on.
+surfaced by monarr**. It reports the always-armed below-critical health cancellation, independent
+of `[post] keep_failed_downloads` or legacy retention values.
 Surfacing it produced a red badge that could never be cleared, which trains
 you to ignore the panel. A signal that is always on is not a signal.
 

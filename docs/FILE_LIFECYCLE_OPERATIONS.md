@@ -28,6 +28,13 @@ fresh **Grab** in Curator, or retry the retained source. Removing such a queue
 entry does not offer an Undo that would reuse its consumer request token.
 Ordinary parked jobs retain their existing Undo/requeue behavior.
 
+**Failed-download policy.** Settings → Post-processing → **keep failed
+downloads** (`post.keep_failed_downloads`) defaults off: Delete after salvage
+and cleanup custody settle. Enable it for Park; reason, recoverability and
+Curator admission do not force parking. Per-download Keep retains its source
+indefinitely. Legacy `failure_action`/`health_action` values do not govern the
+daemon's retention choice. Health cancellation remains armed either way.
+
 New owned failures use seven days by default. Expiry is the wall-clock
 deadline alone: it is the same across restarts and downtime, and Keep or a
 hold suspends it. Zero days means indefinitely. An owned allocation whose job
@@ -165,7 +172,7 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
   destination), written before the first rename; `.runner-manifest.json` is
   written last. On restart each open intent is finished (every file found
   unchanged in the target or the source) or unwound (moved files put back by
-  identity, the target removed, the job failed `io` and parked) — never both.
+  identity, the target removed, the job failed `io` with the retention policy applied) — never both.
   While an intent is open, deletion, disposal and queue retirement refuse
   either side; the source shows in state `transitioning`. Same-volume files are renamed (no copy, one digest read at
   most); cross-volume files are streamed once, hashing as they are written. A
@@ -179,8 +186,8 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
   **Abandon move and retain original** — which unwinds it, or, where it
   cannot be put back safely, closes it without deleting anything and
   registers the publication directory (no manifest) for an explicit
-  disposition; the job's next publication attempt fails `io` and parks the
-  source.
+  disposition; the job's next publication attempt fails `io` and applies the
+  retention policy once custody settles.
   The processing directory then holds only unselected siblings, which Runner
   disposes of once the delivery row exists. See
   [INTEGRATION.md §2a](INTEGRATION.md#2a-publication-manifest-and-the-move-journal-pipeline-contract-v2-runner-040).
@@ -350,6 +357,14 @@ Attempts and exponential backoff survive restart (eight attempts; initial
 30-second backoff). Quota release is explicitly operator-triggered because
 `statvfs` supplies no authoritative quota headroom. Manual pause and review
 holds survive resource release.
+
+After clearing space, automatic storage probes resume eligible work with
+storage delays capped at 30–60 seconds; persisted long storage holds are
+shortened. The web **retry storage now** button calls
+`POST /api/v1/queue/actions/retry-storage`, including probes for idle post
+failures. It preserves both manual lane pauses and the evidence latch.
+Successful probes, rather than a free-space reading or a lane toggle, release
+eligible work; stop/custody and per-job manual-pause gates still apply.
 
 The web and mobile queues put held jobs under **Needs attention**, with the
 recorded reason. Failed jobs and torrents with missing files or storage holds
