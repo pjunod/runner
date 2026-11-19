@@ -422,6 +422,29 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
     use nzbd_state::UrlAdmissionReceipt;
     use std::io::Write;
 
+    async fn post_disposition(
+        client: &crate::http::ClusterClient,
+        base: &str,
+        action: &JobDispositionRequest,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = hyper::Request::post("/api/v1/jobs/37/disposition")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(action).unwrap()))
+            .unwrap();
+        let response = client.forward(base, request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(axum::body::Body::new(response.into_body()), 64 * 1024)
+            .await
+            .unwrap();
+        let snapshot = serde_json::from_slice(&body).unwrap_or_else(|error| {
+            panic!(
+                "disposition returned {status}: {error}: {}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        (status, snapshot)
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let a = Node::start(temp.path(), "authority", true).await;
     let b = Node::start(temp.path(), "writer", false).await;
@@ -532,7 +555,11 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
         )
         .await
         .unwrap();
-    let (incarnation, revision) = control.job_identity(job_id.0).await.unwrap().unwrap();
+    let (incarnation, revision) = control
+        .job_identity(u64::from(job_id.0))
+        .await
+        .unwrap()
+        .unwrap();
     let storage = b.runtime.engine.artifacts().installation.clone();
     let scope = serde_json::json!({"_startOrdered":1,"_workerStorage":storage,
         "_authority":{"node":issuer.0,"incarnation":issuer.1,"fence":issuer.2}})
@@ -608,8 +635,7 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
     let workspace = workspace_root.join(relative);
     b.stop().await;
 
-    let client = reqwest::Client::new();
-    let route = format!("{}/api/v1/jobs/37/disposition", a.url);
+    let client = crate::http::ClusterClient::new("keep-secret".into());
     let action = JobDispositionRequest {
         request_id: "disposition-37".into(),
         action: JobDispositionAction::Delete,
@@ -622,13 +648,7 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
     let mut stale = action.clone();
     stale.generation.push_str("-stale");
     assert_eq!(
-        client
-            .post(&route)
-            .json(&stale)
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        post_disposition(&client, &a.url, &stale).await.0,
         StatusCode::CONFLICT
     );
     assert!(control
@@ -636,13 +656,8 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
         .await
         .unwrap()
         .is_none());
-    let first = client.post(&route).json(&action).send().await.unwrap();
-    assert_eq!(
-        first.status(),
-        StatusCode::ACCEPTED,
-        "{:?}",
-        first.text().await
-    );
+    let (status, first) = post_disposition(&client, &a.url, &action).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
     let removal = control
         .cancellation_removal(job_id.0, &incarnation)
         .await
@@ -657,25 +672,18 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
     reused.source_generation = None;
     reused.source_artifact_id = None;
     assert_eq!(
-        client
-            .post(&route)
-            .json(&reused)
-            .send()
-            .await
-            .unwrap()
-            .status(),
+        post_disposition(&client, &a.url, &reused).await.0,
         StatusCode::CONFLICT
     );
-    let still_pending = client.post(&route).json(&action).send().await.unwrap();
-    assert_eq!(still_pending.status(), StatusCode::ACCEPTED);
+    let (status, still_pending) = post_disposition(&client, &a.url, &action).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{still_pending}");
     assert!(workspace.join("partial-assembly.bin").exists());
 
     let b = Node::start(temp.path(), "writer", false).await;
     assert_eq!(b.runtime.engine.artifacts().installation, storage);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     loop {
-        let response = client.post(&route).json(&action).send().await.unwrap();
-        let snapshot: serde_json::Value = response.json().await.unwrap();
+        let (_, snapshot) = post_disposition(&client, &a.url, &action).await;
         if snapshot["state"] == "verified" {
             break;
         }

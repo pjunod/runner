@@ -3467,11 +3467,9 @@ impl Owner {
                         &params,
                     )
                 });
-                if let (Some(token), Some(fingerprint), Some(nonce)) = (
-                    request_token.as_ref(),
-                    submission_sha256.as_ref(),
-                    &admission_nonce,
-                ) {
+                if let (Some(token), Some(fingerprint)) =
+                    (request_token.as_ref(), submission_sha256.as_ref())
+                {
                     if !self.persist {
                         let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                         return;
@@ -3660,9 +3658,11 @@ impl Owner {
                     }
                 }
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
-                if let (Some(token), Some(fingerprint)) =
-                    (request_token.as_ref(), submission_sha256.as_ref())
-                {
+                if let (Some(token), Some(fingerprint), Some(nonce)) = (
+                    request_token.as_ref(),
+                    submission_sha256.as_ref(),
+                    &admission_nonce,
+                ) {
                     let receipt = UrlAdmissionReceipt {
                         protocol_version: 1,
                         request_token: token.clone(),

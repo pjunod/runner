@@ -837,7 +837,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let path = root.join("episode");
         let inventory = Inventory::open(&state).unwrap();
-        let artifact = inventory.allocate(41, &root, &path).unwrap();
+        let _artifact = inventory.allocate(41, &root, &path).unwrap();
         std::fs::write(path.join("episode.mkv"), b"owned contents").unwrap();
         let artifact = inventory.finish(41, &path, &root, "retained").unwrap();
         let source = SourceGeneration {

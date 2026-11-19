@@ -1112,12 +1112,11 @@ async fn report_completions(
                 tracing::warn!(job=job_id.0,%error,"completion outbox commit failed");
                 continue;
             }
-            let req = std::fs::read(completion_path(cfg, &req))
+            std::fs::read(completion_path(cfg, &req))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<PendingCompletion>(&bytes).ok())
                 .map(|pending| pending.request)
-                .unwrap_or(req);
-            req
+                .unwrap_or(req)
         };
         if submit_completion(
             cfg,
@@ -1835,8 +1834,9 @@ async fn poll_for_work(
             {
                 let inventory = engine.artifacts();
                 let incoming = grant.job.clone();
+                let retry_context = context.clone();
                 match tokio::task::spawn_blocking(move || {
-                    inventory.adopt_worker_retry_for_job(&incoming, &context)
+                    inventory.adopt_worker_retry_for_job(&incoming, &retry_context)
                 })
                 .await
                 {

@@ -3821,6 +3821,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
+    use std::time::Duration;
     use tower::util::ServiceExt;
 
     async fn test_engine(tmp: &tempfile::TempDir) -> EngineHandle {
