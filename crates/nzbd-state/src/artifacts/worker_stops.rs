@@ -2,6 +2,10 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+mod assembly;
+use assembly::AssemblyWorkspace;
+pub use assembly::WorkerAssemblyRetirement;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerStopRequest {
@@ -36,6 +40,8 @@ struct GrantJournal {
     never_started: bool,
     #[serde(default)]
     receipt: Option<WorkerStoppedReceipt>,
+    #[serde(default)]
+    assembly: Option<AssemblyWorkspace>,
 }
 #[derive(Clone, Debug)]
 pub struct WorkerStopTicket {
@@ -145,6 +151,38 @@ impl Inventory {
                 "owned copy identity/use changed; retain for review".into(),
             ));
         }
+        if artifact.terminal() {
+            // Recheck absence under the recorded mount and directory handle.
+            // A missing/rebound volume is an unresolved source observation.
+            if artifact.gone_reason.is_some() {
+                return Err(Error::Conflict(
+                    "source absence was not verified against its owned root".into(),
+                ));
+            }
+            let root = self.verify_root(&artifact)?;
+            let relative = artifact
+                .path
+                .strip_prefix(&artifact.root)
+                .map_err(|_| Error::Conflict("retired source escaped its owned root".into()))?;
+            let parent_path = relative
+                .parent()
+                .ok_or_else(|| Error::Conflict("retired source has no parent".into()))?;
+            let parent = if parent_path.as_os_str().is_empty() {
+                root
+            } else {
+                fs::open_relative(&root, &parent_path.to_string_lossy())?
+            };
+            let name = relative
+                .file_name()
+                .ok_or_else(|| Error::Conflict("retired source has no name".into()))?;
+            if fs::entry_missing_at(&parent, name)? {
+                fs::sync_directory(&parent)?;
+                return Ok(Vec::new());
+            }
+            return Err(Error::Conflict(
+                "retired source path was occupied again; retain for review".into(),
+            ));
+        }
         let directory = self.verify(&artifact)?;
         let observed = fs::manifest(&directory, 100_000)?;
         let recorded: std::collections::HashMap<_, _> = artifact
@@ -239,6 +277,14 @@ impl Inventory {
     /// This commit precedes private allocation/copy/import/writer creation.
     /// A removal fence and a late grant start serialize on the same guard.
     pub fn begin_worker_grant(&self, request: &WorkerStopRequest) -> Result<()> {
+        self.begin_worker_grant_with_assembly(request, None)
+    }
+
+    fn begin_worker_grant_with_assembly(
+        &self,
+        request: &WorkerStopRequest,
+        assembly: Option<AssemblyWorkspace>,
+    ) -> Result<()> {
         validate(request, &self.installation)?;
         if request.removal_revision.is_some() || !request.start_ordered {
             return Err(Error::Conflict(
@@ -270,6 +316,7 @@ impl Inventory {
                 phase: "started".into(),
                 never_started: false,
                 receipt: None,
+                assembly,
             },
         )
     }
@@ -316,6 +363,7 @@ impl Inventory {
             phase: "stopping".into(),
             never_started: true,
             receipt: None,
+            assembly: None,
         });
         if record.request.owner_incarnation != request.owner_incarnation
             || record.request.authority_source_json != request.authority_source_json

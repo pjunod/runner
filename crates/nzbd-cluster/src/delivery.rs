@@ -259,7 +259,9 @@ impl ControlStore {
         &self,
         token: &str,
     ) -> Result<Option<ClusterDelivery>, String> {
-        let row=self.client.query_consistent_map::<ValueRow,_>("SELECT id AS value FROM cluster_deliveries WHERE request_token=?1 ORDER BY sequence DESC LIMIT 1",params!(token)).await.map_err(|error|error.to_string())?.into_iter().next();
+        let row=self.client.query_consistent_map::<ValueRow,_>("SELECT id AS value FROM cluster_deliveries WHERE request_token=?1
+            AND coalesce(json_extract(data,'$.source_disposition'),'') NOT IN ('cancellation_delete_files','cancellation_keep_files')
+            ORDER BY sequence DESC LIMIT 1",params!(token)).await.map_err(|error|error.to_string())?.into_iter().next();
         match row {
             Some(row) => self.cluster_delivery(&row.value).await,
             None => Ok(None),
@@ -879,6 +881,13 @@ async fn authorized_copy(
         .cluster_delivery(&request.delivery_id)
         .await?
         .ok_or("Delivery not found")?;
+    if record.source_disposition.as_deref() == Some("cancellation_delete_files")
+        && !control
+            .disposition_cleanup_ready(&request.delivery_id)
+            .await?
+    {
+        return Err("explicit disposition is still joining its owners".into());
+    }
     let copy = record
         .copies
         .iter()
@@ -1069,12 +1078,6 @@ pub(crate) async fn cleanup_copy(
                     let identity = copy
                         .directory_identity
                         .ok_or("legacy copy has no owned directory identity; review required")?;
-                    if !path.try_exists().map_err(|e| e.to_string())? {
-                        return Ok(nzbd_state::artifacts::ClusterCopyCleanup {
-                            status: "removed".into(),
-                            error: None,
-                        });
-                    }
                     let files = copy
                         .deletion_files
                         .ok_or("copy lacks a durable deletion manifest; retain it for review")?;
@@ -1148,6 +1151,13 @@ pub(crate) async fn cleanup_one_copy(
     let mut selected = None;
     for mut record in rows {
         *cursor = record.delivery.sequence;
+        if record.source_disposition.as_deref() == Some("cancellation_delete_files")
+            && !control
+                .disposition_cleanup_ready(&record.delivery.delivery_id)
+                .await?
+        {
+            continue;
+        }
         if record.source_disposition.as_deref() == Some("cancellation_delete_files")
             && record
                 .copies

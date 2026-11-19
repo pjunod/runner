@@ -57,7 +57,7 @@ pub(crate) async fn stop(
         Err(error) => reply::<WorkerStoppedReceipt>(Err(error)),
     }
 }
-async fn stop_exact(
+pub(crate) async fn stop_exact(
     shared: &Arc<LeaderShared>,
     request: &StopRequest,
 ) -> Result<WorkerStoppedReceipt, String> {
@@ -137,7 +137,7 @@ async fn stop_exact(
     } else {
         crate::worker::cancel_and_join_execution(shared, &stop.context).await?
     };
-    if !joined && !ticket.never_started && grant.kind != "download" {
+    if !joined && !ticket.never_started && grant.kind == "post" {
         // Exclusive inventory reopening covers Rust writer lifetime, not an
         // external child. Only its exact sealed completion may substitute.
         let sealed = request
@@ -233,7 +233,11 @@ async fn complete_exact(
     let root = shared.cfg.shared_dir.join(".nzbd-cluster/generations");
     let decision =
         crate::cancellation::decide(control, &root, request, shared.authority_identity()).await?;
-    if decision.disposition == "cleanup_pending" {
+    if decision.disposition == "cleanup_pending"
+        && control
+            .disposition_cleanup_ready(&decision.cleanup_id)
+            .await?
+    {
         let record = control
             .cluster_delivery(&decision.cleanup_id)
             .await?
@@ -405,7 +409,7 @@ pub(crate) async fn refresh_owner_seals(
     Ok(())
 }
 
-type StopAuthority = (
+pub(crate) type StopAuthority = (
     crate::grant_receipts::HistoricalGrant,
     crate::cancellation::RemovalRecord,
 );
@@ -415,7 +419,7 @@ pub(crate) async fn stop_authority(
 ) -> Response {
     reply(stop_authority_exact(&shared, &request).await)
 }
-async fn stop_authority_exact(
+pub(crate) async fn stop_authority_exact(
     shared: &Arc<LeaderShared>,
     request: &StopRequest,
 ) -> Result<StopAuthority, String> {
@@ -469,6 +473,12 @@ async fn seal_authority_exact(
         || record.source_disposition.as_deref() != Some("cancellation_delete_files")
     {
         return Err("this removal keeps files; no cleanup authority".into());
+    }
+    if !control
+        .disposition_cleanup_ready(&request.cleanup_id)
+        .await?
+    {
+        return Err("explicit disposition is still joining its owners".into());
     }
     let copy = record
         .copies

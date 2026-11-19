@@ -18,6 +18,7 @@ mod delivery;
 pub mod election;
 mod grant_receipts;
 pub mod http;
+mod job_disposition;
 pub mod layout;
 pub mod leader;
 pub mod proto;
@@ -307,11 +308,13 @@ impl ClusterRuntime {
             let cancel = cancel.clone();
             tracker.spawn(async move {
                 let mut cleanup_cursor=0;
+                let mut disposition_cursor=0;
                 loop {
                     if cancel.is_cancelled(){break;}
                     if shared.view.borrow().is_me && shared.authority_ready() {
                         if let Err(error)=delivery::migrate_local_deliveries(&shared).await {tracing::warn!(%error,"cluster Delivery catalog adoption remains pending");}
                         if let Err(error)=cluster_keep::reconcile_one(&shared).await {tracing::warn!(%error,"cluster Keep owner application remains pending");}
+                        if let Err(error)=job_disposition::reconcile_one(&shared,&mut disposition_cursor).await {tracing::debug!(%error,"cluster job disposition remains pending");}
                         if let Err(error)=delivery::cleanup_one_copy(&shared,&mut cleanup_cursor).await {tracing::warn!(%error,"cluster source-copy cleanup remains pending");}
                     }
                     tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
@@ -558,6 +561,10 @@ impl ClusterRuntime {
             .layer(middleware::from_fn_with_state(
                 self.leader_shared.clone(),
                 cluster_keep::serve,
+            ))
+            .layer(middleware::from_fn_with_state(
+                self.leader_shared.clone(),
+                job_disposition::serve,
             )),
             auth.clone(),
         )
@@ -617,7 +624,7 @@ async fn commit_control_mutation(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if cluster_keep::serves(&request) {
+    if cluster_keep::serves(&request) || job_disposition::job_id(&request).is_some() {
         return next.run(request).await;
     }
     let observations = shared

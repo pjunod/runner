@@ -415,3 +415,330 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
     b.stop().await;
     a.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_disposition_retires_started_assembly_after_original_receiver_restarts() {
+    use crate::cancellation::RemovalMode;
+    use nzbd_state::UrlAdmissionReceipt;
+    use std::io::Write;
+
+    async fn post_disposition(
+        client: &crate::http::ClusterClient,
+        base: &str,
+        action: &JobDispositionRequest,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = hyper::Request::post("/api/v1/jobs/37/disposition")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(action).unwrap()))
+            .unwrap();
+        let response = client.forward(base, request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(axum::body::Body::new(response.into_body()), 64 * 1024)
+            .await
+            .unwrap();
+        let snapshot = serde_json::from_slice(&body).unwrap_or_else(|error| {
+            panic!(
+                "disposition returned {status}: {error}: {}",
+                String::from_utf8_lossy(&body)
+            )
+        });
+        (status, snapshot)
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let a = Node::start(temp.path(), "authority", true).await;
+    let b = Node::start(temp.path(), "writer", false).await;
+    let until = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !a.runtime.leader_shared.authority_ready()
+        || b.runtime.leader_view().leader_url() != Some(a.url.as_str())
+        || !crate::registry::read_nodes(&a.runtime.leader_shared.layout)
+            .iter()
+            .any(|n| n.name == "writer")
+    {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "authorities never became ready"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let control = a.runtime.control.as_ref().unwrap();
+    let instance = control.delivery_instance().await.unwrap();
+    let job_id = JobId(37);
+    let inventory = a.runtime.engine.artifacts();
+    let root = &a.runtime.leader_shared.dest_dir;
+    let path = root.join("disposition-source");
+    let outside = temp.path().join("library-copy");
+    std::fs::create_dir_all(root).unwrap();
+    inventory
+        .allocate_for_delivery(job_id.0, root, &path, true, true)
+        .unwrap();
+    let partial = path.join(".runner-file-61.part");
+    std::fs::write(&partial, b"owned partial").unwrap();
+    std::fs::hard_link(&partial, &outside).unwrap();
+    let copy = inventory
+        .cluster_download_authority_source(job_id.0)
+        .unwrap()
+        .unwrap();
+    let source = serde_json::to_string(&crate::delivery::AuthoritySourceCopy {
+        owner_node: "authority".into(),
+        copy: copy.clone(),
+    })
+    .unwrap();
+    let transfer = "exact-task-37".to_owned();
+    let generation = format!("{instance}-url-37-test");
+    let job = Job {
+        id: job_id,
+        kind: JobKind::Nzb,
+        name: "partial".into(),
+        dir_name: "disposition-source".into(),
+        name_provisional: false,
+        delivery_lifecycle: true,
+        queued_at_unix: 1,
+        original_name: String::new(),
+        category: None,
+        priority: 0,
+        dupe: Default::default(),
+        params: vec![
+            ("monarr-transfer".into(), transfer.clone()),
+            (crate::delivery::AUTHORITY_COPY_PARAM.into(), source.clone()),
+            ("Failure:Stage".into(), "download".into()),
+            ("Failure:Reason".into(), "historical diagnostic".into()),
+            (PP_DONE_PARAM.into(), "FAILURE/HEALTH".into()),
+        ],
+        files: vec![nzbd_types::FileEntry {
+            id: FileId(61),
+            subject: "partial".into(),
+            filename: "unconfirmed.bin".into(),
+            filename_confirmed: false,
+            is_par2: false,
+            paused: true,
+            groups: vec![],
+            date: None,
+            segments: vec![],
+            crc32: None,
+            finalized: false,
+        }],
+        totals: Default::default(),
+        status: JobStatus::Failed,
+        torrent: None,
+        stages: vec![],
+    };
+    let admission = UrlAdmissionReceipt {
+        protocol_version: 1,
+        request_token: transfer.clone(),
+        submission_sha256: "a".repeat(64),
+        job_id: job_id.0,
+        generation: generation.clone(),
+        runner_instance_id: instance.clone(),
+        terminal_outcome: None,
+        outcome: "failed".into(),
+        failure_stage: None,
+        failure_cause: None,
+        custody_state: "runner_owned".into(),
+        keep_source_on_failure: false,
+        source_cleanup_status: None,
+        publication_path: None,
+        source_artifact_id: None,
+        source_generation: None,
+        failure_reason: None,
+        fetch_cause: None,
+        blames_release: None,
+        salvage: None,
+    };
+    let issuer = a.runtime.leader_shared.authority_identity();
+    control
+        .commit_job_delta_guarded(
+            &[(u64::from(job_id.0), Some(job.clone()))],
+            &Default::default(),
+            &[admission],
+            Some(issuer),
+        )
+        .await
+        .unwrap();
+    let (incarnation, revision) = control
+        .job_identity(u64::from(job_id.0))
+        .await
+        .unwrap()
+        .unwrap();
+    let storage = b.runtime.engine.artifacts().installation.clone();
+    let scope = serde_json::json!({"_startOrdered":1,"_workerStorage":storage,
+        "_authority":{"node":issuer.0,"incarnation":issuer.1,"fence":issuer.2}})
+    .to_string();
+    let crate::control::LeaseClaim::Acquired(token) = control
+        .acquire(
+            "work/job/37/download",
+            "exact-keep",
+            u64::from(job_id.0),
+            &incarnation,
+            "writer",
+            &b.runtime.leader_shared.owner_incarnation,
+            "download",
+            &scope,
+            revision,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("grant")
+    };
+    let crate::control::LeaseClaim::Acquired(assembly) = control
+        .acquire(
+            "work/job/37/file/61/assemble",
+            "exact-keep",
+            u64::from(job_id.0),
+            &incarnation,
+            "writer",
+            &b.runtime.leader_shared.owner_incarnation,
+            "assemble",
+            &scope,
+            revision,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("assembly grant")
+    };
+    let assembly_start = WorkerStopRequest {
+        job: job_id.0,
+        context: WorkerControlContext {
+            lease_id: format!("{}@{}", assembly.resource, assembly.fence),
+            job_incarnation: incarnation.clone(),
+            job_revision: revision,
+            control_revision: revision,
+            epoch: issuer.2,
+        },
+        owner_incarnation: assembly.owner_incarnation,
+        storage_instance_id: storage.clone(),
+        removal_revision: None,
+        authority_source_json: Some(source),
+        start_ordered: true,
+    };
+    let workspace_root = &b.runtime.leader_shared.dest_dir;
+    std::fs::create_dir_all(workspace_root).unwrap();
+    let writer_inventory = b.runtime.engine.artifacts();
+    writer_inventory
+        .begin_worker_assembly_grant(&assembly_start, workspace_root)
+        .unwrap();
+    let (mut output, reader, relative) = writer_inventory
+        .allocate_worker_assembly(
+            job_id.0,
+            &assembly_start.context,
+            workspace_root,
+            "partial-assembly.bin",
+        )
+        .unwrap();
+    output.write_all(b"partially assembled").unwrap();
+    output.sync_all().unwrap();
+    drop((output, reader, writer_inventory));
+    let workspace = workspace_root.join(relative);
+    b.stop().await;
+
+    let client = crate::http::ClusterClient::new("keep-secret".into());
+    let action = JobDispositionRequest {
+        request_id: "disposition-37".into(),
+        action: JobDispositionAction::Delete,
+        transfer: transfer.clone(),
+        runner_instance_id: instance,
+        generation,
+        source_artifact_id: Some(copy.source.artifact),
+        source_generation: Some(copy.source.generation),
+    };
+    let mut stale = action.clone();
+    stale.generation.push_str("-stale");
+    assert_eq!(
+        post_disposition(&client, &a.url, &stale).await.0,
+        StatusCode::CONFLICT
+    );
+    assert!(control
+        .cancellation_removal(job_id.0, &incarnation)
+        .await
+        .unwrap()
+        .is_none());
+    let (status, first) = post_disposition(&client, &a.url, &action).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{first}");
+    let removal = control
+        .cancellation_removal(job_id.0, &incarnation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(removal.mode, RemovalMode::DeleteFiles);
+    assert!(
+        partial.exists(),
+        "tombstone is not a filesystem acknowledgment"
+    );
+    let mut reused = action.clone();
+    reused.source_generation = None;
+    reused.source_artifact_id = None;
+    assert_eq!(
+        post_disposition(&client, &a.url, &reused).await.0,
+        StatusCode::CONFLICT
+    );
+    let (status, still_pending) = post_disposition(&client, &a.url, &action).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{still_pending}");
+    assert!(workspace.join("partial-assembly.bin").exists());
+
+    let b = Node::start(temp.path(), "writer", false).await;
+    assert_eq!(b.runtime.engine.artifacts().installation, storage);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        let (_, snapshot) = post_disposition(&client, &a.url, &action).await;
+        if snapshot["state"] == "verified" {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let copies = match snapshot["operationId"].as_str() {
+                Some(id) => control
+                    .cluster_delivery(id)
+                    .await
+                    .unwrap()
+                    .map(|record| record.copies),
+                None => None,
+            };
+            panic!("disposition did not verify: {snapshot}; copy receipts: {copies:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!partial.exists());
+    assert!(!workspace.exists());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"owned partial");
+    let restored = control.admission(&transfer).await.unwrap().unwrap();
+    assert_eq!(restored.terminal_outcome.as_deref(), Some("FAILURE/HEALTH"));
+    assert_eq!(
+        restored.failure_cause.as_deref(),
+        Some("historical diagnostic")
+    );
+    assert!(
+        control
+            .commit_job_delta(&[(u64::from(job_id.0), Some(job))])
+            .await
+            .is_err(),
+        "the immutable disposition prevents resurrecting the cancelled admission"
+    );
+    let late = WorkerStopRequest {
+        job: job_id.0,
+        context: WorkerControlContext {
+            lease_id: format!("{}@{}", token.resource, token.fence),
+            job_incarnation: incarnation,
+            job_revision: revision,
+            control_revision: revision,
+            epoch: 0,
+        },
+        owner_incarnation: token.owner_incarnation,
+        storage_instance_id: storage,
+        removal_revision: None,
+        authority_source_json: None,
+        start_ordered: true,
+    };
+    assert!(
+        b.runtime
+            .engine
+            .artifacts()
+            .begin_worker_grant(&late)
+            .is_err(),
+        "a late grant cannot start behind the verified receipt"
+    );
+    b.stop().await;
+    a.stop().await;
+}

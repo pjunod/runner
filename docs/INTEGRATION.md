@@ -164,6 +164,7 @@ TOK=<api.token from nzbd.toml>
 | Action (`pause`, `resume`, `delete`, `delete-files`, …) | `POST` | `/api/v1/jobs/{id}/actions/{action}` |
 | Retry now (a hold, or an NZB fetch waiting on its backoff) | `POST` | `/api/v1/jobs/{id}/retry` |
 | Keep the source if it fails | `GET`/`PUT` | `/api/v1/jobs/{id}/failure-keep` (`{"keep": true}`) |
+| Stop and dispose an exact admitted job | `POST` | `/api/v1/jobs/{id}/disposition` |
 | Admission lookup by transfer | `GET` | `/api/v1/request-admissions/{token}` |
 | Status | `GET` | `/api/v1/status` |
 
@@ -211,6 +212,56 @@ curl -sS "$NZBD/healthz"                                               # -> the 
 
 `/api/v1/status` answering with a `version` field is the whole of "runner is
 really there"; curator treats a 200 without `version` as a hard failure.
+
+### Dispose a job by admission
+
+When `GET /api/v1/status` includes `job-disposition-v1`, use the admission
+receipt to bind a confirmed Delete to a Runner instance, transfer and job
+generation. The endpoint uses the native job API's authentication. The
+request ID belongs to this Delete and must survive retries and restarts.
+
+```http
+POST /api/v1/jobs/42/disposition
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "requestId": "delete-6ed8cac3-147e-4263-8099-b87bff4d3543",
+  "action": "delete",
+  "transfer": "t-42-7d94",
+  "runnerInstanceId": "runner-storage-instance",
+  "generation": "admission-generation",
+  "sourceArtifactId": "owned-source",
+  "sourceGeneration": "source-generation"
+}
+```
+
+Send both source fields when the admission receipt supplies them. Leave both
+out before a source is known. Runner compares the job, transfer, instance,
+admission and source in its write path. A new source requires its own
+admission-bound evidence, even if it occupies the same numeric job ID.
+
+Replay the identical request to reconcile the disposition. Each reply carries
+`requestId`, `jobId` (as a string), `transfer`, `runnerInstanceId`,
+`generation`, `state`, and optional `reason` and `operationId`.
+
+| HTTP | State or error | Client behavior |
+|---|---|---|
+| 202 | `pending` | Runner saved the request. Continue polling while writers or file operations settle. |
+| 200 | `blocked` | Keep the request visible with its reason. Replay after the reported prerequisite changes. |
+| 200 | `verified` | The transfer has stopped and its recorded Runner-owned disposal obligations have settled. |
+| 409 | Conflicting identity or reused request ID | Stop the destructive request and reconcile the admitted generation. |
+| 429 | `pending` while the owner is busy before this reply can confirm admission | Retry the same request with backoff. |
+| 503 | Authority or storage is temporarily unavailable | Replay the same request to learn whether it committed. |
+
+The delete receipt is separate from a job terminal. Runner records cancellation
+for stopped live work and preserves an existing failed or completed terminal
+and its history. Runner leaves consumer publications and independent native
+torrent seed jobs with their owners. The existing artifact executor checks
+the exact source, mount and manifest and retains sources whose evidence or
+recovery custody still needs review. The ordinary numeric actions remain
+available for their existing queue and History semantics. Clients must require
+the new capability for the confirmed disposition flow.
 
 ---
 

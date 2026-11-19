@@ -353,7 +353,7 @@ fn same_copy(
 ) -> bool {
     left.owner_node == right.owner_node && left.copy == right.copy
 }
-fn authority_source(
+pub(crate) fn authority_source(
     job: &nzbd_types::Job,
 ) -> Result<Option<crate::delivery::AuthoritySourceCopy>, String> {
     let mut values = job
@@ -421,7 +421,10 @@ async fn prove_grant(
         || original.fence != request.token.fence
         || request.token.revision < original.revision
         || request.token.expires_at_unix_ms < original.expires_at_unix_ms
-        || !matches!(grant.kind.as_str(), "download" | "post" | "assemble")
+        || !matches!(
+            grant.kind.as_str(),
+            "download" | "post" | "segment" | "assemble"
+        )
         || grant.issued_at_unix_ms > removal.at_ms
     {
         return Err("cancellation does not match the immutable historical grant".into());
@@ -812,8 +815,16 @@ async fn acknowledge_owner_stop_policy(
         .cancellation_removal(ack.job_id, &ack.job_incarnation)
         .await?
         .ok_or("owner stop has no current exact removal")?;
-    if removal.mode != RemovalMode::DeleteFiles
-        || removal.applied_revision != ack.removal_applied_revision
+    if removal.applied_revision != ack.removal_applied_revision
+        || (removal.mode != RemovalMode::DeleteFiles
+            && !control
+                .explicit_disposition_covers(
+                    &ack.cleanup_id,
+                    ack.job_id,
+                    &ack.job_incarnation,
+                    ack.removal_applied_revision,
+                )
+                .await?)
     {
         return Err("owner-stop removal scope changed".into());
     }
