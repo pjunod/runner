@@ -248,6 +248,7 @@ impl Owner {
         // and commit removal through its replicated control ledger.
         if self.persist_guard.is_some() {
             let _ = reply.send(Ok(JobDisposition {
+                admitted: false,
                 request,
                 job_id: job.0,
                 state: JobDispositionState::Blocked,
@@ -263,9 +264,16 @@ impl Owner {
             || self.allocating_jobs.contains(&job)
             || !self.disposition_in_flight.insert(job)
         {
-            let _ = reply.send(Err(EngineError::Lifecycle(
-                "Runner is settling another job transition; retry the same request".into(),
-            )));
+            let _ = reply.send(Ok(JobDisposition {
+                admitted: false,
+                request,
+                job_id: job.0,
+                state: JobDispositionState::Pending,
+                reason: Some(
+                    "Runner is settling another job transition; retry the same request".into(),
+                ),
+                operation_id: None,
+            }));
             return;
         }
         let epoch = self.job_epochs.get(&job).copied();
@@ -350,7 +358,16 @@ impl Owner {
         reply: Reply,
     ) {
         let Some(record) = self.state.job(job).cloned() else {
-            self.finish_disposition_stop(receipt, reply);
+            if receipt.source.is_some() || receipt.unallocated_retirement() {
+                self.finish_disposition_stop(receipt, reply);
+            } else {
+                self.reply_disposition_wait(
+                    receipt,
+                    JobDispositionState::Blocked,
+                    "retired admission has no exact source or durable payload-absence proof",
+                    reply,
+                );
+            }
             return;
         };
         if record.torrent.is_some() || self.delegated.contains_key(&job) {
@@ -619,19 +636,23 @@ impl Owner {
     }
 
     fn retire_disposition_job(&mut self, job: JobId, receipt: JobDispositionRecord, reply: Reply) {
-        let bound_source = Some(receipt.source.clone());
-        self.delete_job_with_source_then(job, false, bound_source, move |owner, stopped| {
-            if stopped {
-                owner.finish_disposition_stop(receipt, reply);
-            } else {
-                owner.reply_disposition_wait(
-                    receipt,
-                    JobDispositionState::Pending,
-                    "Runner is still retiring the queue and source writers",
-                    reply,
-                );
-            }
-        });
+        self.delete_job_with_source_then(
+            job,
+            false,
+            Some(receipt.clone()),
+            move |owner, stopped| {
+                if stopped {
+                    owner.finish_disposition_stop(receipt, reply);
+                } else {
+                    owner.reply_disposition_wait(
+                        receipt,
+                        JobDispositionState::Pending,
+                        "Runner is still retiring the queue and source writers",
+                        reply,
+                    );
+                }
+            },
+        );
     }
 
     fn finish_disposition_stop(&mut self, mut receipt: JobDispositionRecord, reply: Reply) {
@@ -641,7 +662,14 @@ impl Owner {
         let inventory = self.artifacts.clone();
         let job = JobId(receipt.job_id);
         self.io_then(
-            move || Ok(inventory.save_job_disposition(&receipt).map(|()| receipt)),
+            move || {
+                Ok((|| {
+                    inventory.save_job_disposition(&receipt)?;
+                    inventory
+                        .job_disposition(&receipt.request.request_id)?
+                        .ok_or(Error::NotFound)
+                })())
+            },
             move |owner, result| match result {
                 Ok(Ok(receipt)) => {
                     owner.disposition_fences.remove(&job);

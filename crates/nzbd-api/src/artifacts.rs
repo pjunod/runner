@@ -107,7 +107,11 @@ async fn job_disposition(
         if receipt.operation_id.is_some() {
             kick_after(st.engine.artifacts(), 0);
         }
-        StatusCode::ACCEPTED
+        if receipt.admitted {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        }
     } else {
         StatusCode::OK
     };

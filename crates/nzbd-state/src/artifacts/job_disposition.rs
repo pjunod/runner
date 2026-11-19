@@ -64,6 +64,8 @@ pub enum JobDispositionState {
 
 #[derive(Clone, Debug)]
 pub struct JobDisposition {
+    /// A temporary owner refusal can carry a typed status before admission.
+    pub admitted: bool,
     pub request: JobDispositionRequest,
     pub job_id: u32,
     pub state: JobDispositionState,
@@ -80,11 +82,18 @@ pub struct JobDispositionRecord {
     pub state: JobDispositionState,
     pub reason: Option<String>,
     pub operation_id: Option<String>,
+    #[serde(default)]
+    unallocated_retirement: bool,
 }
 
 impl JobDispositionRecord {
+    pub fn unallocated_retirement(&self) -> bool {
+        self.unallocated_retirement
+    }
+
     pub fn status(&self) -> JobDisposition {
         JobDisposition {
+            admitted: true,
             request: self.request.clone(),
             job_id: self.job_id,
             state: self.state,
@@ -289,6 +298,7 @@ impl Inventory {
             state: JobDispositionState::Pending,
             reason: None,
             operation_id: None,
+            unallocated_retirement: false,
         };
         let rows = self.db.lock().unwrap().execute(
             "INSERT INTO job_dispositions(id,job,transfer,generation,stopped,data)
@@ -324,16 +334,82 @@ impl Inventory {
             return Err(Error::Conflict("disposition binding changed".into()));
         }
         if current.state != JobDispositionState::Verified {
-            self.db.lock().unwrap().execute(
-                "UPDATE job_dispositions SET stopped=?2,data=?3 WHERE id=?1",
-                params![
-                    receipt.request.request_id,
-                    receipt.stopped,
-                    serde_json::to_string(receipt)?
-                ],
-            )?;
+            let mut next = receipt.clone();
+            // Ordinary status updates cannot manufacture or erase the stop
+            // proof recorded by the local writer retirement path.
+            next.unallocated_retirement = current.unallocated_retirement;
+            self.write_job_disposition(&next)?;
         }
         Ok(())
+    }
+
+    fn write_job_disposition(&self, receipt: &JobDispositionRecord) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE job_dispositions SET stopped=?2,data=?3 WHERE id=?1",
+            params![
+                receipt.request.request_id,
+                receipt.stopped,
+                serde_json::to_string(receipt)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the no-payload proof after the exact live admission's writers
+    /// have joined and the owner has settled the URL or descriptor input.
+    /// Absence of an inventory row is only a corroborating check.
+    pub fn record_unallocated_job_retirement(
+        &self,
+        proof: &JobDispositionRecord,
+        job: &nzbd_types::Job,
+    ) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let Some(mut current) = self.job_disposition(&proof.request.request_id)? else {
+            return Err(Error::NotFound);
+        };
+        if current.request != proof.request
+            || current.job_id != proof.job_id
+            || job.id.0 != proof.job_id
+            || proof.request.runner_instance_id != self.installation
+            || nzbd_types::transfer_of(&job.params).as_deref() != Some(&proof.request.transfer)
+        {
+            return Err(Error::Conflict(
+                "unallocated retirement admission changed".into(),
+            ));
+        }
+        let has_param = |key: &str| job.params.iter().any(|(name, _)| name == key);
+        let exact_generation = |key: &str| {
+            job.params
+                .iter()
+                .any(|(name, value)| name == key && value == &proof.request.generation)
+        };
+        let unopened_download = match job.kind {
+            nzbd_types::JobKind::Url => {
+                has_param("*URL") && exact_generation("*URL:AdmissionGeneration")
+            }
+            nzbd_types::JobKind::Torrent => {
+                job.torrent.is_none()
+                    && exact_generation("*Torrent:AdmissionGeneration")
+                    && !has_param("*Torrent:Donor")
+                    && !has_param("*Torrent:InfoHash")
+                    && !has_param("*Torrent:CopyComplete")
+            }
+            _ => false,
+        };
+        if !unopened_download
+            || !job.files.is_empty()
+            || job.totals != nzbd_types::JobTotals::default()
+            || current.source.is_some()
+            || current.request.source().is_some()
+            || has_param("Artifact:Id")
+            || has_param("Artifact:Generation")
+            || self.for_job(job.id.0)?.is_some()
+            || self.disposition_unbound_copy(&current)?
+        {
+            return Ok(());
+        }
+        current.unallocated_retirement = true;
+        self.write_job_disposition(&current)
     }
 
     fn disposition_source_moved(
@@ -496,6 +572,12 @@ impl Inventory {
         }
         let (state, reason) = match self.advance_disposition_source(&mut receipt) {
             Ok(state) => state,
+            Err(Error::Busy(reason)) => (JobDispositionState::Pending, Some(reason.into())),
+            Err(Error::CleanupRetry { reason, .. }) => (JobDispositionState::Pending, Some(reason)),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => (
+                JobDispositionState::Pending,
+                Some("source custody is still in use".into()),
+            ),
             Err(Error::Conflict(reason) | Error::CleanupBlocked(reason)) => {
                 (JobDispositionState::Blocked, Some(reason))
             }
@@ -541,16 +623,14 @@ impl Inventory {
             ));
         }
         let Some(binding) = &receipt.source else {
-            if terminal.as_ref().is_some_and(|terminal| {
-                terminal.publication.is_none()
-                    && (terminal.outcome == nzbd_types::TerminalOutcome::Cancelled
-                        || (terminal.fetched.success_articles == 0
-                            && matches!(
-                                terminal.stage.as_deref(),
-                                Some("fetch" | "torrent_metadata")
-                            )
-                            && terminal.fetch_cause.is_some()))
-            }) {
+            if receipt.unallocated_retirement
+                && terminal.as_ref().is_some_and(|terminal| {
+                    terminal.publication.is_none()
+                        && terminal.entry.final_dir.is_none()
+                        && terminal.fetched.success_articles == 0
+                        && terminal.fetched.bytes == 0
+                })
+            {
                 return Ok((Verified, None));
             }
             return Err(Error::Conflict(
@@ -646,6 +726,14 @@ impl Inventory {
                 ))
             }
             _ => {}
+        }
+        if artifact.hold.as_deref() == Some("waiting for writer stop")
+            || self.artifact_in_use(&artifact)?
+        {
+            return Ok((
+                Pending,
+                Some("Runner is waiting for exact source custody to release".into()),
+            ));
         }
         if let Some(hold) = &artifact.hold {
             return Ok((
@@ -809,6 +897,69 @@ mod tests {
             inventory.admit_job_disposition(42, changed, None),
             Err(Error::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn disposition_requires_positive_absence_proof_for_legacy_cancellation() {
+        let folder = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(&folder.path().join("state")).unwrap();
+        for (job, bytes) in [(46, 0), (47, 4)] {
+            let entry = serde_json::from_value(serde_json::json!({
+                "job": job,
+                "name": "legacy cancellation",
+                "status": "DELETED",
+                "size": bytes,
+                "completed_at_unix": 1,
+            }))
+            .unwrap();
+            let terminal = JobTerminal {
+                job,
+                transfer: Some("transfer-a".into()),
+                outcome: nzbd_types::TerminalOutcome::Cancelled,
+                reason: None,
+                fetch_cause: None,
+                stage: None,
+                message: None,
+                blames_release: false,
+                salvage: SalvageState::None,
+                keep_on_failure: false,
+                fetched: nzbd_types::Fetched {
+                    bytes,
+                    success_articles: u64::from(bytes > 0),
+                    total_articles: 1,
+                },
+                publication: None,
+                markers: vec![],
+                entry,
+                history_seq: None,
+                history_incarnation: None,
+                markers_stamped: false,
+                emitted: false,
+                disposal: None,
+                salvage_error: None,
+                created_at: 0,
+                updated_at: 0,
+            };
+            inventory.record_terminal(&terminal).unwrap();
+            for step in [
+                TerminalStep::HistoryWritten {
+                    seq: i64::from(job),
+                    incarnation: "legacy-history".into(),
+                },
+                TerminalStep::MarkersStamped,
+                TerminalStep::Emitted,
+            ] {
+                inventory.mark_terminal_step(job, &step).unwrap();
+            }
+            let mut receipt = inventory
+                .admit_job_disposition(job, request(&inventory, &format!("legacy-{job}")), None)
+                .unwrap();
+            receipt.stopped = true;
+            inventory.save_job_disposition(&receipt).unwrap();
+            let status = inventory.settle_job_disposition(receipt).unwrap();
+            assert_eq!(status.state, JobDispositionState::Blocked);
+            assert!(status.operation_id.is_none());
+        }
     }
 
     #[test]

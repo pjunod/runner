@@ -251,6 +251,7 @@ Replay the identical request to reconcile the disposition. Each reply carries
 | 200 | `blocked` | Keep the request visible with its reason. Replay after the reported prerequisite changes. |
 | 200 | `verified` | The transfer has stopped and its recorded Runner-owned disposal obligations have settled. |
 | 409 | Conflicting identity or reused request ID | Stop the destructive request and reconcile the admitted generation. |
+| 429 | `pending` while the owner is busy before this reply can confirm admission | Retry the same request with backoff. |
 | 503 | Authority or storage is temporarily unavailable | Replay the same request to learn whether it committed. |
 
 The delete receipt is separate from a job terminal. Runner records cancellation

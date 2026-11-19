@@ -3899,7 +3899,9 @@ mod tests {
                 }
                 assert!(matches!(
                     response.status(),
-                    StatusCode::ACCEPTED | StatusCode::SERVICE_UNAVAILABLE
+                    StatusCode::ACCEPTED
+                        | StatusCode::TOO_MANY_REQUESTS
+                        | StatusCode::SERVICE_UNAVAILABLE
                 ));
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

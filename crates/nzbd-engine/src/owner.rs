@@ -9200,7 +9200,7 @@ impl Owner {
         &mut self,
         job: JobId,
         delete_files: bool,
-        source: Option<Option<nzbd_state::artifacts::SourceGeneration>>,
+        disposition: Option<nzbd_state::artifacts::JobDispositionRecord>,
         callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
         if delete_files
@@ -9227,9 +9227,9 @@ impl Owner {
         let inventory = self.artifacts.clone();
         let retirement_record = self.state.job(job).cloned().unwrap();
         let retirements = self.url_resolutions.clone();
-        let native_disposition =
-            source.is_some() && crate::torrent_acquisitions::is_acquisition(&retirement_record);
-        let url_disposition = source.is_some()
+        let native_disposition = disposition.is_some()
+            && crate::torrent_acquisitions::is_acquisition(&retirement_record);
+        let url_disposition = disposition.is_some()
             && retirement_record
                 .params
                 .iter()
@@ -9257,15 +9257,15 @@ impl Owner {
         self.payload_then(
             lane_root,
             move || {
-                if let Some(source) = source {
-                    if let Some(source) = source {
+                if let Some(disposition) = &disposition {
+                    if let Some(source) = &disposition.source {
                         let files = disposition::disposition_writer_files(
                             &retirement_record,
-                            &source,
+                            source,
                             &inventory.installation,
                         );
                         inventory
-                            .finish_job_disposition_source(&source, &retirement_record, &files)
+                            .finish_job_disposition_source(source, &retirement_record, &files)
                             .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
                     }
                 } else if let Some(artifact) = inventory
@@ -9293,6 +9293,13 @@ impl Owner {
                     retirements
                         .dispose_disposition_input(&retirement_record, &descriptor_references)
                         .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
+                if let Some(disposition) = &disposition {
+                    if disposition.source.is_none() {
+                        inventory
+                            .record_unallocated_job_retirement(disposition, &retirement_record)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
                 }
                 retirements
                     .retire_job(&retirement_record)
