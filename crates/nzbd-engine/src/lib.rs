@@ -1408,7 +1408,7 @@ impl EngineHandle {
             tracing::error!(job = id.0, "URL executor set poisoned during acquisition");
             poisoned.into_inner()
         });
-        if !jobs.insert(id) {
+        if self.shared.load().job_disposition_fences.contains_key(&id) || !jobs.insert(id) {
             return false;
         }
         drop(jobs);
@@ -1459,7 +1459,11 @@ impl EngineHandle {
             if let Ok(Ok(Some(retry))) = tokio::task::spawn_blocking(move || retry_store.retry(&retry_id)).await {
                 let seconds = retry.next_retry_at.saturating_sub(url_retry_now()).max(0) as u64;
                 storage_retry = retry;
-                tokio::select! { _ = handle.cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(seconds)) => {} }
+                tokio::select! {
+                    _ = handle.cancel.cancelled() => return,
+                    _ = handle.wait_disposition_fence(id) => return,
+                    _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                }
             }
             let mut failure = None;
             // Contract §2.2: the fetcher types its own failure. A local
@@ -1482,6 +1486,7 @@ impl EngineHandle {
                 let kick = handle.url_retry_kicks.register(id);
                 let fetched = tokio::select! {
                     _ = handle.cancel.cancelled() => return,
+                    _ = handle.wait_disposition_fence(id) => return,
                     _ = async {
                         loop { match events.recv().await {
                             Ok(Event::JobDeleted { job }) if job == id => break,
@@ -1612,6 +1617,15 @@ impl EngineHandle {
         true
     }
 
+    async fn wait_disposition_fence(&self, job: JobId) {
+        let mut changes = self.queue_changes.clone();
+        while !self.shared.load().job_disposition_fences.contains_key(&job) {
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     async fn wait_url_coordination_retry(
         &self,
         job: JobId,
@@ -1623,6 +1637,7 @@ impl EngineHandle {
             "URL coordination interrupted; retrying without a storage failure");
         tokio::select! {
             _ = self.cancel.cancelled() => false,
+            _ = self.wait_disposition_fence(job) => false,
             _ = tokio::time::sleep(delay) => true,
         }
     }
@@ -1698,7 +1713,11 @@ impl EngineHandle {
             return false;
         }
         let seconds = retry.next_retry_at.saturating_sub(url_retry_now()).max(0) as u64;
-        tokio::select! { _ = self.cancel.cancelled() => false, _ = tokio::time::sleep(Duration::from_secs(seconds)) => true }
+        tokio::select! {
+            _ = self.cancel.cancelled() => false,
+            _ = self.wait_disposition_fence(origin.id) => false,
+            _ = tokio::time::sleep(Duration::from_secs(seconds)) => true,
+        }
     }
 
     async fn prepare_url_resolution(
@@ -2411,7 +2430,35 @@ impl EngineHandle {
         .await
     }
 
+    pub async fn advance_job_disposition(
+        &self,
+        job: JobId,
+        request: nzbd_state::artifacts::JobDispositionRequest,
+        native_joined: bool,
+    ) -> Result<nzbd_state::artifacts::JobDisposition, EngineError> {
+        let url_joined = !self
+            .url_fetches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&job);
+        let (reply, result) = oneshot::channel();
+        self.send(QueueCommand::AdvanceJobDisposition {
+            job,
+            request,
+            native_joined,
+            url_joined,
+            reply,
+        })
+        .await?;
+        owner_reply(result).await?
+    }
+
     pub async fn delete_job(&self, job: JobId, delete_files: bool) -> Result<bool, EngineError> {
+        if self.shared.load().job_disposition_fences.contains_key(&job) {
+            return Err(EngineError::Lifecycle(
+                "exact job disposition already owns this source".into(),
+            ));
+        }
         let torrent = self
             .snapshot()
             .jobs

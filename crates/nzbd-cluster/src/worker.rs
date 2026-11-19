@@ -49,6 +49,9 @@ pub struct ActiveLeases {
     admissions: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
     operations: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
     retiring: Arc<Mutex<HashMap<String, LeaseKind>>>,
+    /// The completion lane can already be in a blocking seal when a worker
+    /// stop fence commits. Observing its result slot must wait for that join.
+    pub(crate) sealing: Arc<tokio::sync::Mutex<()>>,
 }
 impl std::ops::Deref for ActiveLeases {
     type Target = Mutex<HashMap<String, LeaseState>>;
@@ -1033,44 +1036,60 @@ async fn report_completions(
             }
             continue;
         }
-        let sealed = match seal_generation(cfg, dest_dir, &job, &lease, engine.artifacts()).await {
-            Ok(sealed) => sealed,
-            Err(error) => {
-                tracing::warn!(job = job_id.0, %error, "completion generation could not be sealed");
+        let req = {
+            let _seal = active.sealing.lock().await;
+            if !lease_authority(active, &lease_id, &lease)()
+                || !matches!(
+                    engine
+                        .artifacts()
+                        .worker_grant_is_stopped(job_id.0, &lease.context),
+                    Ok(false)
+                )
+            {
                 continue;
             }
+            let sealed = match seal_generation(cfg, dest_dir, &job, &lease, engine.artifacts())
+                .await
+            {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    tracing::warn!(job = job_id.0, %error, "completion generation could not be sealed");
+                    continue;
+                }
+            };
+            let job = match std::fs::read(sealed.path.join("job.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            {
+                Some(job) => job,
+                None => continue,
+            };
+            let receipt_id = format!(
+                "complete:{}:{}:{}",
+                lease.token.resource, lease.token.fence, sealed.result_id
+            );
+            let req = CompleteRequest {
+                lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
+                node: cfg.node_name.clone(),
+                lease_id: lease_id.clone(),
+                token: lease.token.clone(),
+                expected_job_revision: lease.job_revision,
+                result_id: sealed.result_id,
+                result_ref: sealed.path.to_string_lossy().into_owned(),
+                receipt_id,
+                job,
+            };
+            if let Err(error) = persist_completion(cfg, lease.kind, &req) {
+                tracing::warn!(job=job_id.0,%error,"completion outbox commit failed");
+                continue;
+            }
+            let req = std::fs::read(completion_path(cfg, &req))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<PendingCompletion>(&bytes).ok())
+                .map(|pending| pending.request)
+                .unwrap_or(req);
+            req
         };
-        let job = match std::fs::read(sealed.path.join("job.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        {
-            Some(job) => job,
-            None => continue,
-        };
-        let receipt_id = format!(
-            "complete:{}:{}:{}",
-            lease.token.resource, lease.token.fence, sealed.result_id
-        );
-        let req = CompleteRequest {
-            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
-            node: cfg.node_name.clone(),
-            lease_id: lease_id.clone(),
-            token: lease.token.clone(),
-            expected_job_revision: lease.job_revision,
-            result_id: sealed.result_id,
-            result_ref: sealed.path.to_string_lossy().into_owned(),
-            receipt_id,
-            job,
-        };
-        if let Err(error) = persist_completion(cfg, lease.kind, &req) {
-            tracing::warn!(job=job_id.0,%error,"completion outbox commit failed");
-            continue;
-        }
-        let req = std::fs::read(completion_path(cfg, &req))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PendingCompletion>(&bytes).ok())
-            .map(|pending| pending.request)
-            .unwrap_or(req);
         if submit_completion(
             cfg,
             engine,
@@ -1470,11 +1489,15 @@ async fn submit_completion(
     if decision.receipt_id != req.receipt_id {
         return false;
     }
-    if let Some(setup) = pp {
-        let mut retired = req.job.clone();
-        retired
+    if let Some(setup) = pp.as_ref().filter(|_| {
+        // Preserve a terminal previously emitted by the PP lane. This
+        // receipt decides source custody after rejection, not that outcome.
+        !req.job
             .params
-            .retain(|(key, _)| key != nzbd_types::PP_DONE_PARAM);
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+    }) {
+        let mut retired = req.job.clone();
         retired
             .params
             .push((nzbd_types::PP_DONE_PARAM.into(), "CANCELLED".into()));
@@ -2439,6 +2462,16 @@ fn resolve_post_seal_source(
     ))
 }
 
+pub(crate) fn generation_slot(shared: &Path, job: u32, resource: &str, fence: u64) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let resource_key = format!("{:x}", Sha256::digest(resource.as_bytes()));
+    shared
+        .join(".nzbd-cluster/generations")
+        .join(format!("job-{job}"))
+        .join(format!("work-{}", &resource_key[..16]))
+        .join(format!("fence-{fence}"))
+}
+
 async fn seal_generation(
     cfg: &ClusterConfig,
     dest_dir: &std::path::Path,
@@ -2452,13 +2485,16 @@ async fn seal_generation(
     let lease = lease.clone();
     tokio::task::spawn_blocking(move || {
         use sha2::{Digest, Sha256};
-        let resource_key = format!("{:x}", Sha256::digest(lease.token.resource.as_bytes()));
-        let root = cfg
-            .shared_dir
-            .join(".nzbd-cluster/generations")
-            .join(format!("job-{}", job.id.0))
-            .join(format!("work-{}", &resource_key[..16]));
-        let final_dir = root.join(format!("fence-{}", lease.token.fence));
+        let final_dir = generation_slot(
+            &cfg.shared_dir,
+            job.id.0,
+            &lease.token.resource,
+            lease.token.fence,
+        );
+        let root = final_dir
+            .parent()
+            .expect("generation slot has a parent")
+            .to_owned();
         let manifest_path = final_dir.join("manifest.json");
         if manifest_path.exists() {
             let manifest: GenerationManifest =

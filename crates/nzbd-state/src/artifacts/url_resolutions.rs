@@ -677,6 +677,21 @@ impl UrlResolutionStore {
             b"admission cancelled\n",
         )
     }
+    /// The disposition caller has joined the native descriptor writer.
+    /// Keep any descriptor still referenced by an independently owned seed.
+    pub fn dispose_disposition_input(
+        &self,
+        origin: &Job,
+        descriptor_references: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let identity = url_source_identity(origin)?;
+        if !descriptor_references.contains(&identity) {
+            self.cancel(origin)?;
+            self.compact_settled(&identity)?;
+        }
+        Ok(())
+    }
+
     /// Bounded cleanup of exact owned temporaries and late writes whose
     /// authoritative acceptance/cancellation tombstone already committed.
     pub fn maintenance(&self, limit: usize) -> Result<usize> {

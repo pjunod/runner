@@ -6,8 +6,13 @@ mod cleanup_review;
 pub use cleanup_review::CleanupReview;
 mod cluster;
 mod cluster_keep;
+mod job_disposition;
 pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
 pub use cluster_keep::{ClusterFailureKeepStatus, ClusterFailureKeepTarget};
+pub use job_disposition::{
+    JobAdmissionBinding, JobDisposition, JobDispositionAction, JobDispositionRecord,
+    JobDispositionRequest, JobDispositionState,
+};
 pub(crate) mod fs;
 
 /// Name prefix of the engine's out-of-space directory probe files (W5a):
@@ -347,12 +352,22 @@ pub struct Operation {
     pub error: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct ConsumerDeleteBinding {
+    artifact: String,
+    generation: String,
+    revision: u64,
+    disposition_id: String,
+    owned_selection: String,
+}
+
 /// New deletes bind authorization to an allocation, never just its reusable
 /// row ID. Old journals remain readable but cannot authorize startup repair
 /// without generation evidence.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum DeleteRequest {
+    Consumer(ConsumerDeleteBinding),
     ManagedSeed(torrent_seed::ManagedSeedDeleteRequest),
     // Exact cancellation receipt and immutable owned selection binding keep
     // explicit byte authority separate from mutable Keep/revision changes.
@@ -364,6 +379,13 @@ enum DeleteRequest {
 impl DeleteRequest {
     fn fields(&self) -> (&str, u64, u64, bool, Option<&str>) {
         match self {
+            Self::Consumer(request) => (
+                &request.artifact,
+                request.revision,
+                0,
+                false,
+                Some(&request.generation),
+            ),
             Self::ManagedSeed(request) => (
                 &request.artifact,
                 request.revision,
@@ -795,6 +817,10 @@ impl Inventory {
           CREATE INDEX IF NOT EXISTS artifacts_job ON artifacts(job);
           CREATE INDEX IF NOT EXISTS artifacts_path ON artifacts(path);
           CREATE INDEX IF NOT EXISTS artifacts_state ON artifacts(state,updated_at);
+          CREATE TABLE IF NOT EXISTS job_disposition_sources(artifact TEXT NOT NULL,source_generation TEXT NOT NULL,job INTEGER NOT NULL,transfer TEXT NOT NULL,instance TEXT NOT NULL,admission_generation TEXT NOT NULL,PRIMARY KEY(artifact,source_generation));
+          CREATE INDEX IF NOT EXISTS job_disposition_source_admission ON job_disposition_sources(job,transfer,instance,admission_generation);
+          CREATE TABLE IF NOT EXISTS job_dispositions(id TEXT PRIMARY KEY,job INTEGER NOT NULL,transfer TEXT NOT NULL,generation TEXT NOT NULL,stopped INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(job,transfer,generation));
+          CREATE INDEX IF NOT EXISTS job_disposition_fences ON job_dispositions(job,transfer) WHERE stopped=0;
           CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS worker_controls(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS worker_authority(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
@@ -2430,10 +2456,21 @@ impl Inventory {
     }
     pub(super) fn finish_artifact_unlocked(
         &self,
+        a: Artifact,
+        path: &Path,
+        root: &Path,
+        state: &str,
+    ) -> Result<Artifact> {
+        self.finish_artifact_checked(a, path, root, state, |_| Ok(()))
+    }
+
+    fn finish_artifact_checked(
+        &self,
         mut a: Artifact,
         path: &Path,
         root: &Path,
         state: &str,
+        check: impl FnOnce(&[FileEntry]) -> Result<()>,
     ) -> Result<Artifact> {
         let original = a.clone();
         // History may record a bounded PP failure while its independent
@@ -2513,6 +2550,7 @@ impl Inventory {
         a.root_identity = fs::identity_for_file(&root_file)?;
         a.identity = Some(fs::identity_for_file(&dir)?);
         a.files = fs::manifest(&dir, 100_000)?;
+        check(&a.files)?;
         a.inspected_at = Some(now());
         // The finalization commits a fresh snapshot: an earlier attempt's
         // failure (a full volume) is history, not this row's state.
@@ -3029,7 +3067,9 @@ impl Inventory {
             for raw in ops {
                 let mut op: Operation = serde_json::from_str(&raw)?;
                 if op.kind == "delete"
-                    && matches!(serde_json::from_str::<DeleteRequest>(&op.request),Ok(DeleteRequest::ClusterCancellation((_,_,_,false,ref generation,false,ref receipt,_))) if generation==&a.generation && !receipt.is_empty())
+                    && (matches!(serde_json::from_str::<DeleteRequest>(&op.request), Ok(DeleteRequest::Consumer(ref request))
+                            if request.generation == a.generation && request.artifact == a.id)
+                        || matches!(serde_json::from_str::<DeleteRequest>(&op.request),Ok(DeleteRequest::ClusterCancellation((_,_,_,false,ref generation,false,ref receipt,_))) if generation==&a.generation && !receipt.is_empty()))
                 {
                     // The executor still rechecks its independent receipt and
                     // exact owned manifest after any Keep-only revision change.
@@ -3455,6 +3495,32 @@ impl Inventory {
         failure_keep_guard: bool,
         cancellation_receipt: Option<&str>,
     ) -> Result<Operation> {
+        self.request_delete_with_disposition(
+            key,
+            revision,
+            request_id,
+            undo_seconds,
+            automatic,
+            authority,
+            failure_keep_guard,
+            cancellation_receipt,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_delete_with_disposition(
+        &self,
+        key: &str,
+        revision: u64,
+        request_id: &str,
+        undo_seconds: u64,
+        automatic: bool,
+        authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
+        failure_keep_guard: bool,
+        cancellation_receipt: Option<&str>,
+        consumer_disposition: Option<&str>,
+    ) -> Result<Operation> {
         let _guard = self.mutation_guard()?;
         if let Some((_, checkpoint)) = authority {
             checkpoint()?;
@@ -3484,7 +3550,30 @@ impl Inventory {
                 "explicit cancellation lacks its exact durable receipt".into(),
             ));
         }
-        let request = if let Some(receipt) = cancellation_receipt {
+        let explicit_consumer = consumer_disposition
+            .map(|id| self.disposition_keep_override(id, &a))
+            .transpose()?
+            .unwrap_or(false);
+        if consumer_disposition.is_some()
+            && (!explicit_consumer
+                || cancellation_receipt.is_some()
+                || automatic
+                || failure_keep_guard
+                || undo_seconds != 0)
+        {
+            return Err(Error::Conflict(
+                "disposition lacks explicit authority for this kept source".into(),
+            ));
+        }
+        let request = if let Some(id) = consumer_disposition {
+            serde_json::to_string(&DeleteRequest::Consumer(ConsumerDeleteBinding {
+                artifact: key.into(),
+                generation: a.generation.clone(),
+                revision,
+                disposition_id: id.into(),
+                owned_selection: self.cluster_cancellation_delete_binding(&a)?,
+            }))?
+        } else if let Some(receipt) = cancellation_receipt {
             serde_json::to_string(&(
                 key,
                 revision,
@@ -3527,7 +3616,7 @@ impl Inventory {
         if a.revision != revision
             || (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
             || !a.owned
-            || (a.keep && !explicit_cancellation)
+            || (a.keep && !(explicit_cancellation || explicit_consumer))
             || a.hold.is_some()
             || !matches!(
                 a.state.as_str(),
@@ -3653,7 +3742,18 @@ impl Inventory {
             return Ok(op);
         }
 
-        let explicit_cancellation = if let DeleteRequest::ClusterCancellation((
+        let explicit_cancellation = if let DeleteRequest::Consumer(consumer) = &request {
+            if !self.disposition_keep_override(&consumer.disposition_id, &a)?
+                || self.cluster_cancellation_delete_binding(&a)? != consumer.owned_selection
+            {
+                op.state = "review".into();
+                op.error =
+                    Some("confirmed disposition no longer matches the exact owned source".into());
+                save_operation(&self.db.lock().unwrap(), &op)?;
+                return Ok(op);
+            }
+            true
+        } else if let DeleteRequest::ClusterCancellation((
             _,
             _,
             _,
@@ -3806,7 +3906,10 @@ impl Inventory {
         let root = self.verify_root(a)?;
         if attempts > 1 {
             match std::fs::symlink_metadata(&a.path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::sync_directory(&root)?;
+                    return Ok(());
+                }
                 Err(e) => return Err(e.into()),
                 Ok(_) => (),
             }
@@ -3873,6 +3976,7 @@ impl Inventory {
             return Err(Error::Conflict("payload directory replaced".into()));
         }
         fs::unlink(&root, Path::new(a.path.file_name().unwrap()), true)?;
+        fs::sync_directory(&root)?;
         Ok(())
     }
 

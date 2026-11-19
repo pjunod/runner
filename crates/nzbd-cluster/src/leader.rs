@@ -984,6 +984,18 @@ pub fn router(shared: Arc<LeaderShared>) -> Router {
             post(crate::cancellation_routes::stop),
         )
         .route(
+            "/cluster/v1/work/disposition-grant",
+            post(crate::job_disposition::observe_grant),
+        )
+        .route(
+            "/cluster/v1/work/disposition-owner",
+            post(crate::job_disposition::observe_owner),
+        )
+        .route(
+            "/cluster/v1/work/disposition-owner-authority",
+            post(crate::job_disposition::owner_authority),
+        )
+        .route(
             "/cluster/v1/work/relocation-proof",
             post(crate::control_recovery::relocation_proof).layer(DefaultBodyLimit::max(16 * 1024)),
         )

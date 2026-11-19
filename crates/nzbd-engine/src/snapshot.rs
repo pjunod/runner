@@ -304,6 +304,8 @@ pub struct QueueSnapshot {
     #[serde(skip)]
     pub queue_authority: bool,
     #[serde(skip)]
+    pub job_disposition_fences: std::collections::HashMap<JobId, String>,
+    #[serde(skip)]
     pub pending_automatic_controls: std::collections::HashSet<JobId>,
     #[serde(skip)]
     pub native_seed_dependencies: std::collections::HashSet<JobId>,

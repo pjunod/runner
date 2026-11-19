@@ -703,6 +703,79 @@ impl Inventory {
             .collect()
     }
 
+    pub(super) fn torrent_disposition_copy_entries(
+        &self,
+        job: u32,
+        source: &SourceGeneration,
+    ) -> Result<Vec<(String, Identity)>> {
+        let op = match self.operation(&format!("torrent-copy-job-{job}")) {
+            Ok(op) => op,
+            Err(Error::NotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let reference: TorrentCopy = serde_json::from_str(&op.request)?;
+        if op.kind != "torrent-copy"
+            || op.artifact != source.artifact
+            || reference.job != job
+            || reference.generation != source.generation
+        {
+            return Err(Error::Conflict(
+                "torrent copy receipt has a different binding".into(),
+            ));
+        }
+        let plan = load_plan(self, &op)?;
+        Ok(plan
+            .files
+            .into_iter()
+            .filter_map(|file| {
+                let identity = file
+                    .target
+                    .or_else(|| file.stage.and_then(|stage| stage.identity))?;
+                Some((file.path, identity))
+            })
+            .chain(
+                plan.directories
+                    .into_iter()
+                    .filter_map(|directory| Some((directory.path, directory.identity?))),
+            )
+            .collect())
+    }
+
+    pub(super) fn torrent_disposition_stages(
+        &self,
+        job: u32,
+        source: &SourceGeneration,
+    ) -> Result<Option<Operation>> {
+        let op = match self.operation(&format!("torrent-copy-job-{job}")) {
+            Ok(op) => op,
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let plan: TorrentCopy = serde_json::from_str(&op.request)?;
+        if op.kind != "torrent-copy"
+            || op.artifact != source.artifact
+            || plan.job != job
+            || plan.generation != source.generation
+        {
+            return Err(Error::Conflict(
+                "torrent staging belongs to a different source".into(),
+            ));
+        }
+        match self.operation(&format!("torrent-stage-status-job-{job}")) {
+            Ok(status) => {
+                let detail: StageCleanupStatus = serde_json::from_str(&status.request)?;
+                if detail.job != job || detail.source != *source {
+                    return Err(Error::Conflict(
+                        "torrent staging status has a different binding".into(),
+                    ));
+                }
+                Ok(Some(status))
+            }
+            Err(Error::NotFound) => self.cleanup_torrent_copy_stages(job, &|| Ok(())).map(Some),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Reading a legacy/unowned donor creates no deletion authority. A known
     /// owned donor is pinned by the existing exact-generation use registry.
     fn pin_torrent_donor(
@@ -770,6 +843,7 @@ impl Inventory {
             destination,
             keep_on_failure,
             None,
+            None,
             checkpoint,
         )
     }
@@ -784,6 +858,7 @@ impl Inventory {
         destination_root: &Path,
         destination: &Path,
         keep_on_failure: bool,
+        admission: Option<&JobAdmissionBinding>,
         verifier: &dyn Fn(&TorrentSourceReader<'_>) -> Result<()>,
         checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> Result<Artifact> {
@@ -796,6 +871,7 @@ impl Inventory {
             destination_root,
             destination,
             keep_on_failure,
+            admission,
             Some(verifier),
             checkpoint,
         )
@@ -811,6 +887,7 @@ impl Inventory {
         destination_root: &Path,
         destination: &Path,
         keep_on_failure: bool,
+        admission: Option<&JobAdmissionBinding>,
         verifier: SourceVerifier<'_>,
         checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> Result<Artifact> {
@@ -904,6 +981,7 @@ impl Inventory {
                 ));
             }
         }
+        let unallocated = self.for_job(job)?.is_none();
         let artifact = self.allocate_for_delivery_with_keep(
             job,
             destination_root,
@@ -916,6 +994,16 @@ impl Inventory {
             return Err(Error::Conflict(
                 "torrent processing copy has no current owned allocation".into(),
             ));
+        }
+        if let Some(admission) = admission {
+            if admission.job_id != job {
+                return Err(Error::Conflict(
+                    "torrent copy belongs to a different admission".into(),
+                ));
+            }
+            if unallocated {
+                self.bind_job_disposition_source(admission, &artifact)?;
+            }
         }
         let _target_use = self
             .acquire_attempt_use_checked(job, checkpoint)
@@ -2341,6 +2429,7 @@ mod tests {
                 &f.root,
                 &f.target,
                 false,
+                None,
                 &|reader| {
                     let mut bytes = [0u8; 1];
                     reader.read_exact_at(&f.selected[0].0, 0, &mut bytes)?;

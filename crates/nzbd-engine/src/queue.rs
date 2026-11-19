@@ -486,13 +486,14 @@ impl QueueState {
         let paused = opts.paused;
         let mut params = crate::with_client(opts.params.clone(), opts.client.clone());
         let id = self.reserve_torrent_admission(source, opts);
+        let nonce = crate::admissions::generation_nonce();
         params.push((DEFAULTS_PARAM.into(), encoded_defaults));
         params.push((ACQUISITION_PARAM.into(), "1".into()));
         params.push((SUBMISSION_PARAM.into(), submission_sha256.clone()));
         params.push((SOURCE_READY_PARAM.into(), "0".into()));
         params.push((
             ADMISSION_GENERATION_PARAM.into(),
-            format!("{storage_instance}-torrent-{}", id.0),
+            format!("{storage_instance}-torrent-{}-{nonce}", id.0),
         ));
         params.push((METADATA_ATTEMPT_PARAM.into(), "0".into()));
         self.jobs.push(Job {
@@ -523,7 +524,7 @@ impl QueueState {
             request_token: token,
             submission_sha256,
             job_id: id.0,
-            generation: format!("{instance}-torrent-{}", id.0),
+            generation: format!("{instance}-torrent-{}-{nonce}", id.0),
             runner_instance_id: instance.into(),
             terminal_outcome: None,
             outcome: "fetching".into(),

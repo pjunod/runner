@@ -159,12 +159,24 @@ impl ControlStore {
             return Ok(());
         }
         if value["deleted"] == 1 {
-            if value["status"] == "failed" {
+            if let Some(outcome) = param(nzbd_types::PP_DONE_PARAM) {
+                receipt.outcome = if outcome.starts_with("SUCCESS") {
+                    "completed"
+                } else {
+                    "failed"
+                }
+                .into();
+                receipt.terminal_outcome = Some(outcome);
+            } else if value["status"] == "failed" {
                 receipt.outcome = "failed".into();
-                receipt.terminal_outcome = Some("FAILURE".into());
+                receipt
+                    .terminal_outcome
+                    .get_or_insert_with(|| "FAILURE".into());
             } else {
                 receipt.outcome = "deleted".into();
-                receipt.terminal_outcome = Some("DELETED".into());
+                receipt
+                    .terminal_outcome
+                    .get_or_insert_with(|| "DELETED".into());
             }
         } else {
             receipt.outcome = value["status"].as_str().unwrap_or("post_processing").into();
@@ -211,14 +223,19 @@ impl ControlStore {
             && receipt.source_artifact_id.is_some()
         {
             receipt.source_cleanup_status = Some("retained".into());
-            receipt.failure_stage = Some("source_cleanup".into());
+            receipt
+                .failure_stage
+                .get_or_insert_with(|| "source_cleanup".into());
             let keep_files = value["removalMode"] == "keep_files";
             receipt.custody_state = if keep_files { "kept_by_user" } else { "runner" }.into();
-            receipt.failure_cause=Some(if keep_files {
-                "Removal kept the exact source files; no byte cleanup was authorized."
-            }else{
-                "Raw source retained for review: removal was recorded without a sealed cleanup receipt. The exact source owner must confirm stopped writers and file custody before cleanup."
-            }.into());
+            receipt.failure_cause.get_or_insert_with(|| {
+                if keep_files {
+                    "Removal kept the exact source files; no byte cleanup was authorized."
+                } else {
+                    "Raw source awaits the owner's exact stop and cleanup receipts."
+                }
+                .into()
+            });
         }
         if receipt.terminal_outcome.is_some()
             && value["files"] == 0

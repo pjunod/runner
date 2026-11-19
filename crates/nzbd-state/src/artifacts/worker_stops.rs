@@ -145,6 +145,38 @@ impl Inventory {
                 "owned copy identity/use changed; retain for review".into(),
             ));
         }
+        if artifact.terminal() {
+            // Recheck absence under the recorded mount and directory handle.
+            // A missing/rebound volume is an unresolved source observation.
+            if artifact.gone_reason.is_some() {
+                return Err(Error::Conflict(
+                    "source absence was not verified against its owned root".into(),
+                ));
+            }
+            let root = self.verify_root(&artifact)?;
+            let relative = artifact
+                .path
+                .strip_prefix(&artifact.root)
+                .map_err(|_| Error::Conflict("retired source escaped its owned root".into()))?;
+            let parent_path = relative
+                .parent()
+                .ok_or_else(|| Error::Conflict("retired source has no parent".into()))?;
+            let parent = if parent_path.as_os_str().is_empty() {
+                root
+            } else {
+                fs::open_relative(&root, &parent_path.to_string_lossy())?
+            };
+            let name = relative
+                .file_name()
+                .ok_or_else(|| Error::Conflict("retired source has no name".into()))?;
+            if fs::entry_missing_at(&parent, name)? {
+                fs::sync_directory(&parent)?;
+                return Ok(Vec::new());
+            }
+            return Err(Error::Conflict(
+                "retired source path was occupied again; retain for review".into(),
+            ));
+        }
         let directory = self.verify(&artifact)?;
         let observed = fs::manifest(&directory, 100_000)?;
         let recorded: std::collections::HashMap<_, _> = artifact

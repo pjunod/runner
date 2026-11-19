@@ -1078,6 +1078,12 @@ impl Owner {
         // Manager sends this only after its actual tool/reader worker drain.
         self.post_admissions.remove(&admission.job);
         self.post_cancellations.remove(&admission.job);
+        if self.job_disposing(admission.job) {
+            self.publish_now();
+            self.bump_epoch();
+            callback(self, true);
+            return;
+        }
         if !self.remove_job_silent(admission.job) {
             callback(self, false);
             return;

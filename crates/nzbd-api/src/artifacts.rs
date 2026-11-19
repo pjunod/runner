@@ -7,13 +7,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use nzbd_state::artifacts::{Error, Inventory, ListFilter, ListQuery, ListSort, Receipt, Settings};
+use nzbd_state::artifacts::{
+    Error, Inventory, JobDispositionRequest, JobDispositionState, ListFilter, ListQuery, ListSort,
+    Receipt, Settings,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 
 pub fn router() -> Router<ApiState> {
     Router::new()
+        .route("/api/v1/jobs/{id}/disposition", post(job_disposition))
         .route("/api/v1/deliveries", get(deliveries))
         .route("/api/v1/url-resolution-faults", get(url_resolution_faults))
         .route("/api/v1/deliveries/{id}", get(delivery))
@@ -69,6 +73,58 @@ pub fn router() -> Router<ApiState> {
             post(prune_source),
         )
         .route("/api/v1/recoveries/{id}/cancel-ack", post(cancel_ack))
+}
+
+async fn job_disposition(
+    State(st): State<ApiState>,
+    Path(id): Path<u32>,
+    Json(request): Json<JobDispositionRequest>,
+) -> Response {
+    if id == 0 || !request.valid() {
+        return error(StatusCode::BAD_REQUEST, "invalid job disposition binding");
+    }
+    let job = nzbd_types::JobId(id);
+    let native_joined = match &st.torrent {
+        Some(torrent) => {
+            torrent
+                .disposition_backend_stopped(job, &request.transfer)
+                .await
+        }
+        None => false,
+    };
+    let receipt = match st
+        .engine
+        .advance_job_disposition(job, request, native_joined)
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(nzbd_engine::EngineError::RequestConflict(reason)) => {
+            return error(StatusCode::CONFLICT, &reason);
+        }
+        Err(error_) => return error(StatusCode::SERVICE_UNAVAILABLE, &error_.to_string()),
+    };
+    let code = if receipt.state == JobDispositionState::Pending {
+        if receipt.operation_id.is_some() {
+            kick_after(st.engine.artifacts(), 0);
+        }
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (
+        code,
+        Json(json!({
+            "requestId": receipt.request.request_id,
+            "jobId": receipt.job_id.to_string(),
+            "transfer": receipt.request.transfer,
+            "runnerInstanceId": receipt.request.runner_instance_id,
+            "generation": receipt.request.generation,
+            "state": receipt.state,
+            "reason": receipt.reason,
+            "operationId": receipt.operation_id,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Default, Deserialize)]

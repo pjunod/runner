@@ -303,7 +303,7 @@ impl Owner {
                 descriptor,
                 reply,
             } => {
-                if self.persistence_fenced || !self.persist {
+                if self.job_disposing(job) || self.persistence_fenced || !self.persist {
                     let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                     return None;
                 }
@@ -385,6 +385,7 @@ impl Owner {
                 let before = self.state.job(job).cloned();
                 let ok = !self.persistence_fenced
                     && self.persist
+                    && !self.job_disposing(job)
                     && before.as_ref().is_some_and(|row| {
                         crate::torrent_acquisitions::donor(row).is_some()
                             && !row.held()
@@ -410,6 +411,7 @@ impl Owner {
                 let before = self.state.job(job).cloned();
                 let eligible = !self.persistence_fenced
                     && self.persist
+                    && !self.job_disposing(job)
                     && before.as_ref().is_some_and(|row| {
                         crate::torrent_acquisitions::donor(row) == Some(donor)
                             && !row.held()

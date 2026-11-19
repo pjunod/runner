@@ -24,6 +24,54 @@ pub struct ClusterCopyCleanup {
 }
 
 impl Inventory {
+    /// Inventory is used only to detect omitted copies. Its presence never
+    /// grants deletion authority. Completed consumer publication ownership
+    /// requires the exact succeeded materialization and replicated READY.
+    pub fn cluster_disposition_candidates(
+        &self,
+        job: u32,
+        transfer: &str,
+        protected_results: &[String],
+    ) -> Result<Vec<SourceGeneration>> {
+        let protected = serde_json::to_string(protected_results)?;
+        let db = self.db.lock().unwrap();
+        let mut rows = db.prepare(
+            "SELECT a.id,json_extract(a.data,'$.generation') FROM artifacts a
+             WHERE (
+                 a.job=?1 OR EXISTS(SELECT 1 FROM operations o
+                    WHERE json_extract(o.data,'$.kind') IN ('par_repair','extract')
+                      AND json_extract(json_extract(o.data,'$.request'),'$.source.job')=?1
+                      AND json_extract(json_extract(o.data,'$.request'),'$.scratch.id')=a.id
+                      AND json_extract(json_extract(o.data,'$.request'),'$.scratch.generation')=json_extract(a.data,'$.generation'))
+             )
+               AND (a.state NOT IN ('deleted','source_gone') OR json_extract(a.data,'$.gone_reason') IS NOT NULL)
+               AND NOT EXISTS(SELECT 1 FROM operations o
+                  WHERE o.artifact=a.id AND o.state='succeeded'
+                    AND json_extract(o.data,'$.kind')='materialize_generation'
+                    AND json_extract(json_extract(o.data,'$.request'),'$.selected.id')=a.id
+                    AND json_extract(json_extract(o.data,'$.request'),'$.selected.generation')=json_extract(a.data,'$.generation')
+                    AND json_extract(json_extract(o.data,'$.request'),'$.accepted.result_id') IN (SELECT value FROM json_each(?2)))
+               AND NOT EXISTS(SELECT 1 FROM deliveries d
+                  WHERE d.artifact=a.id AND d.generation=json_extract(a.data,'$.generation')
+                    AND json_extract(d.data,'$.requestToken')=?3)
+             ORDER BY a.id LIMIT 129",
+        )?;
+        let candidates = rows
+            .query_map(params![job, protected, transfer], |row| {
+                Ok(SourceGeneration {
+                    artifact: row.get(0)?,
+                    generation: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if candidates.len() > 128 {
+            return Err(Error::Conflict(
+                "source custody exceeds the supported disposition bound".into(),
+            ));
+        }
+        Ok(candidates)
+    }
+
     /// Grant provenance is separate from cleanup eligibility. Legacy/new
     /// nonconsumer jobs keep their existing retention policy while a worker
     /// can persist an exact unowned shadow retry under this owner generation.
@@ -1617,6 +1665,16 @@ pub fn remove_cluster_generation_copy(
             .file_name()
             .ok_or_else(|| Error::Conflict("generation name missing".into()))?,
     );
+    let parent_identity = fs::identity_for_file(&parent)?;
+    if parent_identity.device != expected_identity.0 {
+        return Err(Error::Conflict(
+            "sealed generation volume identity changed".into(),
+        ));
+    }
+    if fs::entry_missing_at(&parent, name.as_os_str())? {
+        fs::sync_directory(&parent)?;
+        return Ok(());
+    }
     let directory = fs::open_at(&parent, name, true)?;
     let identity = fs::identity_for_file(&directory)?;
     if (identity.device, identity.inode) != expected_identity {

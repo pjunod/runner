@@ -8,6 +8,8 @@
 //! about state. Sends toward writer tasks use `try_send` with a
 //! retry-on-tick fallback so owner ⇄ writer backpressure can never deadlock.
 
+#[path = "owner_disposition.rs"]
+mod disposition;
 #[path = "owner_native_failure.rs"]
 mod native_failure;
 #[path = "owner_lifecycle.rs"]
@@ -543,6 +545,13 @@ pub(crate) enum QueueCommand {
     ForgetClusterWriterStops {
         context: nzbd_state::artifacts::WorkerControlContext,
         reply: oneshot::Sender<bool>,
+    },
+    AdvanceJobDisposition {
+        job: JobId,
+        native_joined: bool,
+        url_joined: bool,
+        request: nzbd_state::artifacts::JobDispositionRequest,
+        reply: oneshot::Sender<Result<nzbd_state::artifacts::JobDisposition, crate::EngineError>>,
     },
     QuiescePayload {
         job: JobId,
@@ -1135,6 +1144,8 @@ pub(crate) struct Owner {
     writer_epochs: HashMap<FileId, u64>,
     job_epochs: HashMap<JobId, u64>,
     control_epochs: HashMap<JobId, u64>,
+    disposition_in_flight: HashSet<JobId>,
+    disposition_fences: HashMap<JobId, (String, String)>,
     post_admissions: HashMap<JobId, u64>,
     post_cancellations: HashMap<JobId, CancellationToken>,
     failed_cleanup_admissions: HashMap<JobId, nzbd_state::artifacts::FailedCleanupProof>,
@@ -1582,8 +1593,17 @@ impl Owner {
                 }
             }
             state.jobs.retain(|job| !retired.contains(&job.id));
+            state
+                .pending_admissions
+                .retain(|pending| !retired.contains(&pending.job_id));
             for receipt in &mut state.url_admission_receipts {
-                if retired.contains(&JobId(receipt.job_id)) && receipt.custody_state != "curator" {
+                if retired.contains(&JobId(receipt.job_id))
+                    && receipt.custody_state != "curator"
+                    && receipt
+                        .terminal_outcome
+                        .as_deref()
+                        .is_none_or(|terminal| terminal == "DELETED")
+                {
                     receipt.outcome = "deleted".into();
                 }
             }
@@ -1721,6 +1741,19 @@ impl Owner {
             .collect::<HashSet<_>>();
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         let initial_quota_hold = tuning.daily_quota_bytes > 0 || tuning.monthly_quota_bytes > 0;
+        let disposition_fences = artifacts
+            .job_disposition_fences()
+            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+            .into_iter()
+            .filter(|(job, transfer, generation)| {
+                state.url_admission_receipts.iter().any(|receipt| {
+                    receipt.job_id == *job
+                        && receipt.request_token == *transfer
+                        && receipt.generation == *generation
+                })
+            })
+            .map(|(job, transfer, generation)| (JobId(job), (transfer, generation)))
+            .collect();
         let mut owner = Owner {
             state,
             admission_adoption: None,
@@ -1734,6 +1767,8 @@ impl Owner {
             writer_epochs: HashMap::new(),
             job_epochs: HashMap::new(),
             control_epochs: HashMap::new(),
+            disposition_in_flight: HashSet::new(),
+            disposition_fences,
             post_admissions: HashMap::new(),
             post_cancellations: HashMap::new(),
             failed_cleanup_admissions: HashMap::new(),
@@ -2089,6 +2124,7 @@ impl Owner {
         let mut to_check = Vec::new();
         for job in &self.state.jobs {
             if self.pending_control_commits.contains(&job.id)
+                || self.job_disposing(job.id)
                 || self.verification.contains_key(&job.id)
                 || self.retiring_writers.contains_key(&job.id)
             {
@@ -2408,6 +2444,16 @@ impl Owner {
             }
             return;
         }
+        let cmd = match cmd {
+            QueueCommand::RemoveJobSilent { job, reply, .. }
+            | QueueCommand::Delete { job, reply, .. }
+                if self.job_disposing(job) =>
+            {
+                let _ = reply.send(false);
+                return;
+            }
+            command => command,
+        };
         let pending_job = match &cmd {
             QueueCommand::Pause { job, .. }
             | QueueCommand::Resume { job, .. }
@@ -2869,7 +2915,8 @@ impl Owner {
             QueueCommand::BeginPostAdmission { job, reply } => {
                 let allowed = !self.cancel.is_cancelled()
                     && self.state.job(job).is_some_and(|j| {
-                        !j.held()
+                        (!self.job_disposing(job) || Self::disposition_allows_failed_followup(j))
+                            && !j.held()
                             && !transitions::failed_cleanup_only(j)
                             && matches!(
                                 j.status,
@@ -3416,9 +3463,11 @@ impl Owner {
                         &params,
                     )
                 });
-                if let (Some(token), Some(fingerprint)) =
-                    (request_token.as_ref(), submission_sha256.as_ref())
-                {
+                if let (Some(token), Some(fingerprint), Some(nonce)) = (
+                    request_token.as_ref(),
+                    submission_sha256.as_ref(),
+                    &admission_nonce,
+                ) {
                     if !self.persist {
                         let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                         return;
@@ -3465,11 +3514,19 @@ impl Owner {
                             request_token: token.clone(),
                             submission_sha256: submission_sha256.clone().unwrap_or_default(),
                             job_id: id.0,
-                            generation: url_admission_generation(
-                                id,
-                                token,
-                                &self.consumer_instance_id,
-                            ),
+                            generation: existing_job
+                                .params
+                                .iter()
+                                .find(|(key, _)| key == "*URL:AdmissionGeneration")
+                                .map(|(_, generation)| generation.clone())
+                                .unwrap_or_else(|| {
+                                    url_admission_generation(
+                                        id,
+                                        token,
+                                        &self.consumer_instance_id,
+                                        &crate::admissions::generation_nonce(),
+                                    )
+                                }),
                             runner_instance_id: self.consumer_instance_id.clone(),
                             terminal_outcome: None,
                             outcome: existing_job.status.as_str().into(),
@@ -3569,6 +3626,9 @@ impl Owner {
                     return;
                 }
                 let id = self.state.admit_url(name.clone(), &url, category, priority);
+                let admission_nonce = request_token
+                    .as_ref()
+                    .map(|_| crate::admissions::generation_nonce());
                 if let Some(j) = self.state.job_mut(id) {
                     mark_new_lifecycle_cohort(j);
                     if let Some(dupe) = dupe {
@@ -3579,13 +3639,19 @@ impl Owner {
                     }
                     j.params.extend(params);
                     j.delivery_lifecycle = nzbd_types::has_delivery_intent(&j.params);
-                    if let Some(token) = request_token.as_deref() {
+                    if let (Some(token), Some(nonce)) = (request_token.as_deref(), &admission_nonce)
+                    {
                         // Public consumer identity can change across authority
                         // adoption; the fetch origin remains bound to this
                         // storage installation for its complete lifetime.
                         j.params.push((
                             "*URL:AdmissionGeneration".into(),
-                            url_admission_generation(id, token, &self.artifacts.installation),
+                            url_admission_generation(
+                                id,
+                                token,
+                                &self.artifacts.installation,
+                                nonce,
+                            ),
                         ));
                     }
                 }
@@ -3598,7 +3664,12 @@ impl Owner {
                         request_token: token.clone(),
                         submission_sha256: fingerprint.clone(),
                         job_id: id.0,
-                        generation: url_admission_generation(id, token, &self.consumer_instance_id),
+                        generation: url_admission_generation(
+                            id,
+                            token,
+                            &self.consumer_instance_id,
+                            nonce,
+                        ),
                         runner_instance_id: self.consumer_instance_id.clone(),
                         terminal_outcome: None,
                         outcome: "fetching".into(),
@@ -4024,6 +4095,10 @@ impl Owner {
                 });
             }
             QueueCommand::Resume { job, reply } => {
+                if self.job_disposing(job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if self
                     .state
@@ -4264,6 +4339,15 @@ impl Owner {
             }
             QueueCommand::ForgetClusterWriterStops { context, reply } => {
                 let _ = reply.send(self.cluster_writer_stops.forget_joined(&context));
+            }
+            QueueCommand::AdvanceJobDisposition {
+                job,
+                request,
+                native_joined,
+                url_joined,
+                reply,
+            } => {
+                self.advance_job_disposition(job, request, native_joined, url_joined, reply);
             }
             QueueCommand::QuiescePayload { job, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
@@ -5779,6 +5863,10 @@ impl Owner {
             callback(self, Err(crate::EngineError::OwnershipLost));
             return;
         }
+        if self.job_disposing(job) {
+            callback(self, Ok(false));
+            return;
+        }
         let Some(before) = self
             .state
             .job(job)
@@ -6507,9 +6595,12 @@ impl Owner {
             .state
             .jobs
             .iter()
-            .filter(|job| transitions::failed_cleanup_only(job))
+            .filter(|job| transitions::failed_cleanup_only(job) || self.job_disposing(job.id))
         {
-            excluded.insert(job.id, "failed cleanup metadata only".into());
+            excluded.insert(
+                job.id,
+                "job is fenced for disposition or failed cleanup".into(),
+            );
         }
         for job in self
             .verification
@@ -7541,6 +7632,7 @@ impl Owner {
         guard: &crate::hold_release::HoldReleaseGuard,
     ) -> Result<(), String> {
         if self.persistence_fenced
+            || self.job_disposing(job)
             || (by == RetryBy::Recovery && self.automatic_control_pending(job))
         {
             return Err("durable queue ownership is fenced".into());
@@ -8416,6 +8508,7 @@ impl Owner {
             return;
         };
         let inventory = self.artifacts.clone();
+        let consumer_admission = self.job_admission_binding(&record);
         let root = self.dest_dir.clone();
         let occupied = self
             .state
@@ -8470,6 +8563,11 @@ impl Owner {
                         keep,
                     )
                     .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                if let Some(binding) = consumer_admission.as_ref().filter(|_| allocation.owned) {
+                    inventory
+                        .bind_job_disposition_source(binding, &allocation)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
                 Ok((name, allocation))
             },
             move |owner, result| {
@@ -8577,6 +8675,7 @@ impl Owner {
         // segment. Own the descriptor only when scheduling an actual allocation.
         let record = record.clone();
         let inventory = self.artifacts.clone();
+        let consumer_admission = self.job_admission_binding(&record);
         let root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         self.allocating_jobs.insert(job);
@@ -8600,7 +8699,7 @@ impl Owner {
                         .params
                         .iter()
                         .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
-                    inventory
+                    let created = inventory
                         .allocate_for_delivery_with_keep(
                             record.id.0,
                             &plan.root,
@@ -8609,7 +8708,13 @@ impl Owner {
                             record.delivery_lifecycle,
                             keep,
                         )
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    if let Some(binding) = consumer_admission.as_ref().filter(|_| created.owned) {
+                        inventory
+                            .bind_job_disposition_source(binding, &created)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                    created
                 } else {
                     transitions::allocate_imported_payload(
                         &inventory, &record, &root, &plan, allocation,
@@ -9088,6 +9193,16 @@ impl Owner {
         delete_files: bool,
         callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
+        self.delete_job_with_source_then(job, delete_files, None, callback);
+    }
+
+    fn delete_job_with_source_then(
+        &mut self,
+        job: JobId,
+        delete_files: bool,
+        source: Option<Option<nzbd_state::artifacts::SourceGeneration>>,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
         if delete_files
             || self.state.job(job).is_none()
             || self.post_admissions.contains_key(&job)
@@ -9112,6 +9227,26 @@ impl Owner {
         let inventory = self.artifacts.clone();
         let retirement_record = self.state.job(job).cloned().unwrap();
         let retirements = self.url_resolutions.clone();
+        let native_disposition =
+            source.is_some() && crate::torrent_acquisitions::is_acquisition(&retirement_record);
+        let url_disposition = source.is_some()
+            && retirement_record
+                .params
+                .iter()
+                .any(|(key, _)| key == "*URL");
+        let descriptor_references = if native_disposition {
+            self.state
+                .jobs
+                .iter()
+                .filter_map(|row| {
+                    crate::torrent_acquisitions::descriptor_reference(row)
+                        .and_then(|reference| reference.source_identity(row).ok())
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let pending_sources = self.pending_sources.clone();
 
         self.pending_control_commits.insert(job);
         let lane_root = self
@@ -9122,12 +9257,41 @@ impl Owner {
         self.payload_then(
             lane_root,
             move || {
-                let retiring = inventory
+                if let Some(source) = source {
+                    if let Some(source) = source {
+                        let files = disposition::disposition_writer_files(
+                            &retirement_record,
+                            &source,
+                            &inventory.installation,
+                        );
+                        inventory
+                            .finish_job_disposition_source(&source, &retirement_record, &files)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                } else if let Some(artifact) = inventory
                     .prepare_forget(job.0)
-                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                if let Some(artifact) = retiring {
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                {
                     inventory
                         .finish(job.0, &artifact.path, &artifact.root, "retained")
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
+                if native_disposition {
+                    for metadata in [false, true] {
+                        let origin =
+                            crate::torrent_acquisitions::blob_origin(&retirement_record, metadata)
+                                .map_err(|error| {
+                                    nzbd_state::StateError::Corrupt(error.to_string())
+                                })?;
+                        retirements
+                            .dispose_disposition_input(&origin, &descriptor_references)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                    pending_sources.remove(job)?;
+                }
+                if url_disposition {
+                    retirements
+                        .dispose_disposition_input(&retirement_record, &descriptor_references)
                         .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
                 }
                 retirements
@@ -9144,6 +9308,12 @@ impl Owner {
                 if !owner.remove_job_silent(job) {
                     callback(owner, false);
                     return;
+                }
+                if native_disposition {
+                    owner
+                        .state
+                        .pending_admissions
+                        .retain(|pending| pending.job_id != job);
                 }
                 owner.persist_then(move |owner, _snapshot_ok| {
                     // The exact cancellation tombstone is already fsync'd.
@@ -10819,6 +10989,7 @@ impl Owner {
                     }
                 }
                 if self.verification.contains_key(&j.id)
+                    || self.job_disposing(j.id)
                     || self.retiring_writers.contains_key(&j.id)
                     || self.pending_control_commits.contains(&j.id)
                 {
@@ -10900,6 +11071,12 @@ impl Owner {
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             queue_authority: self.persist,
+            job_disposition_fences: self
+                .disposition_fences
+                .iter()
+                .filter(|(job, _)| self.job_disposing(**job))
+                .map(|(job, (transfer, _))| (*job, transfer.clone()))
+                .collect(),
             pending_automatic_controls: self
                 .state
                 .jobs
@@ -11213,7 +11390,27 @@ fn refresh_url_admission_custody(
     receipt: &mut UrlAdmissionReceipt,
     inventory: &nzbd_state::artifacts::Inventory,
 ) -> bool {
-    let pinned = pin_unpinned_failed_source(receipt, inventory);
+    let exact = if receipt.source_artifact_id.is_none()
+        && receipt.source_generation.is_none()
+        && receipt.runner_instance_id == inventory.installation
+    {
+        let binding = nzbd_state::artifacts::JobAdmissionBinding {
+            job_id: receipt.job_id,
+            transfer: receipt.request_token.clone(),
+            instance: receipt.runner_instance_id.clone(),
+            generation: receipt.generation.clone(),
+        };
+        if let Ok(Some(source)) = inventory.job_disposition_source(&binding) {
+            receipt.source_artifact_id = Some(source.artifact);
+            receipt.source_generation = Some(source.generation);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let pinned = exact || pin_unpinned_failed_source(receipt, inventory);
     refresh_pinned_url_admission_custody(receipt, inventory) || pinned
 }
 
@@ -11600,8 +11797,9 @@ fn url_submission_sha256(
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn url_admission_generation(job: JobId, token: &str, instance: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
+fn url_admission_generation(job: JobId, token: &str, instance: &str, nonce: &str) -> String {
+    let digest =
+        Sha256::digest(serde_json::to_vec(&(token, nonce)).expect("generation inputs serialize"));
     format!("{}-url-{}-{:x}", instance, job.0, digest)
 }
 
