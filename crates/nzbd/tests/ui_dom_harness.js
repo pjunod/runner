@@ -1310,6 +1310,25 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
 // This is the whole point of M4: one click deletes, the toast offers Undo
 // for as long as the server says the job is parked, and Undo requeues it.
 (async () => {
+  // Disk-full recovery is visible and uses its own action, with no lane toggle.
+  {
+    const button = sandbox.document.getElementById("retry-storage");
+    const prior = T.store.status;
+    T.store.status = { ...prior, disk_low: true, disk_guard_write_latched: true,
+      enospc_where: "post-processing: /downloads/job" };
+    T.renderStatus();
+    eq(button.hidden, false, "disk-full stop exposes retry storage now");
+    ok(sandbox.document.getElementById("hold").textContent.includes("checking automatically"), "storage error explains automatic retries");
+    routes.set("/api/v1/queue/actions/retry-storage", { status: 200, body: { ok: true } });
+    seen.length = 0;
+    await button.onclick();
+    ok(seen.some(r => r.url === "/api/v1/queue/actions/retry-storage"), "retry uses the dedicated storage action");
+    ok(!seen.some(r => /actions\/(pause|resume)/.test(r.url)), "storage retry never toggles a lane");
+    T.store.status = { ...prior, disk_low: false };
+    T.renderStatus();
+    eq(button.hidden, true, "retry hides after storage recovers");
+  }
+
   const stack = sandbox.document.getElementById("toasts");
   const reset = () => { stack.children.length = 0; routes.clear(); seen.length = 0; T.pending.clear(); };
 
@@ -2352,7 +2371,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const save = doc.getElementById("cfg-save");
     const msg = doc.getElementById("cfg-msg");
     const config = process.env.NZBD_UI_CONFIG ? JSON.parse(process.env.NZBD_UI_CONFIG) : {
-      paths: {}, queue: {}, post: { failure_action: "park" }, history: {}, server: [], category: [],
+      paths: {}, queue: {}, post: { keep_failed_downloads: true }, history: {}, server: [], category: [],
       torrent: { enabled: false, listen_port: 6881, pex: true },
     };
     let stored = config, submitted, rejectSave = false, reloadFailure = null;
@@ -2470,9 +2489,9 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       }
     }
     const enable = controls.find(control => control.dataset.path === "torrent.enabled");
-    const failure = controls.find(control => control.dataset.path === "post.failure_action");
-    ok(!!failure, "the form uses the canonical failure_action field");
-    eq(failure?.value, config.post.failure_action, "the form shows the configured failure policy");
+    const failure = controls.find(control => control.dataset.path === "post.keep_failed_downloads");
+    ok(!!failure, "the form exposes failed download retention");
+    eq(failure?.checked, config.post.keep_failed_downloads, "the form shows the configured retention choice");
     ok(form.innerHTML.includes('data-settings-view="dev"'), "settings renders a Dev view");
     const advice = T.enableAdvisory({ torrent: { listen_port: 6881, dht: true, socks_proxy_url: "socks5://localhost:1080" }, cluster: { enabled: true } });
     ok(advice.includes("unmet"), "incompatible configuration is advisory");
@@ -2506,7 +2525,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     await save.onclick();
     eq(JSON.parse(submitted).torrent.enabled, true, "Save changes submits BitTorrent enabled");
     eq(JSON.parse(submitted).torrent.listen_port, 6881, "save preserves the default listen port");
-    eq(JSON.parse(submitted).post.failure_action, config.post.failure_action, "save preserves the configured failure policy");
+    eq(JSON.parse(submitted).post.keep_failed_downloads, config.post.keep_failed_downloads, "save preserves the configured failure policy");
     ok(!("health_action" in JSON.parse(submitted).post), "save does not add the legacy alias");
     if (process.env.NZBD_UI_SAVED_CONFIG_PATH) fs.writeFileSync(process.env.NZBD_UI_SAVED_CONFIG_PATH, submitted);
     eq(msg.textContent, "saved", "save confirmation survives the settings reload");

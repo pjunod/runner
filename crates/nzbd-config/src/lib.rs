@@ -212,20 +212,13 @@ pub struct PostSection {
     pub deobfuscate_final: bool,
     /// NZBGet `PostStrategy`: sequential | balanced | aggressive | rocket.
     pub strategy: String,
-    /// What to do with the FILES of a job that ended in a terminal
-    /// failure — par failure, unpack failure, health abort, post crash:
-    /// none | park | delete.
-    ///
-    /// Was `health_action` (NZBGet `HealthCheck`) and still parses under
-    /// that name. It only ever governed the health gate, so a par failure
-    /// left its whole directory in the category tree forever — which is
-    /// how ~523 GB of known-bad downloads accumulated under an importer's
-    /// watch folder (docs/archive/REGRAB_LOOP_PLAN.md D2). The default is
-    /// `delete`: the bytes are known-bad and the job's NZB is parked with
-    /// its history entry, so `requeue` gets them back.
+    /// Legacy failure policy, retained for parsing older configurations and
+    /// NZBGet compatibility. `keep_failed_downloads` controls runtime retention.
     #[serde(alias = "health_action")]
     pub failure_action: String,
-    /// Where `failure_action = "park"` puts a failed job's directory.
+    /// Retain failed payloads in the failed directory. Off by default.
+    pub keep_failed_downloads: bool,
+    /// Where retained failed downloads are moved.
     /// Defaults to `<main_dir>/failed` — deliberately off the category
     /// tree an importer watches.
     pub failed_dir: Option<PathBuf>,
@@ -255,6 +248,7 @@ impl Default for PostSection {
             deobfuscate_final: true,
             strategy: "balanced".into(),
             failure_action: "delete".into(),
+            keep_failed_downloads: false,
             failed_dir: None,
             tool_timeout_secs: 3600,
             script_timeout_secs: 3600,
@@ -2741,5 +2735,19 @@ socks_proxy_password = "proxy-secret"
         assert_eq!(renamed.servers[1].password.as_deref(), Some(SECRET_MASK));
         // …so the strict validator refuses it too, belt and braces.
         assert!(renamed.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod failure_retention_tests {
+    #[test]
+    fn failed_payload_retention_is_opt_in_and_round_trips() {
+        let default: super::Config = toml::from_str("").unwrap();
+        assert!(!default.post.keep_failed_downloads);
+        let mut keep = default;
+        keep.post.keep_failed_downloads = true;
+        let saved = toml::to_string(&keep).unwrap();
+        let loaded: super::Config = toml::from_str(&saved).unwrap();
+        assert!(loaded.post.keep_failed_downloads);
     }
 }

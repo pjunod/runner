@@ -246,6 +246,10 @@ pub struct HoldExpiryRequest {
     pub stop_request: nzbd_state::artifacts::WorkerStopRequest,
     #[serde(default)]
     pub stopped: Option<nzbd_state::artifacts::WorkerStoppedReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writer_paths: Vec<String>,
 }
 impl HoldExpiryRequest {
     pub fn receipt_id(&self) -> String {

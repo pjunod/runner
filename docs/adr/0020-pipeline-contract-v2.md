@@ -6,6 +6,13 @@ post-processing failure is a failure unless the job is marked keep-on-failure)
 · **Contract:** [PIPELINE_CONTRACT.md](../PIPELINE_CONTRACT.md) · **Wire
 reference:** [INTEGRATION.md](../INTEGRATION.md)
 
+> **Superseded in part, 2026-11-18:** The park-always disposal decision below
+> is historical. Runtime `post.keep_failed_downloads` now selects Delete
+> (default false) or Park (true), with per-download Keep overriding both,
+> after salvage and cleanup custody settle. Reason and recoverability do not
+> force Park. Health cancellation is always armed, independently of retention.
+> See the [live contract](../PIPELINE_CONTRACT.md#26-failure-disposal-and-runners-own-cleanup).
+
 ## Context
 
 Runner's seam with curator had grown four overlapping mechanisms for "what

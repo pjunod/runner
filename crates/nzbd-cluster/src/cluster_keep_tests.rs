@@ -40,6 +40,7 @@ impl Node {
             disk_guard_roots: vec![],
             torrent_payload_roots: vec![],
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(control);
