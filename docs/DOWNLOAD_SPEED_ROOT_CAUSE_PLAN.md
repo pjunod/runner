@@ -827,5 +827,16 @@ Throughput per connection is outstanding requests ÷ RTT either way; a
 high-latency provider gains more from a higher `pipeline_depth`.
 
 Local syncs are cheap, so the GlusterFS gain from far fewer syncs is not in
-these numbers. As with §10–§14, restoration to 109 MiB/s is established only
-by an untraced sustained measurement on the runner node after deployment.
+these numbers.
+
+**Acceptance on nuc4 (0.9.7, untraced).** Job 3842 (73.4 GiB, ~107 k
+articles, 146 × 500 MB rar volumes on `/processing`, one active download,
+Newshosting 30 connections, pipeline depth 2) downloaded on 2026-11-18. File
+completion times on the volume give the rate without attaching anything to
+the process: from 20:43 to 20:50 UTC exactly 12 volumes (6.29 GB) completed
+every minute, **100.0 MiB/s** sustained; 128 volumes (67.5 GB) in 20:42–20:52,
+≈ 98 MiB/s. §10 measured 41.0 MiB/s for the same setup before this change,
+and §13's windows were 6–13 MiB/s. That is 92 % of the 109 MiB/s target and
+close to what the gigabit link carries as payload, with the rate no longer
+falling as the file grows. The job's earlier 17:12–20:42 gap is a
+write-reservation (allocation) hold, not download speed.
