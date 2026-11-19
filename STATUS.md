@@ -33,8 +33,10 @@ clear while the forecast still fails.
 **Status:** branch `claude/runner-download-throughput` (from main 51d4980),
 adversarial review addressed, `make fast-check` green on the merge candidate
 (1,091 passed, 0 failed, 0 skipped, `NZBD_REQUIRE_TOOLS=1`). Owner: Claude
-(Opus 5.5 session). PR #337, merged. Next: Paul deploys → untraced
-sustained measurement on the runner node.
+(Opus 5.5 session). PR #337, merged; deployed (0.9.7, now 0.9.8).
+**Accepted on nuc4:** a 73.4 GiB, ~107 k-article job sustained 100.0 MiB/s
+untraced on 2026-11-18 (from 41.0 MiB/s in §10), 92 % of the 109 MiB/s
+target — [speed plan §15](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md).
 
 Root causes (benchmarked, [speed plan §15](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md)):
 the owner re-parsed and re-serialized each file's whole proof (every range)
