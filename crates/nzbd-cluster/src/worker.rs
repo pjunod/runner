@@ -618,6 +618,18 @@ async fn report_expired_holds(cfg: &ClusterConfig, engine: &EngineHandle, active
             fetched: nzbd_types::Fetched::of(&job),
             stop_request,
             stopped: None,
+            source_disposition: None,
+            writer_paths: job
+                .files
+                .iter()
+                .flat_map(|file| {
+                    let mut names = vec![format!(".runner-file-{}.part", file.id.0)];
+                    if file.filename_confirmed {
+                        names.push(file.filename.clone());
+                    }
+                    names
+                })
+                .collect(),
         };
         if let Ok(notice) = serde_json::to_string(&request) {
             let _ = engine
@@ -676,12 +688,29 @@ async fn drive_expiry_outbox(
     if !stopped.sources.contains(&request.source) {
         return Err("stopped receipt does not cover the selected source; custody retained".into());
     }
+    let keep_failed_downloads = reply
+        .get("keep_failed_downloads")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true); // Old authorities grant preservation only.
+                          // Persisted with the selected expiry so a lost final ACK can replay even
+                          // after local queue retirement. Historical requests can only use manifests.
+    let names = request.writer_paths.clone();
     let inventory = engine.artifacts();
     let proof = stopped.clone();
-    tokio::task::spawn_blocking(move || inventory.park_expired_worker_sources(&proof))
+    let terminal_receipt = request.receipt_id();
+    request.source_disposition = Some(
+        tokio::task::spawn_blocking(move || {
+            inventory.dispose_expired_worker_sources(
+                &proof,
+                keep_failed_downloads,
+                &names,
+                &terminal_receipt,
+            )
+        })
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?,
+    );
     engine
         .retire_worker_job(request.job, request.context.clone())
         .await
@@ -696,7 +725,7 @@ async fn drive_expiry_outbox(
     }
     let inventory = engine.artifacts();
     let key = key.to_string();
-    tokio::task::spawn_blocking(move||inventory.finish_worker_expiry_outbox(&key,"hold_expired terminal recorded; stopped sources parked/preserved; salvage assessment abandoned with explicit error")).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+    tokio::task::spawn_blocking(move||inventory.finish_worker_expiry_outbox(&key,"hold_expired terminal recorded; source-owner retention policy settled; salvage assessment abandoned with explicit error")).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
     active.forget_joined(&request.context.lease_id);
     active
         .retiring
@@ -3502,6 +3531,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let client = ClusterClient::new("secret".into());
         for _ in 0..8 {
@@ -3943,6 +3973,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let client = ClusterClient::new("secret".into());
         let active: ActiveLeases = Default::default();

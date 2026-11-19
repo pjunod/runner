@@ -1390,7 +1390,7 @@ async fn grant_post_candidate(
         .jobs
         .iter()
         .filter(|j| {
-            matches!(j.status, JobStatus::Completed)
+            matches!(j.status, JobStatus::Completed | JobStatus::Failed)
                 && !j.pp_done
                 && j.assigned_node.as_deref() == Some(req.node.as_str())
         })
@@ -1635,7 +1635,7 @@ async fn work_hold_expired(
     let _serial = s.mutation_serial.lock().await;
     let result = select_worker_hold_expiry(&s, &req).await;
     match result {
-        Ok(accepted) => Json(serde_json::json!({"accepted":accepted})).into_response(),
+        Ok(accepted) => Json(serde_json::json!({"accepted":accepted,"keep_failed_downloads":s.cfg.keep_failed_downloads})).into_response(),
         Err(error) => {
             s.fence_authority();
             (
@@ -1688,7 +1688,7 @@ async fn select_worker_hold_expiry(
             }
             let inventory = s.engine.artifacts();
             let job = req.job.0;
-            let error="salvage assessment abandoned at the worker hold deadline after joined execution; bytes were not assessed as unusable; exact source owner parked or preserved the stopped copies".to_string();
+            let error=format!("salvage assessment abandoned at the worker hold deadline after joined execution; bytes were not assessed as unusable; source owner disposition: {}", req.source_disposition.as_deref().unwrap_or("legacy stopped copies preserved"));
             tokio::task::spawn_blocking(move || {
                 inventory.settle_salvage(
                     job,
@@ -3814,9 +3814,9 @@ async fn schedule(s: &Arc<LeaderShared>) {
     });
 
     for job in snap.jobs.iter() {
-        if !matches!(job.status, JobStatus::Completed)
+        if !matches!(job.status, JobStatus::Completed | JobStatus::Failed)
             || source_pending.contains(&job.id)
-            || durable_status.get(&job.id) != Some(&JobStatus::Completed)
+            || durable_status.get(&job.id) != Some(&job.status)
             || job.pp_done
             || job.assigned_node.is_some()
         {
@@ -3859,7 +3859,7 @@ fn assigned_pp_backlog(
     snap.jobs
         .iter()
         .filter(|j| {
-            matches!(j.status, JobStatus::Completed)
+            matches!(j.status, JobStatus::Completed | JobStatus::Failed)
                 && !j.pp_done
                 && !leased.contains(&j.id)
                 && j.assigned_node.as_deref() == Some(node)
@@ -3938,6 +3938,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
@@ -4017,6 +4018,14 @@ mod tests {
         let mut post = test_job(4);
         post.name = "ready-post".into();
         post.dir_name = "ready-post".into();
+        // A download-only worker hands off a failed result without PP_DONE.
+        // It needs the same authority-granted post lease as completed bytes.
+        post.status = JobStatus::Failed;
+        post.params.push((
+            nzbd_engine::terminal::DOWNLOAD_FAILURE_PARAM.into(),
+            "1".into(),
+        ));
+        post.params.push(("Failure:Reason".into(), "health".into()));
         inventory
             .allocate_for_delivery(4, &dest, &dest.join("ready-post"), false, false)
             .unwrap();
@@ -4227,6 +4236,7 @@ mod tests {
             disk_guard_roots: vec![],
             torrent_payload_roots: vec![],
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
@@ -4472,6 +4482,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
@@ -4699,6 +4710,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5277,6 +5289,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let hist = Arc::new(
             nzbd_state::history::HistoryDb::open(
@@ -5434,6 +5447,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let shared = LeaderShared::new(
             engine.clone(),
@@ -5759,6 +5773,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let shared = LeaderShared::new(
             engine.clone(),
@@ -5838,6 +5853,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
@@ -6060,6 +6076,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
@@ -6218,6 +6235,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
@@ -6552,6 +6570,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let (_send, view) = watch::channel(LeaderView {
             is_me: true,
@@ -6642,6 +6661,8 @@ mod tests {
                     start_ordered: true,
                 },
                 stopped: None,
+                source_disposition: None,
+                writer_paths: Vec::new(),
             };
             let mut stale = request.clone();
             stale.token.fence += 1;

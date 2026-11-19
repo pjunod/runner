@@ -595,6 +595,9 @@ pub(crate) enum QueueCommand {
         source: String,
         reply: oneshot::Sender<()>,
     },
+    RetryStorage {
+        reply: oneshot::Sender<()>,
+    },
     ResumeAll {
         source: String,
         reply: oneshot::Sender<()>,
@@ -984,6 +987,7 @@ pub(crate) struct Lease {
     pub message_id: String,
     pub writer: mpsc::Sender<WriteCmd>,
     pub generation: u64,
+    pub cancel: CancellationToken,
 }
 
 /// Everything that reaches the owner task.
@@ -4863,6 +4867,14 @@ impl Owner {
                 self.publish_now();
                 let _ = reply.send(());
             }
+            QueueCommand::RetryStorage { reply } => {
+                // Retry probes, not pause flags or the evidence-based safety latch.
+                self.space_probe_after = Instant::now();
+                self.space_probe_failures = 0;
+                self.maybe_probe_space();
+                self.publish_now();
+                let _ = reply.send(());
+            }
             QueueCommand::ResumeAll { source, reply } => {
                 tracing::info!(
                     %source,
@@ -5339,36 +5351,19 @@ impl Owner {
                 if quiescent {
                     if let Some(j) = self.state.job_mut(job) {
                         let current = j.control();
-                        let after = j
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == "*Control:probe_after")
-                            .and_then(|(_, v)| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        let count = j
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == "*Control:attempts")
-                            .and_then(|(_, v)| v.parse::<u32>().ok())
-                            .unwrap_or(0);
                         if current.is_some_and(|c| {
                             c.revision == revision
                                 && c.lifecycle == "held"
                                 && matches!(c.cause.as_str(), "capacity" | "quota")
-                        }) && (after <= now || by == RetryBy::Operator)
-                        {
-                            // The spacing paces the recovery task; a person
-                            // asking is the health probe's to answer, not
-                            // the backoff's.
+                                && (by == RetryBy::Operator
+                                    || (!c.manual_pause
+                                        && c.next_retry_at_unix.is_none_or(|after| after <= now)))
+                        }) {
+                            // JobControl owns the retry clock. Legacy probe
+                            // parameters must not delay a migrated hold.
                             j.params.retain(|(k, _)| {
                                 k != "*Control:probe_after" && k != "*Control:attempts"
                             });
-                            j.params.push((
-                                "*Control:probe_after".into(),
-                                (now + 30 * (1i64 << count.min(6))).to_string(),
-                            ));
-                            j.params
-                                .push(("*Control:attempts".into(), (count + 1).to_string()));
                             self.dirty = true;
                             accepted = true;
                         }
@@ -6609,6 +6604,7 @@ impl Owner {
             .chain(self.pending_control_commits.iter())
             .chain(self.pending_control_revisions.keys())
             .chain(self.allocating_jobs.iter())
+            .chain(self.deferred_terminals.keys())
         {
             excluded.insert(*job, "verification/replacement".into());
         }
@@ -6727,6 +6723,7 @@ impl Owner {
                 message_id,
                 writer,
                 generation,
+                cancel: self.writers[&r.file].stop.clone(),
             });
         }
         if !leases.is_empty() && self.startup_phases.first_lease_ms.is_none() {
@@ -7252,24 +7249,28 @@ impl Owner {
         self.maybe_abort_unhealthy(r.job);
     }
 
-    /// NZBGet-style critical-health abort: once enough articles have
-    /// failed that the job can't be repaired even with every par2 block
-    /// (`health < critical_health`), stop wasting bandwidth. Pending
-    /// segments are failed outright; leased ones finish their in-flight
-    /// attempt honestly. The job then completes as Failed through the
-    /// normal path, and the PP health gate parks/deletes per policy.
+    /// End an unviable download through the durable failure path immediately.
+    /// Pending-only exhaustion leaves leased retries and paused PAR files alive.
     fn maybe_abort_unhealthy(&mut self, job_id: JobId) {
-        if !self.tuning.health_abort {
+        if !self.tuning.health_abort
+            || self.terminals_in_flight.contains(&job_id)
+            || self.deferred_terminals.contains_key(&job_id)
+        {
             return;
         }
         let Some(job) = self.state.job(job_id) else {
             return;
         };
-        // A held download still counts its late article failures.
         if !matches!(
             job.status,
             JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused | JobStatus::Held
-        ) {
+        ) || open_post_stage(job).is_some()
+            || job.control().is_some_and(|control| control.post_side())
+            || job
+                .params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
             return;
         }
         let health = Health::calc(&job.totals);
@@ -7278,46 +7279,31 @@ impl Owner {
             return;
         }
         let name = job.name.clone();
-        let pending: Vec<(FileId, Vec<u32>)> = job
-            .files
-            .iter()
-            .filter(|f| !f.is_terminal())
-            .map(|f| {
-                (
-                    f.id,
-                    f.segments
-                        .iter()
-                        .filter(|s| matches!(s.state, SegmentState::Pending))
-                        .map(|s| s.number)
-                        .collect(),
-                )
-            })
-            .collect();
-        tracing::warn!(
-            job = job_id.0,
-            %name,
-            health = health.0,
-            critical = critical.0,
-            "aborting download: health below critical (unrepairable even with all par2)"
-        );
-        for (file, segs) in pending {
-            for seg_number in segs {
-                let r = SegRef {
-                    job: job_id,
-                    file,
-                    seg_number,
-                };
-                if let Some(seg) = self.state.segment_mut(r) {
-                    seg.state = SegmentState::Failed;
+        // Stop producers and fence their late acknowledgements before disposal.
+        self.retire_job_writers(job_id);
+        self.attempts.retain(|r, _| r.job != job_id);
+        self.fail_job_terminal_then(
+            job_id,
+            nzbd_types::FailureReason::Health,
+            None,
+            "health",
+            &format!(
+                "download health {} below critical health {}",
+                health.0, critical.0
+            ),
+            Box::new(move |owner, row| {
+                if row.is_some() {
+                    owner.emit(Event::JobFinished {
+                        job: job_id,
+                        name,
+                        status: JobStatus::Failed,
+                        health: health.0,
+                    });
                 }
-                self.attempts.remove(&r);
-            }
-            if let Some(j) = self.state.job_mut(job_id) {
-                recompute_job_totals(j);
-            }
-            self.after_file_change(job_id, file);
-        }
+            }),
+        );
         self.bump_epoch();
+        self.publish_now();
     }
 
     fn accept_file_metadata(&mut self, job: JobId, file: FileId, name: &str, size: u64) {
@@ -7517,8 +7503,14 @@ impl Owner {
                 attempts_made
             },
             next_retry_at_unix: timed.then(|| {
-                now.saturating_add(hold_retry_delay_with_jitter(job, attempts_made, now))
-                    .max(not_before.unwrap_or(0))
+                now.saturating_add(
+                    if cause.is_storage() || cause == nzbd_types::HoldCause::StorageUnavailable {
+                        hold_retry_delay_with_jitter(job, attempts_made, now).min(60)
+                    } else {
+                        hold_retry_delay_with_jitter(job, attempts_made, now)
+                    },
+                )
+                .max(not_before.unwrap_or(0))
             }),
             blocked_since_unix: episode.and_then(|c| c.blocked_since_unix).or(Some(now)),
             released_at_unix: None,
@@ -7788,6 +7780,13 @@ impl Owner {
         let timed = control.hold_cause().policy().timed();
         if timed {
             let delay = hold_retry_delay_with_jitter(job, control.retry_attempt, unix_now());
+            let delay = if control.hold_cause().is_storage()
+                || control.hold_cause() == nzbd_types::HoldCause::StorageUnavailable
+            {
+                delay.min(60)
+            } else {
+                delay
+            };
             control.retry_attempt = control.retry_attempt.saturating_add(1);
             control.next_retry_at_unix = Some(unix_now().saturating_add(delay));
         }
@@ -9412,7 +9411,9 @@ impl Owner {
                 volumes,
             },
         );
-        self.space_probe_after = Instant::now() + Duration::from_secs(30);
+        if !self.enospc_latched {
+            self.space_probe_after = Instant::now() + Duration::from_secs(30);
+        }
         self.enospc_where = Some(whence.to_string());
         if !self.enospc_latched {
             self.enospc_latched = true;
@@ -9531,7 +9532,7 @@ impl Owner {
     }
 
     /// W5a: while latched, gather evidence for each recorded failure on a
-    /// backoff (30 s doubling to 10 min), off the owner thread. Failures
+    /// backoff (30–60 s), off the owner thread. Failures
     /// whose operation no longer exists are dropped here; see
     /// [`Self::space_probe_plan`] for what each remaining one waits on.
     fn maybe_probe_space(&mut self) {
@@ -9718,7 +9719,7 @@ impl Owner {
                         }
                     }
                     SpaceOp::Post { job } => {
-                        if self.space_retry_runnable(op) {
+                        if self.post_admissions.contains_key(job) {
                             return None;
                         }
                         // A post report's path is already the directory the
@@ -9790,7 +9791,7 @@ impl Owner {
             self.space_probe_failures = self.space_probe_failures.saturating_add(1);
             let backoff = 30u64
                 .saturating_mul(1 << self.space_probe_failures.min(5))
-                .min(600);
+                .min(60);
             self.space_probe_after = Instant::now() + Duration::from_secs(backoff);
         }
         self.settle_space_latch();
@@ -9987,6 +9988,12 @@ impl Owner {
             self.replay_terminals();
         }
         self.convert_legacy_holds();
+        if self.tuning.health_abort {
+            let jobs = self.state.jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+            for job in jobs {
+                self.maybe_abort_unhealthy(job);
+            }
+        }
         self.persist_post_rollbacks_then(|_| {});
         self.retry_payload_recoveries();
         self.start_verifications();
@@ -11685,10 +11692,18 @@ pub(crate) fn rearmed_hold(
     if identity_wedge {
         control.next_retry_at_unix = Some(now);
     }
+    let storage_delay = (cause.is_storage() || cause == nzbd_types::HoldCause::StorageUnavailable)
+        && control
+            .next_retry_at_unix
+            .is_some_and(|at| at > now.saturating_add(60));
+    if storage_delay {
+        control.next_retry_at_unix = Some(now.saturating_add(60));
+    }
     if control.cause == cause.as_str()
         && control.retry_policy == policy.as_str()
         && !unscheduled
         && !identity_wedge
+        && !storage_delay
     {
         return None;
     }

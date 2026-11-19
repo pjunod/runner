@@ -69,6 +69,8 @@ pub struct ClusterConfig {
     pub download: bool,
     pub max_download_jobs: u32,
     pub post_process: bool,
+    /// Retain failed source copies after custody settles.
+    pub keep_failed_downloads: bool,
     /// Concurrent PP pipelines this node may run (C2).
     pub pp_slots: u32,
     pub lease_interval: Duration,

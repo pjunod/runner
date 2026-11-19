@@ -295,7 +295,11 @@ fn post_config(
         unpack: cfg.post.unpack,
         cleanup: cfg.post.cleanup,
         deobfuscate_final: cfg.post.deobfuscate_final,
-        failure_action: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action),
+        failure_action: if cfg.post.keep_failed_downloads {
+            nzbd_post::manager::FailureAction::Park
+        } else {
+            nzbd_post::manager::FailureAction::Delete
+        },
         failed_dir: Some(
             cfg.post
                 .failed_dir
@@ -390,8 +394,7 @@ fn engine_tuning(cfg: &nzbd_config::Config) -> Tuning {
         daily_quota_bytes: cfg.queue.daily_quota_mb * 1024 * 1024,
         monthly_quota_bytes: cfg.queue.monthly_quota_mb * 1024 * 1024,
         quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
-        health_abort: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action)
-            != nzbd_post::manager::FailureAction::None,
+        health_abort: true,
         hold_deadline: Duration::from_secs(cfg.post.hold_deadline_secs.max(1)),
         password_hold_deadline: Duration::from_secs(cfg.post.password_hold_deadline_secs.max(1)),
         ..Tuning::default()
@@ -446,6 +449,7 @@ fn cluster_runtime_config(
         disk_guard_roots: disk_guard_roots(cfg),
         torrent_payload_roots: torrent_payload_roots(cfg),
         workspace_dir: cfg.configured_workspace_dir(),
+        keep_failed_downloads: cfg.post.keep_failed_downloads,
     };
     Ok((runtime, shared_dir))
 }
@@ -2245,15 +2249,24 @@ mod tests {
     }
 
     #[test]
-    fn post_config_maps_health_and_timeouts() {
-        let cfg = cfg_with(
+    fn post_config_maps_retention_and_timeouts() {
+        let mut cfg = cfg_with(
             "[post]\nhealth_action = \"park\"\ntool_timeout_secs = 0\nscripts_dir = \"~/scripts\"\n",
         );
         let pc = post_config(&cfg, 3, None);
         assert_eq!(
             pc.failure_action,
-            nzbd_post::manager::FailureAction::Park,
-            "the old `health_action` key still parses"
+            nzbd_post::manager::FailureAction::Delete,
+            "retention is opt-in even with a legacy health_action"
+        );
+        cfg.post.keep_failed_downloads = true;
+        assert_eq!(
+            post_config(&cfg, 3, None).failure_action,
+            nzbd_post::manager::FailureAction::Park
+        );
+        assert!(
+            engine_tuning(&cfg).health_abort,
+            "keeping files must not disable health abort"
         );
         assert_eq!(pc.slots, 3);
         // Zero timeout is clamped to something sane rather than "instant".
@@ -2278,7 +2291,7 @@ mod tests {
         assert_eq!(tuning.daily_quota_bytes, 5 * 1024 * 1024);
         assert_eq!(tuning.monthly_quota_bytes, 6 * 1024 * 1024);
         assert_eq!(tuning.quota_start_day, 28);
-        assert!(!tuning.health_abort);
+        assert!(tuning.health_abort);
 
         cfg.queue.quota_start_day = 0;
         cfg.post.failure_action = "park".into();

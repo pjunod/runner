@@ -1655,10 +1655,11 @@ async fn queue_action(
         "resume" => engine.resume_all(&source).await,
         "pause-post" => engine.pause_post(&source).await,
         "resume-post" => engine.resume_post(&source).await,
+        "retry-storage" => engine.retry_storage().await,
         _ => {
             return error(
                 StatusCode::BAD_REQUEST,
-                "unknown action (pause|resume|pause-post|resume-post)",
+                "unknown action (pause|resume|pause-post|resume-post|retry-storage)",
             )
         }
     };

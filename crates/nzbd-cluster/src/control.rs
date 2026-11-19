@@ -2097,6 +2097,7 @@ pub(crate) mod coordinator_protocol_tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);

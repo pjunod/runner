@@ -571,6 +571,137 @@ impl Inventory {
         Ok(())
     }
 
+    /// Settle a joined worker's exact source copies under the authority's
+    /// retention policy. Deletion uses the existing sealed cluster-copy journal.
+    pub fn dispose_expired_worker_sources(
+        &self,
+        receipt: &WorkerStoppedReceipt,
+        keep_failed_downloads: bool,
+        writer_paths: &[String],
+        terminal_receipt: &str,
+    ) -> Result<String> {
+        if keep_failed_downloads {
+            self.park_expired_worker_sources(receipt)?;
+            return Ok("stopped source copies retained by Keep failed downloads".into());
+        }
+        let sources = {
+            let _guard = self.mutation_guard()?;
+            let db = self.db.lock().unwrap();
+            let record = load(&db, &receipt.id)?.ok_or(Error::NotFound)?;
+            if record.phase != "stopped"
+                || record
+                    .receipt
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    != Some(serde_json::to_string(receipt)?)
+                || terminal_receipt.is_empty()
+            {
+                return Err(Error::Conflict(
+                    "exact joined source receipt unavailable".into(),
+                ));
+            }
+            let authority: Option<String> = db
+                .query_row(
+                    "SELECT data FROM worker_authority WHERE job=?1",
+                    [receipt.job],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if authority
+                .as_ref()
+                .map(|raw| serde_json::from_str::<WorkerControlContext>(raw))
+                .transpose()?
+                .is_some_and(|current| !same_worker_operation(&current, &receipt.context))
+            {
+                return Err(Error::Conflict(
+                    "a newer worker grant owns this source".into(),
+                ));
+            }
+            let mut sources = receipt.sources.clone();
+            for source in &receipt.sources {
+                let mut stmt = db.prepare("SELECT data FROM operations WHERE artifact=?1 AND json_extract(data,'$.kind') IN ('par_repair','extract')")?;
+                let rows = stmt.query_map([&source.artifact], |row| row.get::<_, String>(0))?;
+                for raw in rows {
+                    let operation: Operation = serde_json::from_str(&raw?)?;
+                    let workspace: super::transforms::Workspace =
+                        serde_json::from_str(&operation.request)?;
+                    if workspace.source.id == source.artifact
+                        && workspace.source.generation == source.generation
+                    {
+                        let child = SourceGeneration {
+                            artifact: workspace.scratch.id,
+                            generation: workspace.scratch.generation,
+                        };
+                        if !sources.contains(&child) {
+                            sources.push(child);
+                        }
+                    }
+                }
+            }
+            sources
+        };
+        let mut retained = 0;
+        for source in sources {
+            let artifact = self.get(&source.artifact)?;
+            if artifact.generation != source.generation {
+                return Err(Error::Conflict("stopped source generation changed".into()));
+            }
+            if artifact.terminal() {
+                continue;
+            }
+            if !artifact.owned
+                || !artifact.automatic_cleanup_eligible
+                || !artifact.delivery_lifecycle
+                || artifact.keep
+                || artifact.keep_on_failure
+            {
+                retained += 1;
+                continue;
+            }
+            // Only the transform workspace marker is an ended-attempt hold.
+            // All other holds/open moves and active users remain decisive.
+            if artifact.hold.as_deref() == Some("transform workspace") {
+                let _guard = self.mutation_guard()?;
+                let mut current = self.get(&source.artifact)?;
+                if current.generation != source.generation || self.source_in_use(&source) {
+                    return Err(Error::Conflict(
+                        "stopped transform source is still in use".into(),
+                    ));
+                }
+                current.hold = None;
+                current.revision += 1;
+                save_artifact(&self.db.lock().unwrap(), &current)?;
+            }
+            let copy = ClusterArtifactCopy {
+                storage_instance_id: self.installation.clone(),
+                publication: source.clone(),
+                source,
+                job_id: receipt.job,
+                selected: false,
+                raw_files: None,
+            };
+            let files = self.cluster_owned_copy_file_seal(&copy, writer_paths)?;
+            let result = self.retire_cluster_artifact_copy_with_failure_retention(
+                &copy,
+                nzbd_types::FailureReason::HoldExpired.history_status(),
+                FinalizationProof::Cluster {
+                    receipt: terminal_receipt.into(),
+                    accepted_at_ms: receipt.stopped_at_ms,
+                },
+                Some(&files),
+                terminal_receipt,
+                false,
+            )?;
+            if result.status != "removed" {
+                return Err(Error::Conflict(result.error.unwrap_or_else(|| {
+                    "failed source deletion remains pending".into()
+                })));
+            }
+        }
+        Ok(format!("stopped source deletion settled; {retained} copies retained by Keep or ownership safeguards"))
+    }
+
     pub fn worker_expiry_outbox(&self, after: &str) -> Result<Vec<(String, String)>> {
         let db = self.db.lock().unwrap();
         let mut stmt=db.prepare("SELECT key,value FROM meta WHERE key LIKE 'expiry-outbox:%' AND key>?1 ORDER BY key LIMIT 16")?;

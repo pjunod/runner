@@ -848,6 +848,8 @@ pub(crate) struct CopyRequest {
 }
 #[derive(Serialize, Deserialize)]
 struct CopyAuthority {
+    #[serde(default = "retain_legacy_failed_copies")]
+    keep_failed_downloads: bool,
     #[serde(default)]
     result_id: String,
     copy: CopyObligation,
@@ -855,6 +857,9 @@ struct CopyAuthority {
     receipt: String,
     accepted_at_ms: i64,
     source_disposition: Option<String>,
+}
+fn retain_legacy_failed_copies() -> bool {
+    true
 }
 #[derive(Serialize, Deserialize)]
 struct CopyResult {
@@ -894,6 +899,7 @@ async fn authorized_copy(
         .cloned()
         .ok_or("copy cleanup claim changed")?;
     Ok(CopyAuthority {
+        keep_failed_downloads: shared.cfg.keep_failed_downloads,
         result_id: record.result_id,
         copy,
         outcome: record.delivery.terminal_outcome,
@@ -991,6 +997,20 @@ pub(crate) async fn cleanup_copy(
             }
             let result = tokio::task::spawn_blocking(
                 move || -> Result<nzbd_state::artifacts::ClusterCopyCleanup, String> {
+                    if authority.keep_failed_downloads
+                        && authority.outcome != "SUCCESS"
+                        && authority.source_disposition.as_deref()
+                            != Some("cancellation_delete_files")
+                        && copy
+                            .artifact
+                            .as_ref()
+                            .is_none_or(|artifact| !artifact.selected)
+                    {
+                        return Ok(nzbd_state::artifacts::ClusterCopyCleanup {
+                            status: "retained".into(),
+                            error: Some("Keep failed downloads is enabled by the authority".into()),
+                        });
+                    }
                     if let Some(local) = copy.local_delivery_id {
                         let delivery = inventory
                             .retire_delivery_source(&local)
@@ -1037,16 +1057,16 @@ pub(crate) async fn cleanup_copy(
                                 .map_err(|e| e.to_string());
                         }
                         return inventory
-                            .retire_cluster_artifact_copy_with_result(
+                            .retire_cluster_artifact_copy_with_failure_retention(
                                 &artifact,
                                 &authority.outcome,
                                 nzbd_state::artifacts::FinalizationProof::Cluster {
                                     receipt: authority.receipt,
                                     accepted_at_ms: authority.accepted_at_ms,
                                 },
-                                authority.source_disposition.as_deref() == Some("unusable"),
                                 copy.deletion_files.as_deref(),
                                 &authority.result_id,
+                                authority.keep_failed_downloads,
                             )
                             .map_err(|e| e.to_string());
                     }
@@ -1416,6 +1436,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
@@ -1613,6 +1634,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
