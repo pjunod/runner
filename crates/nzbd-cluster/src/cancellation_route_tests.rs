@@ -470,7 +470,7 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
     let outside = temp.path().join("library-copy");
     std::fs::create_dir_all(root).unwrap();
     inventory
-        .allocate_for_delivery(job_id.0, root, &path, true, false)
+        .allocate_for_delivery(job_id.0, root, &path, true, true)
         .unwrap();
     let partial = path.join(".runner-file-61.part");
     std::fs::write(&partial, b"owned partial").unwrap();
@@ -687,7 +687,17 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
         if snapshot["state"] == "verified" {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "{snapshot}");
+        if tokio::time::Instant::now() >= deadline {
+            let copies = match snapshot["operationId"].as_str() {
+                Some(id) => control
+                    .cluster_delivery(id)
+                    .await
+                    .unwrap()
+                    .map(|record| record.copies),
+                None => None,
+            };
+            panic!("disposition did not verify: {snapshot}; copy receipts: {copies:?}");
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!partial.exists());

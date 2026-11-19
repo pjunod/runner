@@ -746,7 +746,8 @@ impl Inventory {
                 ),
             ));
         }
-        if artifact.keep && receipt.request.source().as_ref() != Some(binding) {
+        let confirmed_source = receipt.request.source().as_ref() == Some(binding);
+        if artifact.keep && !confirmed_source {
             return Ok((Blocked, Some("Runner Keep covers this source. Release it in Runner Files after reviewing the generation.".into())));
         }
         if let Some(id) = &receipt.operation_id {
@@ -775,6 +776,17 @@ impl Inventory {
         );
         let operation = match self.operation(&key) {
             Ok(operation) => operation,
+            Err(Error::NotFound) if confirmed_source => self.request_delete_with_disposition(
+                &artifact.id,
+                artifact.revision,
+                &key,
+                0,
+                false,
+                None,
+                false,
+                None,
+                Some(&receipt.request.request_id),
+            )?,
             Err(Error::NotFound) => {
                 self.request_delete(&artifact.id, artifact.revision, &key, 0)?
             }
@@ -992,9 +1004,10 @@ mod tests {
             inventory.save_job_disposition(&receipt).unwrap();
             let status = inventory.settle_job_disposition(receipt).unwrap();
             if exact {
+                assert_eq!(status.state, JobDispositionState::Pending, "{status:?}");
                 assert_eq!(
                     inventory
-                        .execute_delete(&status.operation_id.unwrap())
+                        .execute_delete(&status.operation_id.expect("confirmed deletion operation"))
                         .unwrap()
                         .state,
                     "succeeded"

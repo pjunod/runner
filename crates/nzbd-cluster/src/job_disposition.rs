@@ -1046,6 +1046,7 @@ fn raw_copies(
 fn private_record(
     receipt: &Receipt,
     copies: Vec<CopyObligation>,
+    accepted_at_ms: i64,
 ) -> Result<ClusterDelivery, String> {
     let id = operation_id(&receipt.data.request.request_id);
     let request = &receipt.data.request;
@@ -1057,7 +1058,7 @@ fn private_record(
         "jobId":receipt.job, "runnerInstanceId":request.runner_instance_id,
         "requestToken":request.transfer, "keepSourceOnFailure":false,
         "terminalOutcome":"CANCELLED", "publicationPath":"", "manifestDigest":id,
-        "files":[], "fileOutcomes":[], "readyAt":0,
+        "files":[], "fileOutcomes":[], "readyAt":accepted_at_ms / 1000,
         "sourceCleanup":{"status":"pending","attempts":0,"attemptHistory":[]}
     }))
     .map_err(|error| error.to_string())?;
@@ -1079,13 +1080,14 @@ impl ControlStore {
         copies: Vec<CopyObligation>,
         authority: (&str, &str, u64),
     ) -> Result<(), String> {
-        let record = private_record(receipt, copies)?;
+        let accepted_at_ms = crate::control::unix_ms_public();
+        let record = private_record(receipt, copies, accepted_at_ms)?;
         let id = &record.delivery.delivery_id;
         let (data, public) = crate::delivery::encode_record(&record)?;
         let decision = crate::cancellation::CancellationDecision {
             receipt_id: id.clone(),
             cleanup_id: id.clone(),
-            accepted_at_ms: crate::control::unix_ms_public(),
+            accepted_at_ms,
             disposition: "cleanup_pending".into(),
             reason: "exact job owner disposition".into(),
         };
