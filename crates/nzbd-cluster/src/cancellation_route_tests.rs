@@ -417,9 +417,10 @@ async fn explicit_delete_waits_remote_join_before_owner_seal_and_physical_cleanu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn job_disposition_waits_for_offline_grant_and_removes_exact_source_after_receiver_restart() {
+async fn job_disposition_retires_started_assembly_after_original_receiver_restarts() {
     use crate::cancellation::RemovalMode;
     use nzbd_state::UrlAdmissionReceipt;
+    use std::io::Write;
 
     let temp = tempfile::tempdir().unwrap();
     let a = Node::start(temp.path(), "authority", true).await;
@@ -476,7 +477,7 @@ async fn job_disposition_waits_for_offline_grant_and_removes_exact_source_after_
         dupe: Default::default(),
         params: vec![
             ("monarr-transfer".into(), transfer.clone()),
-            (crate::delivery::AUTHORITY_COPY_PARAM.into(), source),
+            (crate::delivery::AUTHORITY_COPY_PARAM.into(), source.clone()),
             ("Failure:Stage".into(), "download".into()),
             ("Failure:Reason".into(), "historical diagnostic".into()),
             (PP_DONE_PARAM.into(), "FAILURE/HEALTH".into()),
@@ -554,6 +555,57 @@ async fn job_disposition_waits_for_offline_grant_and_removes_exact_source_after_
     else {
         panic!("grant")
     };
+    let crate::control::LeaseClaim::Acquired(assembly) = control
+        .acquire(
+            "work/job/37/file/61/assemble",
+            "exact-keep",
+            u64::from(job_id.0),
+            &incarnation,
+            "writer",
+            &b.runtime.leader_shared.owner_incarnation,
+            "assemble",
+            &scope,
+            revision,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("assembly grant")
+    };
+    let assembly_start = WorkerStopRequest {
+        job: job_id.0,
+        context: WorkerControlContext {
+            lease_id: format!("{}@{}", assembly.resource, assembly.fence),
+            job_incarnation: incarnation.clone(),
+            job_revision: revision,
+            control_revision: revision,
+            epoch: issuer.2,
+        },
+        owner_incarnation: assembly.owner_incarnation,
+        storage_instance_id: storage.clone(),
+        removal_revision: None,
+        authority_source_json: Some(source),
+        start_ordered: true,
+    };
+    let workspace_root = &b.runtime.leader_shared.dest_dir;
+    std::fs::create_dir_all(workspace_root).unwrap();
+    let writer_inventory = b.runtime.engine.artifacts();
+    writer_inventory
+        .begin_worker_assembly_grant(&assembly_start, workspace_root)
+        .unwrap();
+    let (mut output, reader, relative) = writer_inventory
+        .allocate_worker_assembly(
+            job_id.0,
+            &assembly_start.context,
+            workspace_root,
+            "partial-assembly.bin",
+        )
+        .unwrap();
+    output.write_all(b"partially assembled").unwrap();
+    output.sync_all().unwrap();
+    drop((output, reader, writer_inventory));
+    let workspace = workspace_root.join(relative);
     b.stop().await;
 
     let client = reqwest::Client::new();
@@ -616,6 +668,7 @@ async fn job_disposition_waits_for_offline_grant_and_removes_exact_source_after_
     );
     let still_pending = client.post(&route).json(&action).send().await.unwrap();
     assert_eq!(still_pending.status(), StatusCode::ACCEPTED);
+    assert!(workspace.join("partial-assembly.bin").exists());
 
     let b = Node::start(temp.path(), "writer", false).await;
     assert_eq!(b.runtime.engine.artifacts().installation, storage);
@@ -630,6 +683,7 @@ async fn job_disposition_waits_for_offline_grant_and_removes_exact_source_after_
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!partial.exists());
+    assert!(!workspace.exists());
     assert_eq!(std::fs::read(&outside).unwrap(), b"owned partial");
     let restored = control.admission(&transfer).await.unwrap().unwrap();
     assert_eq!(restored.terminal_outcome.as_deref(), Some("FAILURE/HEALTH"));

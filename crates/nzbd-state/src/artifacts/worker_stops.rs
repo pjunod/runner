@@ -2,6 +2,10 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+mod assembly;
+use assembly::AssemblyWorkspace;
+pub use assembly::WorkerAssemblyRetirement;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerStopRequest {
@@ -36,6 +40,8 @@ struct GrantJournal {
     never_started: bool,
     #[serde(default)]
     receipt: Option<WorkerStoppedReceipt>,
+    #[serde(default)]
+    assembly: Option<AssemblyWorkspace>,
 }
 #[derive(Clone, Debug)]
 pub struct WorkerStopTicket {
@@ -271,6 +277,14 @@ impl Inventory {
     /// This commit precedes private allocation/copy/import/writer creation.
     /// A removal fence and a late grant start serialize on the same guard.
     pub fn begin_worker_grant(&self, request: &WorkerStopRequest) -> Result<()> {
+        self.begin_worker_grant_with_assembly(request, None)
+    }
+
+    fn begin_worker_grant_with_assembly(
+        &self,
+        request: &WorkerStopRequest,
+        assembly: Option<AssemblyWorkspace>,
+    ) -> Result<()> {
         validate(request, &self.installation)?;
         if request.removal_revision.is_some() || !request.start_ordered {
             return Err(Error::Conflict(
@@ -302,6 +316,7 @@ impl Inventory {
                 phase: "started".into(),
                 never_started: false,
                 receipt: None,
+                assembly,
             },
         )
     }
@@ -348,6 +363,7 @@ impl Inventory {
             phase: "stopping".into(),
             never_started: true,
             receipt: None,
+            assembly: None,
         });
         if record.request.owner_incarnation != request.owner_incarnation
             || record.request.authority_source_json != request.authority_source_json

@@ -1819,7 +1819,11 @@ async fn poll_for_work(
                 registered = true;
             }
             let inventory=engine.artifacts();
-            if let Err(error)=tokio::task::spawn_blocking(move||inventory.begin_worker_grant(&request)).await.map_err(|error|error.to_string()).and_then(|result|result.map_err(|error|error.to_string())) {
+            let assembly_root = (grant.kind == LeaseKind::Assemble).then(|| dest_dir.to_path_buf());
+            if let Err(error)=tokio::task::spawn_blocking(move || match assembly_root {
+                Some(root) => inventory.begin_worker_assembly_grant(&request, &root),
+                None => inventory.begin_worker_grant(&request),
+            }).await.map_err(|error|error.to_string()).and_then(|result|result.map_err(|error|error.to_string())) {
                 tracing::warn!(job=job_id.0,%error,"durable grant start refused");reject_remote_grant(cfg,client,leader_url,&grant.lease_id,&grant.token).await;return;
             }
             if grant.kind == LeaseKind::Download
@@ -1909,7 +1913,7 @@ async fn poll_for_work(
                 let Ok(scope) = serde_json::from_value::<crate::range::AssembleScope>(grant.scope) else { return; };
                 if !authority() { return; }
                 admitted = true;
-                run_assembly(grant.job, scope, dest_dir.to_path_buf(), grant.token.fence, active.clone(), grant.lease_id, tracker);
+                run_assembly(grant.job, scope, dest_dir.to_path_buf(), engine.artifacts(), context, active.clone(), tracker);
             }
         }
         }.await;
@@ -2313,16 +2317,17 @@ fn run_assembly(
     job: nzbd_types::Job,
     scope: crate::range::AssembleScope,
     dest_dir: PathBuf,
-    fence: u64,
+    inventory: Arc<nzbd_state::artifacts::Inventory>,
+    context: nzbd_state::artifacts::WorkerControlContext,
     active: ActiveLeases,
-    lease_id: String,
     tracker: &TaskTracker,
 ) {
+    let lease_id = context.lease_id.clone();
     active
         .clone()
         .spawn_operation(tracker, lease_id.clone(), async move {
             let result = tokio::task::spawn_blocking(move || {
-                crate::range::assemble(job, &scope, &dest_dir, fence)
+                crate::range::assemble(job, &scope, &dest_dir, &inventory, &context)
             })
             .await;
             match result {

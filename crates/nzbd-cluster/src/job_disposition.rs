@@ -16,7 +16,8 @@ use axum::{
 };
 use hiqlite::{params, Row};
 use nzbd_state::artifacts::{
-    ClusterArtifactCopy, JobDispositionRequest, JobDispositionState, WorkerStoppedReceipt,
+    ClusterArtifactCopy, JobDispositionRequest, JobDispositionState, WorkerAssemblyRetirement,
+    WorkerStoppedReceipt,
 };
 use nzbd_types::JobId;
 use serde::{Deserialize, Serialize};
@@ -484,6 +485,8 @@ struct OwnerAuthority {
     storage: String,
     protected_results: Vec<String>,
     stopped: Vec<nzbd_state::artifacts::WorkerControlContext>,
+    assembly_stops: Vec<WorkerStoppedReceipt>,
+    removal_revision: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -491,6 +494,8 @@ struct OwnerObservation {
     node: String,
     storage: String,
     candidates: Vec<nzbd_state::artifacts::SourceGeneration>,
+    #[serde(default)]
+    assembly_retirements: Vec<WorkerAssemblyRetirement>,
 }
 
 fn grant_key(grant: &HistoricalGrant) -> String {
@@ -747,6 +752,17 @@ async fn lookup_owner(
     let deliveries = control
         .disposition_deliveries(&receipt.data.request.transfer, receipt.job)
         .await?;
+    let node_grants: Vec<_> = grants
+        .iter()
+        .filter(|grant| grant.initial_token.owner_node_id == request.node)
+        .filter_map(|grant| {
+            receipt
+                .data
+                .grants
+                .get(&grant_key(grant))
+                .map(|observed| (grant, observed))
+        })
+        .collect();
     Ok(OwnerAuthority {
         job: receipt.job,
         transfer: receipt.data.request.transfer,
@@ -757,12 +773,16 @@ async fn lookup_owner(
             .map(|record| record.result_id)
             .filter(|id| !id.is_empty())
             .collect(),
-        stopped: grants
+        stopped: node_grants
             .iter()
-            .filter(|grant| grant.initial_token.owner_node_id == request.node)
-            .filter_map(|grant| receipt.data.grants.get(&grant_key(grant)))
-            .map(|grant| grant.stopped.context.clone())
+            .map(|(_, observed)| observed.stopped.context.clone())
             .collect(),
+        assembly_stops: node_grants
+            .into_iter()
+            .filter(|(grant, _)| grant.kind == "assemble")
+            .map(|(_, observed)| observed.stopped.clone())
+            .collect(),
+        removal_revision: receipt.removal_revision,
     })
 }
 
@@ -848,6 +868,35 @@ async fn inspect_owner(
             return Err("previous authority is still retiring its local projection".into());
         }
     }
+    let assembly_retirements = if authority.assembly_stops.is_empty() {
+        Vec::new()
+    } else {
+        // lookup_owner checked all historical joins and the exact explicit
+        // Delete receipt. The seal reader is independently joined here.
+        let active = shared
+            .worker_leases
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("worker execution registry unavailable")?;
+        let _seal = active.sealing.lock().await;
+        let inv = inventory.clone();
+        let root = shared.dest_dir.clone();
+        let stops = authority.assembly_stops;
+        let revision = authority.removal_revision;
+        tokio::task::spawn_blocking(move || {
+            let mut retirements = Vec::new();
+            for stop in stops {
+                if let Some(retirement) = inv.retire_worker_assembly(&stop, revision, &root)? {
+                    retirements.push(retirement);
+                }
+            }
+            Ok::<_, nzbd_state::artifacts::Error>(retirements)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?
+    };
     let candidates = tokio::task::spawn_blocking(move || {
         inventory.cluster_disposition_candidates(
             authority.job,
@@ -862,6 +911,7 @@ async fn inspect_owner(
         node: request.node.clone(),
         storage: authority.storage,
         candidates,
+        assembly_retirements,
     })
 }
 
@@ -1340,8 +1390,39 @@ async fn reconcile(
                 return Ok(());
             }
         }
-        if !observed.stopped.never_started && grant.kind == "assemble" {
-            blocked(receipt, "a started assembly grant has private workspace without an exact retirement receipt");
+        if grant.kind == "assemble"
+            && !receipt
+                .data
+                .owners
+                .get(&grant.initial_token.owner_node_id)
+                .is_some_and(|owner| {
+                    owner.assembly_retirements.iter().any(|proof| {
+                        proof.stop_id == observed.stopped.id
+                            && proof.removal_revision == receipt.removal_revision
+                            && proof.storage_instance_id == observed.stopped.storage_instance_id
+                            && (!observed.stopped.never_started || !proof.had_output)
+                    })
+                })
+        {
+            let node = &grant.initial_token.owner_node_id;
+            match check_owner(shared, receipt, node, &owners[node]).await {
+                Ok(owner) => {
+                    let retired = owner
+                        .assembly_retirements
+                        .iter()
+                        .any(|proof| proof.stop_id == observed.stopped.id);
+                    receipt.data.owners.insert(node.clone(), owner);
+                    if retired {
+                        waiting(
+                            receipt,
+                            "checking the refreshed assembly retirement receipt",
+                        );
+                    } else {
+                        blocked(receipt, "assembly workspace lacks an exact owner retirement receipt; review its historical custody");
+                    }
+                }
+                Err(reason) => waiting(receipt, reason),
+            }
             return Ok(());
         }
     }

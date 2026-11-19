@@ -1,8 +1,9 @@
 //! Explicit article-range work and single-writer assembly.
 
+use nzbd_state::artifacts::{Inventory, WorkerControlContext};
 use nzbd_types::{FileId, Job, JobId, JobStatus, SegmentState};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -94,11 +95,12 @@ pub struct AssembleScope {
     pub ranges: Vec<AcceptedRange>,
 }
 
-pub fn assemble(
+pub(crate) fn assemble(
     mut job: Job,
     scope: &AssembleScope,
     dest_dir: &Path,
-    fence: u64,
+    inventory: &Inventory,
+    context: &WorkerControlContext,
 ) -> Result<Job, String> {
     if scope.job_id != job.id.0 {
         return Err("assembly scope names another job".into());
@@ -125,21 +127,9 @@ pub fn assemble(
         .ok_or_else(|| "assembly file disappeared".to_owned())?;
     let filename = job.files[file_index].filename.clone();
     let advertised_crc = job.files[file_index].crc32;
-    let private_dir = dest_dir.join(format!(
-        ".nzbd-cluster/assembly/job-{}/file-{}/fence-{fence}",
-        scope.job_id, scope.file_id
-    ));
-    std::fs::create_dir_all(&private_dir)
-        .map_err(|error| format!("create assembly directory: {error}"))?;
-    let building = private_dir.join(format!("{filename}.building"));
-    let final_path = private_dir.join(&filename);
-    let mut output = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&building)
-        .map_err(|error| format!("create assembly output: {error}"))?;
+    let (mut output, mut reader, private_dir) = inventory
+        .allocate_worker_assembly(job.id.0, context, dest_dir, &filename)
+        .map_err(|error| format!("allocate exact private assembly workspace: {error}"))?;
 
     let mut terminal = std::collections::HashMap::new();
     let mut file_size = 0u64;
@@ -231,16 +221,18 @@ pub fn assemble(
         .set_len(file_size)
         .and_then(|_| output.sync_all())
         .map_err(|error| format!("flush assembly: {error}"))?;
-    std::fs::rename(&building, &final_path)
-        .map_err(|error| format!("publish private assembly: {error}"))?;
-    std::fs::File::open(&private_dir)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("flush private assembly directory: {error}"))?;
-    let mut data = Vec::new();
-    File::open(&final_path)
-        .and_then(|mut file| file.read_to_end(&mut data))
-        .map_err(|error| format!("read assembled output: {error}"))?;
-    let whole_crc = crc32fast::hash(&data);
+    let mut crc = crc32fast::Hasher::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let bytes = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("read assembled output: {error}"))?;
+        if bytes == 0 {
+            break;
+        }
+        crc.update(&buffer[..bytes]);
+    }
+    let whole_crc = crc.finalize();
     if advertised_crc.is_some_and(|expected| expected != whole_crc) {
         return Err("assembled file CRC does not match the advertised whole-file CRC".into());
     }
@@ -252,11 +244,7 @@ pub fn assemble(
     job.params.retain(|(key, _)| key != &size_key);
     job.params.push((size_key, file_size.to_string()));
     job.files.retain(|file| file.id == FileId(scope.file_id));
-    job.dir_name = private_dir
-        .strip_prefix(dest_dir)
-        .map_err(|_| "assembly path escaped destination".to_owned())?
-        .to_string_lossy()
-        .into_owned();
+    job.dir_name = private_dir.to_string_lossy().into_owned();
     job.status = JobStatus::Completed;
     job.params
         .push(("*Cluster:original-dir".into(), original_dir));

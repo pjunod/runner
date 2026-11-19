@@ -64,7 +64,8 @@ pub use url_resolutions::{
     UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry, MAX_SOURCE as MAX_URL_SOURCE_BYTES,
 };
 pub use worker_stops::{
-    same_worker_operation, WorkerStopRequest, WorkerStopTicket, WorkerStoppedReceipt,
+    same_worker_operation, WorkerAssemblyRetirement, WorkerStopRequest, WorkerStopTicket,
+    WorkerStoppedReceipt,
 };
 mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
