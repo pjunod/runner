@@ -8,6 +8,10 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+bincode = { package = "grovedb-bincode", version = "=2.1.0" }
+peer = { package = "librqbit-peer-protocol", path = "../contrib/rqbit/vendor/crates/peer_binary_protocol", default-features = false, features = ["sha1-ring"] }
+buffers = { package = "librqbit-buffers", path = "../contrib/rqbit/vendor/crates/buffers" }
+cryptr = { path = "../vendor/cryptr" }
 librqbit = { workspace = true }
 libfuzzer-sys = "=0.4.13"
 nzbd-torrent = { path = "../crates/nzbd-torrent", features = ["fuzzing"] }
@@ -22,6 +26,20 @@ bench = false
 [[bin]]
 name = "magnet_preflight"
 path = "fuzz_targets/magnet_preflight.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_protocol"
+path = "fuzz_targets/peer_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_bundle"
+path = "fuzz_targets/key_bundle.rs"
 test = false
 doc = false
 bench = false

@@ -156,7 +156,8 @@ features = [
 ]
 
 [dependencies.bincode]
-version = "2"
+package = "grovedb-bincode"
+version = "=2.1.0"
 features = ["serde"]
 
 [dependencies.bytes]
@@ -191,7 +192,8 @@ optional = true
 version = "0.8.4"
 
 [dependencies.cryptr]
-version = "0.10"
+version = "=0.10.0"
+path = "../cryptr"
 
 [dependencies.ctrlc]
 version = "3.4.4"

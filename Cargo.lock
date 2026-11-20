@@ -363,35 +363,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bincode"
-version = "1.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "bincode"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36eaf5d7b090263e8150820482d5d93cd964a81e4019913c972f4edcc6edb740"
-dependencies = [
- "bincode_derive",
- "serde",
- "unty",
-]
-
-[[package]]
-name = "bincode_derive"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf95709a440f45e986983918d0e8a1f30a9b1df04918fc828670606804ac3c09"
-dependencies = [
- "virtue",
-]
-
-[[package]]
 name = "bit-vec"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -849,19 +820,17 @@ dependencies = [
 [[package]]
 name = "cryptr"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceed6f824991d2ee1f69d9e29e802e70bb70c567169ecd9713b08722d2d616de"
 dependencies = [
  "argon2",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
- "bincode 2.0.1",
  "bytes",
  "chacha20poly1305",
  "dotenvy",
  "flume",
  "futures",
+ "grovedb-bincode",
  "lazy_static",
  "rand 0.10.2",
  "regex",
@@ -1116,7 +1085,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1237,6 +1206,15 @@ name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
+
+[[package]]
+name = "fugue-bincode"
+version = "1.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f5bf60095260d112de2ecde0319078ba54b7ae5e0b32e5087b1ecf80408c9f6"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "funty"
@@ -1422,6 +1400,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "grovedb-bincode"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce912028682ecc5870a5ad609ea456b76b0bf4ec1ba1eb649400b64ff73a7782"
+dependencies = [
+ "grovedb-bincode-derive",
+ "serde",
+ "unty",
+]
+
+[[package]]
+name = "grovedb-bincode-derive"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eaff4e961dcb3e7e55c34c8c6982249036e5aaa19e55f6dab94ebcd4896b03a"
+dependencies = [
+ "virtue",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1500,7 +1498,6 @@ dependencies = [
  "arc-swap",
  "axum",
  "axum-server",
- "bincode 2.0.1",
  "bytes",
  "chrono",
  "crossbeam",
@@ -1510,6 +1507,7 @@ dependencies = [
  "fastwebsockets",
  "flume",
  "getrandom 0.4.3",
+ "grovedb-bincode",
  "hex",
  "hiqlite-derive",
  "hiqlite-wal",
@@ -1558,11 +1556,11 @@ dependencies = [
 name = "hiqlite-wal"
 version = "0.14.0"
 dependencies = [
- "bincode 2.0.1",
  "byteorder",
  "crc",
  "flume",
  "fs4",
+ "grovedb-bincode",
  "memmap2",
  "openraft",
  "serde",
@@ -2195,10 +2193,10 @@ name = "librqbit-peer-protocol"
 version = "4.3.0"
 dependencies = [
  "anyhow",
- "bincode 1.3.3",
  "bitvec",
  "byteorder",
  "bytes",
+ "fugue-bincode",
  "itertools",
  "librqbit-bencode",
  "librqbit-buffers",
@@ -3180,7 +3178,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3619,7 +3617,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3678,7 +3676,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3699,7 +3697,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4152,10 +4150,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4835,7 +4833,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

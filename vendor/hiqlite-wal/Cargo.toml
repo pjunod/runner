@@ -41,6 +41,7 @@ resolver = "2"
 all-features = true
 
 [features]
+validation-test-helpers = []
 auto-heal = []
 migration = []
 
@@ -50,7 +51,8 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies.bincode]
-version = "2"
+package = "grovedb-bincode"
+version = "=2.1.0"
 features = ["serde"]
 
 [dependencies.byteorder]
