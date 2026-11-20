@@ -74,7 +74,7 @@ inverse_tree() {
 }
 
 normal_tree="$(cargo tree --locked --workspace --target all -e normal --prefix none)"
-if grep -E '^quick-xml v' <<<"$normal_tree" | grep -Ev '^quick-xml v0\.41\.'; then
+if grep -E '^quick-xml v' <<<"$normal_tree" | grep -Ev '^quick-xml v0\.(41|42)\.'; then
   echo 'advisory-affected quick-xml re-entered the normal graph' >&2
   exit 1
 fi
