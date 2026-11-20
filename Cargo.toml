@@ -76,7 +76,7 @@ http-body-util = "0.1"
 httpdate = "1"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
 sha2 = "0.10"
-quick-xml = "0.41"
+quick-xml = "0.42"
 crc32fast = "1"
 base64 = "0.22"
 libc = "0.2"
