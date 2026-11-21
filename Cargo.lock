@@ -2562,7 +2562,7 @@ name = "nzbd"
 version = "0.9.8"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "hyper-util",
  "mdns-sd",
@@ -2597,7 +2597,7 @@ name = "nzbd-api"
 version = "0.9.8"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "http-body-util",
  "nzbd-config",
  "nzbd-engine",
@@ -2656,7 +2656,7 @@ name = "nzbd-compat"
 version = "0.9.8"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "nzbd-api",
  "nzbd-engine",
  "nzbd-feed",
@@ -2799,7 +2799,7 @@ name = "nzbd-qbit-compat"
 version = "0.9.8"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "hex",
  "http-body-util",
  "nzbd-api",
