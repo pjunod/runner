@@ -128,24 +128,24 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
             Event::Start(e) => {
                 let name = e.local_name();
                 match name.as_ref() {
-                    b"nzb" => saw_root = true,
-                    b"file" => {
+                    "nzb" => saw_root = true,
+                    "file" => {
                         let mut f = ParsedFile::default();
                         for attr in e.attributes().flatten() {
                             let val = attr
                                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .unwrap_or_default();
                             match attr.key.local_name().as_ref() {
-                                b"subject" => f.subject = val.into_owned(),
-                                b"poster" => f.poster = Some(val.into_owned()),
-                                b"date" => f.date = val.trim().parse().ok(),
+                                "subject" => f.subject = val.into_owned(),
+                                "poster" => f.poster = Some(val.into_owned()),
+                                "date" => f.date = val.trim().parse().ok(),
                                 _ => {}
                             }
                         }
                         cur_file = Some(f);
                     }
-                    b"group" => text_target = Some(TextTarget::Group),
-                    b"segment" => {
+                    "group" => text_target = Some(TextTarget::Group),
+                    "segment" => {
                         let mut seg = ParsedSegment {
                             message_id: String::new(),
                             number: 0,
@@ -156,17 +156,17 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
                                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                 .unwrap_or_default();
                             match attr.key.local_name().as_ref() {
-                                b"bytes" => seg.bytes = val.trim().parse().unwrap_or(0),
-                                b"number" => seg.number = val.trim().parse().unwrap_or(0),
+                                "bytes" => seg.bytes = val.trim().parse().unwrap_or(0),
+                                "number" => seg.number = val.trim().parse().unwrap_or(0),
                                 _ => {}
                             }
                         }
                         cur_segment = Some(seg);
                         text_target = Some(TextTarget::Segment);
                     }
-                    b"meta" => {
+                    "meta" => {
                         meta_type = e.attributes().flatten().find_map(|a| {
-                            (a.key.local_name().as_ref() == b"type").then(|| {
+                            (a.key.local_name().as_ref() == "type").then(|| {
                                 a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
                                     .unwrap_or_default()
                                     .to_lowercase()
@@ -180,7 +180,7 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
             Event::Text(t) => {
                 if let Some(target) = &text_target {
                     // xml10_content(): charset-decode + entity-unescape
-                    let text = t.xml10_content().unwrap_or_default();
+                    let text = t.xml10_content();
                     let text = text.trim();
                     if text.is_empty() {
                         // ignore whitespace-only nodes
@@ -210,7 +210,7 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
                 }
             }
             Event::End(e) => match e.local_name().as_ref() {
-                b"file" => {
+                "file" => {
                     if let Some(mut f) = cur_file.take() {
                         f.segments.sort_by_key(|s| s.number);
                         f.segments.dedup_by_key(|s| s.number);
@@ -219,7 +219,7 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
                         }
                     }
                 }
-                b"segment" => {
+                "segment" => {
                     if let Some(mut s) = cur_segment.take() {
                         s.message_id = s
                             .message_id
@@ -235,7 +235,7 @@ pub fn parse(input: &[u8]) -> Result<ParsedNzb, NzbError> {
                     }
                     text_target = None;
                 }
-                b"group" | b"meta" => text_target = None,
+                "group" | "meta" => text_target = None,
                 _ => {}
             },
             Event::Eof => break,

@@ -21,16 +21,13 @@ fn resolve_ref(r: &quick_xml::events::BytesRef<'_>) -> String {
     if let Ok(Some(ch)) = r.resolve_char_ref() {
         return ch.to_string();
     }
-    // Explicit slice type: with byte-string arms, `as_ref()` inference
-    // latches onto the first arm's `&[u8; N]` on newer rustc.
-    let name: &[u8] = r.as_ref();
-    match name {
-        b"lt" => "<".into(),
-        b"gt" => ">".into(),
-        b"amp" => "&".into(),
-        b"apos" => "'".into(),
-        b"quot" => "\"".into(),
-        other => format!("&{};", String::from_utf8_lossy(other)),
+    match &**r {
+        "lt" => "<".into(),
+        "gt" => ">".into(),
+        "amp" => "&".into(),
+        "apos" => "'".into(),
+        "quot" => "\"".into(),
+        other => format!("&{other};"),
     }
 }
 
@@ -79,18 +76,17 @@ pub fn parse_feed(xml: &str, now_unix: i64) -> Vec<FeedItem> {
     while let Ok(ev) = reader.read_event() {
         match ev {
             Event::Start(e) => {
-                let name = e.local_name().as_ref().to_vec();
-                match name.as_slice() {
-                    b"item" | b"entry" => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    "item" | "entry" => {
                         cur = Some(FeedItem::default());
                         pub_date.clear();
                     }
-                    b"title" if cur.is_some() => text_target = Some("title"),
-                    b"link" if cur.is_some() => {
+                    "title" if cur.is_some() => text_target = Some("title"),
+                    "link" if cur.is_some() => {
                         // Atom: <link href="…"/>; RSS: <link>text</link>.
                         let href = e.attributes().flatten().find_map(|a| {
-                            (a.key.local_name().as_ref() == b"href")
-                                .then(|| String::from_utf8_lossy(&a.value).into_owned())
+                            (a.key.local_name().as_ref() == "href").then(|| a.value.into_owned())
                         });
                         match href {
                             Some(h) => {
@@ -103,41 +99,37 @@ pub fn parse_feed(xml: &str, now_unix: i64) -> Vec<FeedItem> {
                             None => text_target = Some("link"),
                         }
                     }
-                    b"guid" | b"id" if cur.is_some() => text_target = Some("guid"),
-                    b"category" if cur.is_some() => text_target = Some("category"),
-                    b"pubDate" | b"published" | b"updated" if cur.is_some() => {
+                    "guid" | "id" if cur.is_some() => text_target = Some("guid"),
+                    "category" if cur.is_some() => text_target = Some("category"),
+                    "pubDate" | "published" | "updated" if cur.is_some() => {
                         text_target = Some("date")
                     }
-                    b"size" if cur.is_some() => text_target = Some("size"),
+                    "size" if cur.is_some() => text_target = Some("size"),
                     _ => {}
                 }
                 text.clear();
             }
             Event::Empty(e) => {
-                let name = e.local_name().as_ref().to_vec();
+                let name = e.local_name();
                 let Some(item) = cur.as_mut() else { continue };
-                match name.as_slice() {
-                    b"enclosure" => {
+                match name.as_ref() {
+                    "enclosure" => {
                         for a in e.attributes().flatten() {
                             match a.key.local_name().as_ref() {
-                                b"url" => item.url = String::from_utf8_lossy(&a.value).into_owned(),
-                                b"length" => {
-                                    item.size = String::from_utf8_lossy(&a.value)
-                                        .parse()
-                                        .unwrap_or(item.size)
-                                }
+                                "url" => item.url = a.value.into_owned(),
+                                "length" => item.size = a.value.parse().unwrap_or(item.size),
                                 _ => {}
                             }
                         }
                     }
                     // <newznab:attr name="size" value="…"/> and friends.
-                    b"attr" => {
+                    "attr" => {
                         let mut aname = String::new();
                         let mut avalue = String::new();
                         for a in e.attributes().flatten() {
                             match a.key.local_name().as_ref() {
-                                b"name" => aname = String::from_utf8_lossy(&a.value).into_owned(),
-                                b"value" => avalue = String::from_utf8_lossy(&a.value).into_owned(),
+                                "name" => aname = a.value.into_owned(),
+                                "value" => avalue = a.value.into_owned(),
                                 _ => {}
                             }
                         }
@@ -147,11 +139,10 @@ pub fn parse_feed(xml: &str, now_unix: i64) -> Vec<FeedItem> {
                             _ => {}
                         }
                     }
-                    b"link" => {
+                    "link" => {
                         // Atom self-closing link.
                         if let Some(h) = e.attributes().flatten().find_map(|a| {
-                            (a.key.local_name().as_ref() == b"href")
-                                .then(|| String::from_utf8_lossy(&a.value).into_owned())
+                            (a.key.local_name().as_ref() == "href").then(|| a.value.into_owned())
                         }) {
                             if item.url.is_empty() {
                                 item.url = h;
@@ -162,18 +153,16 @@ pub fn parse_feed(xml: &str, now_unix: i64) -> Vec<FeedItem> {
                 }
             }
             Event::Text(t) if text_target.is_some() => {
-                if let Ok(chunk) = t.xml10_content() {
-                    text.push_str(&chunk);
-                }
+                text.push_str(&t.xml10_content());
             }
             Event::GeneralRef(r) if text_target.is_some() => {
                 text.push_str(&resolve_ref(&r));
             }
             Event::CData(c) if text_target.is_some() => {
-                text.push_str(&String::from_utf8_lossy(&c));
+                text.push_str(&c);
             }
             Event::End(e) => {
-                let name = e.local_name().as_ref().to_vec();
+                let name = e.local_name();
                 if let (Some(target), Some(item)) = (text_target.take(), cur.as_mut()) {
                     let value = text.trim().to_string();
                     match target {
@@ -190,7 +179,7 @@ pub fn parse_feed(xml: &str, now_unix: i64) -> Vec<FeedItem> {
                         _ => {}
                     }
                 }
-                if matches!(name.as_slice(), b"item" | b"entry") {
+                if matches!(name.as_ref(), "item" | "entry") {
                     if let Some(mut item) = cur.take() {
                         if item.guid.is_empty() {
                             item.guid = item.url.clone();

@@ -31,15 +31,15 @@ pub fn parse_call(xml: &str) -> Option<MethodCall> {
     loop {
         match reader.read_event().ok()? {
             Event::Start(e) => match e.name().as_ref() {
-                b"methodName" => in_name = true,
-                b"value" => {
+                "methodName" => in_name = true,
+                "value" => {
                     let v = parse_value(&mut reader)?;
                     params.push(v);
                 }
                 _ => {}
             },
             Event::Text(t) if in_name => {
-                name = t.xml10_content().ok()?.into_owned();
+                name = t.xml10_content().into_owned();
                 in_name = false;
             }
             Event::End(_) => {}
@@ -64,33 +64,32 @@ fn parse_value(reader: &mut Reader<&[u8]>) -> Option<Value> {
     loop {
         match reader.read_event().ok()? {
             Event::Start(e) => match e.name().as_ref() {
-                b"string" => result = Some(Value::String(read_text(reader, b"string")?)),
-                b"int" | b"i4" | b"i8" => {
-                    let tag = e.name().as_ref().to_vec();
-                    let t = read_text_dyn(reader, &tag)?;
+                "string" => result = Some(Value::String(read_text(reader, "string")?)),
+                "int" | "i4" | "i8" => {
+                    let t = read_text(reader, e.name().as_ref())?;
                     result = Some(json!(t.trim().parse::<i64>().unwrap_or(0)));
                 }
-                b"boolean" => {
-                    let t = read_text(reader, b"boolean")?;
+                "boolean" => {
+                    let t = read_text(reader, "boolean")?;
                     result = Some(Value::Bool(t.trim() == "1"));
                 }
-                b"double" => {
-                    let t = read_text(reader, b"double")?;
+                "double" => {
+                    let t = read_text(reader, "double")?;
                     result = Some(json!(t.trim().parse::<f64>().unwrap_or(0.0)));
                 }
-                b"base64" => {
+                "base64" => {
                     // Delivered as the raw base64 string — the JSON dialect's
                     // append() decodes it exactly the same way.
-                    let t = read_text(reader, b"base64")?;
+                    let t = read_text(reader, "base64")?;
                     result = Some(Value::String(t.split_whitespace().collect()));
                 }
-                b"nil" => result = Some(Value::Null),
-                b"array" => result = Some(parse_array(reader)?),
-                b"struct" => result = Some(parse_struct(reader)?),
+                "nil" => result = Some(Value::Null),
+                "array" => result = Some(parse_array(reader)?),
+                "struct" => result = Some(parse_struct(reader)?),
                 _ => {}
             },
             Event::Text(t) => {
-                let chunk = t.xml10_content().ok()?.into_owned();
+                let chunk = t.xml10_content().into_owned();
                 bare_text.get_or_insert_with(String::new).push_str(&chunk);
             }
             Event::GeneralRef(r) => {
@@ -98,7 +97,7 @@ fn parse_value(reader: &mut Reader<&[u8]>) -> Option<Value> {
                     .get_or_insert_with(String::new)
                     .push_str(&resolve_ref(&r));
             }
-            Event::End(e) if e.name().as_ref() == b"value" => {
+            Event::End(e) if e.name().as_ref() == "value" => {
                 // <value>text</value> without a type tag = string.
                 return Some(result.unwrap_or(Value::String(bare_text.unwrap_or_default())));
             }
@@ -113,8 +112,8 @@ fn parse_array(reader: &mut Reader<&[u8]>) -> Option<Value> {
     let mut items = Vec::new();
     loop {
         match reader.read_event().ok()? {
-            Event::Start(e) if e.name().as_ref() == b"value" => items.push(parse_value(reader)?),
-            Event::End(e) if e.name().as_ref() == b"array" => return Some(Value::Array(items)),
+            Event::Start(e) if e.name().as_ref() == "value" => items.push(parse_value(reader)?),
+            Event::End(e) if e.name().as_ref() == "array" => return Some(Value::Array(items)),
             Event::Eof => return None,
             _ => {}
         }
@@ -128,18 +127,18 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Option<Value> {
     loop {
         match reader.read_event().ok()? {
             Event::Start(e) => match e.name().as_ref() {
-                b"name" => in_name = true,
-                b"value" => {
+                "name" => in_name = true,
+                "value" => {
                     let v = parse_value(reader)?;
                     map.insert(std::mem::take(&mut key), v);
                 }
                 _ => {}
             },
             Event::Text(t) if in_name => {
-                key = t.xml10_content().ok()?.into_owned();
+                key = t.xml10_content().into_owned();
                 in_name = false;
             }
-            Event::End(e) if e.name().as_ref() == b"struct" => return Some(Value::Object(map)),
+            Event::End(e) if e.name().as_ref() == "struct" => return Some(Value::Object(map)),
             Event::Eof => return None,
             _ => {}
         }
@@ -152,28 +151,21 @@ fn resolve_ref(r: &quick_xml::events::BytesRef<'_>) -> String {
     if let Ok(Some(ch)) = r.resolve_char_ref() {
         return ch.to_string();
     }
-    // Explicit slice type: with byte-string arms, `as_ref()` inference
-    // latches onto the first arm's `&[u8; N]` on newer rustc.
-    let name: &[u8] = r.as_ref();
-    match name {
-        b"lt" => "<".into(),
-        b"gt" => ">".into(),
-        b"amp" => "&".into(),
-        b"apos" => "'".into(),
-        b"quot" => "\"".into(),
-        other => format!("&{};", String::from_utf8_lossy(other)),
+    match &**r {
+        "lt" => "<".into(),
+        "gt" => ">".into(),
+        "amp" => "&".into(),
+        "apos" => "'".into(),
+        "quot" => "\"".into(),
+        other => format!("&{other};"),
     }
 }
 
-fn read_text(reader: &mut Reader<&[u8]>, end: &[u8]) -> Option<String> {
-    read_text_dyn(reader, end)
-}
-
-fn read_text_dyn(reader: &mut Reader<&[u8]>, end: &[u8]) -> Option<String> {
+fn read_text(reader: &mut Reader<&[u8]>, end: &str) -> Option<String> {
     let mut out = String::new();
     loop {
         match reader.read_event().ok()? {
-            Event::Text(t) => out.push_str(&t.xml10_content().ok()?),
+            Event::Text(t) => out.push_str(&t.xml10_content()),
             Event::GeneralRef(r) => out.push_str(&resolve_ref(&r)),
             Event::End(e) if e.name().as_ref() == end => return Some(out),
             Event::Eof => return None,
