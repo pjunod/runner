@@ -24,6 +24,10 @@ pub mod capacity;
 pub mod fileops;
 mod fsx;
 pub mod history;
+pub mod io_meter;
+mod snapshot_codec;
+mod snapshot_encoder;
+pub use snapshot_encoder::{SnapshotEncoder, SnapshotEncoderStats};
 pub mod torrent_sources;
 #[cfg(windows)]
 mod windows_secret;
@@ -33,6 +37,32 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+
+/// An `io::Error` that says what was being done to what, keeping the
+/// original as its `source()`.
+///
+/// Rebuilding an error from its kind (`io::Error::new(e.kind(), format!(..))`)
+/// drops the errno: `EIO` becomes an uncategorized error with no number, and
+/// the hold classifier (contract §2.3) can no longer tell a dropped mount from
+/// a bad file. This keeps the kind (callers that match it still work), shows
+/// `"<context>: <original>"`, and lets `source()` reach the errno.
+pub fn io_context(error: std::io::Error, context: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        IoContext {
+            context: context.into(),
+            source: error,
+        },
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {source}")]
+struct IoContext {
+    context: String,
+    #[source]
+    source: std::io::Error,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -52,6 +82,10 @@ pub enum StateError {
     },
     #[error("serialize: {0}")]
     Serde(#[from] serde_json::Error),
+    /// The operation was not admitted. Its owner may retry when capacity or
+    /// lifecycle prerequisites change; this says nothing about stored bytes.
+    #[error("operation deferred: {0}")]
+    Busy(&'static str),
     #[error("corrupt state: {0}")]
     Corrupt(String),
 }
@@ -211,34 +245,51 @@ struct OpenJournal {
 
 pub struct JobJournals {
     jobs_dir: PathBuf,
-    /// Fencing suffix — the work-lease id, or "local" for single-node.
+    /// Stable work-lease identity, retained when a checkpoint rotates files.
+    fencing_suffix: String,
+    /// Unique inode incarnation within that fencing identity.
     suffix: String,
     open: std::collections::HashMap<u32, OpenJournal>,
     dirty: bool,
+}
+
+fn journal_incarnation(fencing_suffix: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{fencing_suffix}.{}.{stamp:x}.{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 impl JobJournals {
     pub fn open(state_dir: &Path, suffix: &str) -> Result<JobJournals, StateError> {
         let jobs_dir = state_dir.join("jobs");
         fsx::create_dir_all(&jobs_dir)?;
+        let fencing_suffix = sanitize_suffix(suffix);
+        let suffix = journal_incarnation(&fencing_suffix);
         Ok(JobJournals {
             jobs_dir,
-            suffix: {
-                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                format!(
-                    "{}.{}.{stamp:x}.{}",
-                    sanitize_suffix(suffix),
-                    std::process::id(),
-                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                )
-            },
+            fencing_suffix,
+            suffix,
             open: Default::default(),
             dirty: false,
         })
+    }
+
+    /// After a complete covering checkpoint commits, retire this incarnation's
+    /// append descriptors without deleting any journal evidence. The next append
+    /// creates a fresh exclusive inode rather than extending a possibly torn
+    /// tail. Worker/delegated journals need this even when not compactable.
+    pub fn rotate_after_checkpoint(&mut self) -> Result<(), StateError> {
+        self.sync()?;
+        self.open.clear();
+        self.suffix = journal_incarnation(&self.fencing_suffix);
+        Ok(())
     }
 
     pub fn jobs_dir(&self) -> &Path {
@@ -500,10 +551,14 @@ pub struct UrlAdmissionReceipt {
     pub failure_stage: Option<String>,
     #[serde(default)]
     pub failure_cause: Option<String>,
+    /// Deprecated (pipeline contract v2 §2.5, OpenAPI `deprecated`): runner
+    /// never holds bytes on curator's behalf. Removed in M6.
     #[serde(default)]
     pub custody_state: String,
     #[serde(default)]
     pub keep_source_on_failure: bool,
+    /// Deprecated (pipeline contract v2 §2.5, OpenAPI `deprecated`): source
+    /// cleanup no longer gates curator. Removed in M6.
     #[serde(default)]
     pub source_cleanup_status: Option<String>,
     #[serde(default)]
@@ -514,6 +569,16 @@ pub struct UrlAdmissionReceipt {
     pub source_artifact_id: Option<String>,
     #[serde(default)]
     pub source_generation: Option<String>,
+    /// Contract §2.2, for the continuity-loss reconcile: the terminal's typed
+    /// reason (`Failure:Reason`), not a status string to re-parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blames_release: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salvage: Option<String>,
 }
 
 /// Everything needed to reconstruct the queue after a restart.
@@ -531,6 +596,10 @@ pub struct QueueSnapshotDoc {
     pub next_job_id: u32,
     pub next_file_id: u32,
     pub download_paused: bool,
+    /// Post-processing lane paused. Absent in snapshots written before the
+    /// lanes split, which read as "running" — the old behavior.
+    #[serde(default)]
+    pub post_paused: bool,
     pub speed_limit_bps: Option<u64>,
     /// How many jobs may download at once. Absent in snapshots written
     /// before the setting existed; `QueueState::from_doc` clamps the
@@ -549,6 +618,7 @@ impl Default for QueueSnapshotDoc {
             next_job_id: 0,
             next_file_id: 0,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 0,
         }
@@ -638,9 +708,25 @@ impl SnapshotStore {
                 doc.schema_version, QUEUE_SCHEMA_VERSION
             )));
         }
-        let bytes = serde_json::to_vec(doc)?;
+        let bytes = snapshot_codec::encode(serde_json::to_vec(doc)?)?;
+        self.commit_encoded(&bytes, guard)
+    }
+
+    /// Encode an owned document with a bounded, byte-equivalence cache. The
+    /// cache never substitutes for the complete atomic durability sequence.
+    pub fn save_cached_guarded(
+        &self,
+        doc: QueueSnapshotDoc,
+        encoder: &mut SnapshotEncoder,
+        guard: &dyn Fn() -> bool,
+    ) -> Result<u64, StateError> {
+        let bytes = encoder.encode(doc)?;
+        self.commit_encoded(&bytes, guard)
+    }
+
+    fn commit_encoded(&self, bytes: &[u8], guard: &dyn Fn() -> bool) -> Result<u64, StateError> {
         let mut f = fsx::create(&self.tmp)?;
-        fsx::write_whole(&mut f, &bytes, &self.tmp)?;
+        fsx::write_whole(&mut f, bytes, &self.tmp)?;
         fsx::sync_data(&f, &self.tmp)?;
         drop(f);
         if !guard() {
@@ -661,10 +747,24 @@ impl SnapshotStore {
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
+        Self::decode(&bytes).map(Some)
+    }
+
+    /// Decode already-read snapshot bytes without creating directories or
+    /// changing the document. Migration callers retain the original bytes for
+    /// their fingerprint and backup, regardless of the filesystem encoding.
+    /// Decode the storage envelope without interpreting or reserializing its
+    /// JSON. This preserves exact bytes for offline inspection and conversion.
+    pub fn decode_json_bytes(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, StateError> {
+        snapshot_codec::decode(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<QueueSnapshotDoc, StateError> {
+        let bytes = snapshot_codec::decode(bytes)?;
         match serde_json::from_slice::<QueueSnapshotDoc>(&bytes) {
             Ok(doc) => {
                 validate_queue_schema_version(doc.schema_version)?;
-                Ok(Some(doc))
+                Ok(doc)
             }
             Err(typed_error) => {
                 if let Ok(header) = serde_json::from_slice::<QueueSnapshotHeader>(&bytes) {
@@ -674,6 +774,85 @@ impl SnapshotStore {
             }
         }
     }
+}
+
+/// Materialize exact JSON bytes for an older binary, without loading an engine,
+/// replaying/compacting journals, migrating schema, or opening SQLite. The
+/// existing inventory ownership lock excludes cooperating daemon processes.
+/// Converts the authoritative store and every existing worker store. All files
+/// are validated before the first replacement; interruption is safely resumable.
+pub fn materialize_plain_snapshots(
+    state_dir: &Path,
+    inventory_dir: &Path,
+    max_schema: u32,
+) -> Result<Vec<PathBuf>, StateError> {
+    let lock = fsx::open(&inventory_dir.join("artifacts.lock"))?;
+    lock.try_lock().map_err(|error| {
+        StateError::Corrupt(format!(
+            "stop the daemon before decoding snapshots: {error}"
+        ))
+    })?;
+    let mut paths = Vec::new();
+    let authoritative = state_dir.join("queue.json");
+    if fsx::exists(&authoritative)? {
+        paths.push(authoritative);
+    }
+    let workers = state_dir.join("workers");
+    match fsx::read_dir(&workers) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = fsx::ctx(entry, "read directory entry", &workers)?;
+                let kind = fsx::ctx(entry.file_type(), "read file type", &entry.path())?;
+                if kind.is_symlink() {
+                    return Err(StateError::Corrupt(
+                        "worker snapshot directory is a symlink".into(),
+                    ));
+                }
+                if kind.is_dir() {
+                    let path = entry.path().join("queue.json");
+                    if fsx::exists(&path)? {
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        Err(error) if error.is_not_found() => {}
+        Err(error) => return Err(error),
+    }
+    let read = |path: &Path| -> Result<(Vec<u8>, bool), StateError> {
+        let original = fsx::read(path)?;
+        let decoded = snapshot_codec::decode(&original)?;
+        let header: QueueSnapshotHeader = serde_json::from_slice(&decoded)
+            .map_err(|error| StateError::Corrupt(format!("{}: {error}", path.display())))?;
+        if header.schema_version > max_schema {
+            return Err(StateError::Corrupt(format!(
+                "{} has document schema {}; rollback binary supports at most {max_schema}",
+                path.display(),
+                header.schema_version
+            )));
+        }
+        let compressed = matches!(decoded, std::borrow::Cow::Owned(_));
+        Ok((decoded.into_owned(), compressed))
+    };
+    for path in &paths {
+        read(path)?;
+    }
+    let mut converted = Vec::new();
+    for path in paths {
+        let (bytes, compressed) = read(&path)?;
+        if !compressed {
+            continue;
+        }
+        let tmp = path.with_extension("json.codec-plain.tmp");
+        let mut file = fsx::create(&tmp)?;
+        fsx::write_whole(&mut file, &bytes, &tmp)?;
+        fsx::sync_data(&file, &tmp)?;
+        drop(file);
+        fsx::rename(&tmp, &path)?;
+        fsx::sync_dir(path.parent().unwrap())?;
+        converted.push(path);
+    }
+    Ok(converted)
 }
 
 fn validate_queue_schema_version(schema_version: u32) -> Result<(), StateError> {
@@ -1085,11 +1264,16 @@ mod tests {
                 publication_path: None,
                 source_artifact_id: Some("source-artifact".into()),
                 source_generation: Some("source-generation".into()),
+                failure_reason: None,
+                fetch_cause: None,
+                blames_release: None,
+                salvage: None,
             }],
             jobs: vec![],
             next_job_id: 7,
             next_file_id: 42,
             download_paused: true,
+            post_paused: true,
             speed_limit_bps: Some(1_000_000),
             max_active_downloads: 3,
         };
@@ -1106,6 +1290,10 @@ mod tests {
         assert_eq!(loaded.next_job_id, 7);
         assert_eq!(loaded.next_file_id, 42);
         assert!(loaded.download_paused);
+        assert!(
+            loaded.post_paused,
+            "the post lane's pause survives a restart"
+        );
         assert_eq!(loaded.speed_limit_bps, Some(1_000_000));
         assert_eq!(loaded.url_admission_receipts.len(), 1);
         assert_eq!(loaded.url_admission_receipts[0].request_token, "token-7");
@@ -1126,6 +1314,7 @@ mod tests {
             next_job_id: 1,
             next_file_id: 1,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 1,
         };
@@ -1149,6 +1338,10 @@ mod tests {
         assert_eq!(loaded.next_job_id, 7);
         assert_eq!(loaded.next_file_id, 9);
         assert_eq!(loaded.max_active_downloads, 0);
+        assert!(
+            !loaded.post_paused,
+            "a document from before the lanes split leaves post-processing running"
+        );
     }
 
     #[test]
@@ -1163,6 +1356,7 @@ mod tests {
             next_job_id: 7,
             next_file_id: 0,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 1,
         })
@@ -1399,19 +1593,51 @@ mod tests {
             next_job_id: 5,
             next_file_id: 400,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 1,
         };
         // 4 jobs × 100 files × 500 segments = 200k segments.
+        let raw = serde_json::to_vec(&doc).unwrap();
+        assert!(raw.len() > 10 << 20, "doc is production-sized");
         let bytes = store.save(&doc).unwrap();
-        assert!(bytes > 10 << 20, "doc is production-sized ({bytes} B)");
+        assert_eq!(
+            bytes,
+            std::fs::metadata(dir.path().join("queue.json"))
+                .unwrap()
+                .len()
+        );
+        assert!(
+            bytes < raw.len() as u64 / 2,
+            "large snapshots reduce filesystem traffic"
+        );
         let loaded = store.load().unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&doc).unwrap()
+        );
         assert_eq!(loaded.jobs.len(), 4);
         assert_eq!(loaded.jobs[3].files.len(), 100);
         assert_eq!(loaded.jobs[3].files[99].segments.len(), 500);
         assert_eq!(
             loaded.jobs[1].files[0].segments[0].message_id,
             doc.jobs[1].files[0].segments[0].message_id
+        );
+        let mut encoder = SnapshotEncoder::default();
+        let first = encoder.encode(doc.clone()).unwrap();
+        assert_eq!(
+            SnapshotStore::decode_json_bytes(&first).unwrap().as_ref(),
+            raw
+        );
+        let second = encoder.encode(doc).unwrap();
+        assert_eq!(
+            SnapshotStore::decode_json_bytes(&second).unwrap().as_ref(),
+            raw
+        );
+        assert_eq!(
+            encoder.stats().reused_jobs,
+            4,
+            "all production-shaped jobs reused by full equality"
         );
     }
 
@@ -1442,6 +1668,43 @@ mod tests {
         assert!(JobJournals::replay_job(dir.path(), JobId(1))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn journal_checkpoint_rotation_keeps_evidence_and_fencing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut local = JobJournals::open(dir.path(), "lease.with.dots").unwrap();
+        let mut foreign = JobJournals::open(dir.path(), "foreign").unwrap();
+        local.append(&rec(0)).unwrap();
+        local.sync().unwrap();
+        let old = local.open.get(&1).unwrap().path.clone();
+        let evidence = std::fs::read(&old).unwrap();
+        foreign.append(&rec(1)).unwrap();
+        foreign.sync().unwrap();
+        for segment in 2..=4 {
+            local.rotate_after_checkpoint().unwrap();
+            local.append(&rec(segment)).unwrap();
+            local.sync().unwrap();
+            assert!(local
+                .open
+                .get(&1)
+                .unwrap()
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("journal.lease_with_dots."));
+        }
+        foreign.append(&rec(5)).unwrap();
+        foreign.sync().unwrap();
+        assert_eq!(std::fs::read(&old).unwrap(), evidence);
+        let mut segments = JobJournals::replay_job(dir.path(), JobId(1))
+            .unwrap()
+            .into_iter()
+            .map(|record| record.segment_number)
+            .collect::<Vec<_>>();
+        segments.sort_unstable();
+        assert_eq!(segments, (0..=5).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1500,6 +1763,128 @@ mod tests {
         );
         assert_eq!(records[1].record, rec(2));
         assert_eq!(records[1].provenance, None);
+    }
+
+    fn large_snapshot_doc() -> QueueSnapshotDoc {
+        let mut job = minimal_job();
+        job.params
+            .push(("opaque".into(), "metadata".repeat(160_000)));
+        QueueSnapshotDoc {
+            jobs: vec![job],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compressed_snapshot_keeps_fencing_and_failure_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path()).unwrap();
+        let mut doc = large_snapshot_doc();
+        store.save(&doc).unwrap();
+        let path = dir.path().join("queue.json");
+        let committed = std::fs::read(&path).unwrap();
+        assert!(committed.starts_with(b"NZBDQZ01"));
+        // A legacy JSON reader refuses this encoding; it cannot silently load
+        // an abandoned older file because there is only one authoritative path.
+        assert!(serde_json::from_slice::<QueueSnapshotDoc>(&committed).is_err());
+        doc.next_job_id = 123;
+        assert!(store.save_guarded(&doc, &|| false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        std::fs::remove_file(dir.path().join("queue.json.tmp")).unwrap();
+        std::fs::create_dir(dir.path().join("queue.json.tmp")).unwrap();
+        assert!(store.save(&doc).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        std::fs::remove_dir(dir.path().join("queue.json.tmp")).unwrap();
+        #[cfg(unix)]
+        {
+            crate::fsx::fail_next_dir_sync();
+            assert!(store
+                .save(&doc)
+                .unwrap_err()
+                .to_string()
+                .contains("fsync directory"));
+        }
+    }
+
+    #[test]
+    fn offline_plain_conversion_preserves_bytes_and_journals_and_excludes_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("workers/node-1");
+        std::fs::create_dir_all(&worker).unwrap();
+        let lock = File::create(dir.path().join("artifacts.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let mut json = serde_json::to_value(large_snapshot_doc()).unwrap();
+        json["future_unknown_field"] = serde_json::json!({"preserve": [1, 2, 3]});
+        let mut raw = serde_json::to_vec_pretty(&json).unwrap();
+        raw.push(b'\n');
+        let encoded = snapshot_codec::encode(raw.clone()).unwrap();
+        let paths = [dir.path().join("queue.json"), worker.join("queue.json")];
+        for path in &paths {
+            std::fs::write(path, &encoded).unwrap();
+        }
+        let plain_worker = dir.path().join("workers/node-plain");
+        std::fs::create_dir_all(&plain_worker).unwrap();
+        std::fs::write(plain_worker.join("queue.json"), &raw).unwrap();
+        let v2_worker = dir.path().join("workers/node-v2");
+        std::fs::create_dir_all(&v2_worker).unwrap();
+        let mut v2 = b"NZBDQZ02".to_vec();
+        v2.extend_from_slice(&(raw.len() as u64).to_le_bytes());
+        v2.extend_from_slice(&crc32fast::hash(&raw).to_le_bytes());
+        v2.extend_from_slice(&2u32.to_le_bytes());
+        for part in [&raw[..raw.len() / 2], &raw[raw.len() / 2..]] {
+            v2.extend_from_slice(&snapshot_codec::encode_frame(part).unwrap());
+        }
+        std::fs::write(v2_worker.join("queue.json"), &v2).unwrap();
+        let journal = dir.path().join("segments.journal");
+        std::fs::write(&journal, b"retain every journal byte").unwrap();
+        // A bogus SQLite file also proves conversion never opens/migrates DBs.
+        std::fs::write(dir.path().join("artifacts.sqlite"), b"do not open").unwrap();
+        assert!(materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).is_err());
+        drop(lock);
+        assert!(
+            materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION - 1).is_err()
+        );
+        for path in &paths {
+            assert_eq!(std::fs::read(path).unwrap(), encoded);
+        }
+        let mut corrupted = encoded.clone();
+        corrupted[16] ^= 1;
+        std::fs::write(&paths[1], &corrupted).unwrap();
+        assert!(materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).is_err());
+        assert_eq!(
+            std::fs::read(&paths[0]).unwrap(),
+            encoded,
+            "validate every store before replacing the first"
+        );
+        std::fs::write(&paths[1], &encoded).unwrap();
+        let converted =
+            materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).unwrap();
+        assert_eq!(converted.len(), 3);
+        for path in &paths {
+            assert_eq!(std::fs::read(path).unwrap(), raw);
+        }
+        assert_eq!(
+            std::fs::read(journal).unwrap(),
+            b"retain every journal byte"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("artifacts.sqlite")).unwrap(),
+            b"do not open"
+        );
+        assert!(
+            materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION)
+                .unwrap()
+                .is_empty()
+        );
+        // Simulate interruption after one store was already materialized.
+        std::fs::write(&paths[1], &encoded).unwrap();
+        assert_eq!(
+            materialize_plain_snapshots(dir.path(), dir.path(), QUEUE_SCHEMA_VERSION).unwrap(),
+            vec![paths[1].clone()]
+        );
+        assert_eq!(std::fs::read(&paths[1]).unwrap(), raw);
+        assert_eq!(std::fs::read(plain_worker.join("queue.json")).unwrap(), raw);
+        assert_eq!(std::fs::read(v2_worker.join("queue.json")).unwrap(), raw);
     }
 
     #[test]

@@ -17,7 +17,8 @@ web view and no service in between your device and the daemon.
 | Surface | Behavior |
 |---|---|
 | Queue state | Reads the full status and job snapshot from the SSE stream; polls every 5 seconds when that stream is stale |
-| Whole queue | Pause and resume |
+| Whole queue | **Downloads** and **Post-processing** toggles pause and resume each lane independently |
+| Storage | One row per filesystem, named processing or completed, with capacity and a three-minute write/read graph and current rates (same sources as the web: device-wide, this host's NFS traffic, or Runner's own I/O on FUSE/SMB) |
 | One job | Pause · resume · move top/up/down/bottom · remove from the queue |
 | Add | Picks an NZB or torrent file, or accepts a magnet / HTTP torrent URL |
 | Discovery | Scans the local network for nzbd's `_nzbd._tcp` DNS-SD service and fills the server address when selected |
@@ -26,6 +27,12 @@ web view and no service in between your device and the daemon.
 | Providers | Shows the live rate and blocked state of every configured news server |
 | Authentication | Basic username/password or bearer token, stored in iOS Keychain or Android Keystore |
 | Display | Classic/Plex/Theater navigation, ten color schemes, and independent Auto/Light/Dark appearance, stored on the device |
+
+The installed build's version must change for a phone to take a new build,
+and device builds read it from the committed native projects
+(`android/app/build.gradle`, the iOS `project.pbxproj` and `Info.plist`), not
+from `app.json`. A release bumps all four together; `app-version-test`
+fails when they disagree.
 
 Removing a job leaves downloaded files in place. When the daemon can park the
 job in history, the success message says it can be restored there. The mobile
@@ -57,6 +64,15 @@ does not restart a stopped torrent: use Start seeding separately. A reached
 policy offers Seeding options directly. If a server refuses a restart with an
 ambiguous 404, the app refreshes that job before deciding whether to open
 options or report that it has left the queue.
+
+A held job's card (status **held**) shows three things: the cause and Runner's
+message (`out of space: storage full`), `retries paused` when you paused it,
+and `Fails as hold expired in 23h 10m unless it recovers`. Every hold is
+environmental and automatic, so the one button is **Pause retries** while
+Runner is retrying and **Retry** once you have paused it; there is no hold
+that waits for a person. The countdown comes from the daemon's
+`deadline_unix` (or, from an older daemon, `deadline_in_s`). The app has no
+Files tab; parked sources are in the browser UI.
 
 Missing files offers Re-download missing files. Failed torrents offer removal
 with the existing keep/delete-files choice. Disk holds explain automatic
@@ -91,7 +107,7 @@ source owners**. Desired Keep is not confirmation that protection was applied;
 this pending state survives refresh and reconnect. An already absent source
 remains unavailable: requesting Keep cannot restore deleted bytes.
 
-[The parity status page](MOBILE_QUEUE_PARITY_STATUS.md) separates implementation
+[The parity status page](archive/MOBILE_QUEUE_PARITY_STATUS.md) separates implementation
 and test evidence from iOS/Android distribution evidence.
 
 ## Run it locally
@@ -275,3 +291,25 @@ an intercepted connection.
 | [`mobile/src/hooks/useNzbd.ts`](../mobile/src/hooks/useNzbd.ts) | Owns live-stream reconnects, stale polling, and mutations |
 | [`mobile/src/screens/`](../mobile/src/screens/) | Connection, phone, tablet, queue-control, and NZB-picker UI |
 | [`mobile/__tests__/`](../mobile/__tests__/) | Wire-shape and chunk-boundary regression tests |
+
+## Dependency security patches
+
+As of 2026-11-13, the lockfile updates compatible Expo/Jest dependencies
+and uses fixed minimatch 11 for `@expo/fingerprint`. The licensed local
+[`deepmerge`](../mobile/vendor/deepmerge/UPSTREAM.json) fork is explicitly named `@runner/deepmerge-compat` version 1.0.0, records
+its deepmerge 4.3.1 origin, and changes destination writes to own data properties,
+closing GHSA-gcqx-w48m-w2h4 without inventing an upstream release. Its seven
+regressions run during `npm ci`; three fail on the original upstream code.
+The complete mobile unit suite verifies Jest/Expo compatibility.
+
+```bash
+cd mobile                       # Use the app's lockfile and local override.
+npm ci                          # Apply patches and execute security regressions.
+npm run typecheck && npm test    # Verify the application and Jest integration.
+npm audit                       # Review current registry dependency advisories.
+```
+
+A zero npm audit result covers the resolved registry graph. The local patch
+requires source review and the regressions above; its provenance records the
+original and modified SHA-256 hashes and includes the MIT license. Remove
+the override only after a compatible upstream fix passes those regressions.

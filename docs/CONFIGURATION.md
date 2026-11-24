@@ -18,9 +18,59 @@ main_dir = "~/downloads"            # default Usenet processing root + state
 dest_dir = "~/downloads/complete"   # finished downloads (per-category overrides below)
 # inter_dir = "~/downloads/inter"   # processing override; absent/empty uses main_dir
 # nzb_watch_dir = "~/downloads/nzb" # drop .nzb files here to auto-queue them
-# queue_dir = "~/downloads/queue"   # journal + queue snapshots (default: <main_dir>/queue)
+# queue_dir = "~/downloads/queue"   # the state directory (default: <main_dir>/queue)
+# workspace_dir = "~/downloads/.workspaces" # PAR repair / extraction scratch
+#                                   # (default: <state dir>/transform-workspaces)
 # temp_dir = "/tmp/nzbd"            # scratch space
 ```
+
+**The state directory** (`queue_dir`, default `<main_dir>/queue`) holds
+everything that is not payload: `queue.json` and its snapshots, the per-job
+journals, `artifacts.sqlite` (file lifecycle), the history index
+(`history.sqlite`, unless `[history] index_dir` moves it), the history
+journal, parked NZBs (`nzbs/`), torrent session state and the identity
+sidecars. It is small and fsync-heavy: a local disk is the right place.
+
+**`workspace_dir`** is where post-processing builds a PAR repair or an
+extraction before the result is moved into the job's processing directory.
+It holds payload-sized data while a transform runs, and its output reaches
+processing by `rename` only when both are on the same filesystem — on
+different volumes every result is copied. Unset, it stays under the state
+directory (nothing changes for existing installs). Put it on the processing
+volume when the state directory is a small local disk. Moving it later is
+supported: stop nzbd, move the directory, set `workspace_dir`, start; at
+startup every recorded workspace path under the old default
+(`<state dir>/transform-workspaces`) — or under whatever root the transform
+journals recorded, which is what matters when the state directory itself
+moved too — is resolved to where those workspaces now are: workspaces on
+`workspace_dir`'s filesystem are renamed into it, and the recorded paths are
+rewritten only to a place that holds every live workspace that still
+exists. An unreadable root leaves everything as it is. The moved workspaces
+are re-stamped (a no-op on every later start). The state directory can be
+moved as a whole: the history index marker is written both absolute
+(`history/.history-index-path`, read by every build) and relative to the
+state directory (`.history-index-path.rel`, preferred), and an older
+absolute-only marker naming the old place resolves to the same index under
+the new one. If the
+old directory still holds workspaces (not moved), nothing is rewritten:
+those finish where they are and only new workspaces use `workspace_dir`. It
+must not be nested inside the default location (or contain it).
+
+**Recommended layout with a small local state disk** (state local, payload on
+one processing volume):
+
+```toml
+[paths]
+queue_dir     = "/srv/nzbd/state"          # local disk: state only
+main_dir      = "/processing"              # processing volume
+workspace_dir = "/processing/.workspaces"  # same volume as main_dir
+dest_dir      = "/processing/completed"    # same volume: publish = rename
+```
+
+`dest_dir` on the same filesystem as the job's processing directory
+publishes by same-volume rename (decided by device number; no bytes are
+copied). On a GlusterFS FUSE mount every path of the volume shares one
+device, so `/processing/completed` qualifies.
 
 The watch dir is polled by the daemon; a dropped `.nzb` is queued and the
 file removed. In cluster mode only the current leader watches it.
@@ -212,6 +262,19 @@ quota_start_day = 1          # day of month the monthly quota resets
 root, not only `paths.dest_dir`. A zero value disables the hold but keeps the
 same cached inventory visible in native status.
 
+The free-space reading is a forecast. A write that actually fails with
+ENOSPC/EDQUOT latches the hold regardless of it, and the latch clears only
+when probe writes (eight 1 MiB files, each fsynced, then removed) succeed in
+the directory that failed — retried automatically with storage delays capped
+at 30–60 seconds.
+**Retry storage now** requests a probe without changing either manual lane
+pause or clearing the evidence latch. Idle post failures are probed too, and
+persisted long storage holds are shortened. Clear space; successful probes
+resume eligible work while preserving manual pauses. A free-space reading
+never clears it:
+on a Gluster distribute volume statvfs sums the bricks and reports space
+while one brick is full.
+
 `max_active_downloads` decides how many jobs are worked on at the same
 time. At `1` — the default, and what nzbd has always done — the top job
 takes every connection until it has no segments left to hand out. Raising
@@ -337,28 +400,61 @@ deobfuscate_final = true    # rename still-obfuscated files to the job name
                             # names are never touched
 strategy = "balanced"       # sequential | balanced | aggressive | rocket
                             # (1 / 2 / 3 / 6 concurrent PP jobs)
-failure_action = "delete"   # none | park | delete — what happens to the
-                            # FILES of a job that ended in a terminal
-                            # failure: par failure, unpack failure, script
-                            # failure, health abort, post crash. Deleting
-                            # loses nothing: the job's NZB is parked with
-                            # its history row, so requeue re-downloads it.
-                            # "none" leaves ~90 GB per failed grab in the
-                            # tree your importer watches — that is how a
-                            # terabyte of duplicates happened. Anything but
-                            # "none" also aborts a download the moment its
-                            # health drops below critical health (the point
-                            # where even all par2 blocks can't repair it),
-                            # instead of finishing a doomed download.
-                            # Accepts the old name `health_action`, which
-                            # only ever governed the health gate
+keep_failed_downloads = false # false: delete failed payload after recovery;
+                              # true: park it in failed_dir for retention.
+                              # Per-download Keep overrides either choice.
+                              # Legacy failure_action/health_action values
+                              # are accepted but do not govern runtime policy.
 failed_dir = "/data/usenet/failed"   # where "park" puts them; defaults to
                             # <main_dir>/failed — deliberately off the
                             # category tree
 tool_timeout_secs = 3600
 script_timeout_secs = 3600
 par_fetch_timeout_secs = 600   # wait for delayed par files during repair
+hold_deadline_secs = 86400     # how long an environmental hold (storage down,
+                               # disk full, quota, missing tool, mount gone…)
+                               # may last before the job fails `hold_expired`
+password_hold_deadline_secs = 604800   # the same, for an archive waiting on
+                               # a password (a person has to act, so longer)
 ```
+
+**Failure disposition.** `[post] keep_failed_downloads` defaults to `false`:
+Runner deletes failed payload after salvage and cleanup custody settle. Set it
+to `true` to park failed payload in `failed_dir`, subject to
+`failed_retention_days`. The per-download **Keep on failure** preference
+retains its source indefinitely and takes precedence. Failure reason,
+recoverability and Curator admission do not force parking. Legacy
+`failure_action` and `health_action` remain accepted for compatibility; the
+boolean supersedes them in daemon runtime. In a cluster, the authority's
+retention and per-download Keep policy also governs expiry and copy owners;
+a worker preserves bytes safely if an older authority supplies no policy.
+
+**Health cancellation is always armed.** When health falls below critical
+health (even all PAR2 blocks cannot repair it), the owner records the durable
+failure immediately and stops writers and NNTP waits. The periodic tick also
+reconciles restored jobs. The download executor stops doing post-side work.
+In a cluster it hands the typed failure to the authority, which assigns normal
+post-processing verification and salvage before accepting the authoritative
+terminal/history result. Download-only workers need no local history for this
+handoff. Retention settings decide what happens to bytes after recovery and
+custody obligations settle.
+
+Parked failures expire at their wall-clock deadline (`failed_retention_days`,
+default 7) whether or not file-lifecycle automation is enabled and across
+restarts; Keep holds them. A job's source directory is a closed scope: once
+its delivery is a success (or a failure it does not keep), whatever the
+publication did not take — PAR sets, samples, `.exe`, consumed or obfuscated
+archive pieces, files a repair rewrote — is removed with the directory, and
+nothing is held for review. A job's subtitles (`srt`, `ass`, `ssa`, `sub`,
+`idx`, `sup`, `vtt`, anywhere in the tree — `Subs/2_English.srt` included)
+are published with its video at their relative path.
+
+**Holds always end.** A hold is environmental only — the job's own content
+never holds it — and is retried automatically on the hold ladder. Each hold
+gets a deadline when it starts (`deadline_unix` and `deadline_in_s` in the
+job's `control`); a newer cause replaces the older one and restarts the clock.
+Past the deadline the job fails with reason `hold_expired` and follows the
+failure policy, even if the queue is paused. Seed-retirement holds on torrents carry no deadline.
 
 Failed-file disposition is retried before the terminal history row is written.
 A stable local error such as permission denied is attempted three times, then

@@ -117,6 +117,7 @@ impl Drop for NamespaceUse<'_> {
                 .lock()
                 .unwrap()
                 .remove(key);
+            self.inventory.reconciliation_released.notify_all();
         }
     }
 }
@@ -592,10 +593,12 @@ impl Inventory {
                             updated_at: now(),
                             retention_seconds: 0,
                             deadline: None,
-                            eligible_seconds: 0,
                             files,
                             error: None,
                             inspected_at: Some(now()),
+                            salvage: None,
+                            failure_reason: None,
+                            gone_reason: None,
                         });
                     }
                 }
@@ -633,10 +636,12 @@ impl Inventory {
                     updated_at: now(),
                     retention_seconds: 0,
                     deadline: None,
-                    eligible_seconds: 0,
                     files: Vec::new(),
                     error: None,
                     inspected_at: Some(now()),
+                    salvage: None,
+                    failure_reason: None,
+                    gone_reason: None,
                 };
                 drop(db);
                 let record = Materialization {

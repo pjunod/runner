@@ -169,8 +169,8 @@ and #163 retains sole activation ownership; this report still authorizes no
 production networking by itself.
 
 The two repository prerequisites named in the original report are complete:
-[`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 landed on 2026-07-31, and
-[`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) now makes forget durable
+[`REGRAB_LOOP_PLAN.md`](archive/REGRAB_LOOP_PLAN.md) F1–F3 landed on 2026-07-31, and
+[`DEFECT_HISTORY_DELETE.md`](archive/DEFECT_HISTORY_DELETE.md) now makes forget durable
 across the shared JSONL. They no longer block M2. The engine decision completed
 separately and is now accepted.
 

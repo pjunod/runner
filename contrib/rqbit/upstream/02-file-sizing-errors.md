@@ -15,11 +15,16 @@ During initialization rqbit calls `TorrentStorage::ensure_file_length` for each 
 
 ## Tests
 ```
-# upstream main f4ca7d91 + this commit; Linux x86_64, Rust 1.97.1
+# upstream main f23bacdd + this commit; Linux x86_64, Rust 1.97.1
 cargo fmt --all -- --check     # ok
-cargo clippy --all-targets     # no warnings (also clean with Rust 1.94)
-cargo test                     # 170 passed, 0 failed (main alone: 168 passed, 0 failed)
+cargo clippy --all-targets     # no warnings
+cargo test                     # 173 passed, 0 failed (main alone: 171 passed, 0 failed)
 ```
+One unrelated, unreproduced failure is noted: upstream's new
+`fake_peer::test_fake_peer_downloads_a_block_from_a_seeder` failed once in the
+first full run (upload counter read 0). It then passed 50/50 alone, both with and
+without this change, and the full suite passed on rerun. It may be a timing race
+in that test: the counter is updated after the write completes.
 The new tests (`file_sizing_error_stops_initialization` in `librqbit`, `pause_race_preserves_non_cancellation` in `librqbit`) are part of that run and pass.
 
 What the new tests cover:

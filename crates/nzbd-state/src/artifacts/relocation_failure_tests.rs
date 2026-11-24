@@ -110,6 +110,14 @@ fn restart_refreshes_hardlink_identity_after_source_unlink() {
     drop(inventory);
 
     let reopened = Inventory::open(&temp.path().join("state")).unwrap();
+    // This injected I/O failure is a durable scheduled retry, not an actual
+    // process kill. Restart must preserve its deadline; advance it explicitly.
+    let mut operation = reopened.operation(&relocation.operation_id).unwrap();
+    let mut movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
+    assert!(movement["cleanup"]["next_retry"].as_i64().unwrap() > now());
+    movement["cleanup"]["next_retry"] = 0.into();
+    operation.request = serde_json::to_string(&movement).unwrap();
+    save_operation(&reopened.db.lock().unwrap(), &operation).unwrap();
     reopened.reconcile_relocations().unwrap();
     let artifact = reopened.for_job(91).unwrap().unwrap();
     let observed = fs::manifest(&fs::open_dir(&target).unwrap(), 100_000).unwrap();
@@ -341,7 +349,9 @@ fn successful_delete_never_tombstones_a_recreated_artifact_id() {
     next.state = "retained".into();
     inventory.sidecar(&next).unwrap();
     save_artifact(&inventory.db.lock().unwrap(), &next).unwrap();
-    inventory.reconcile_deleted_artifacts().unwrap();
+    inventory
+        .reconcile_deleted_artifacts_snapshot(None)
+        .unwrap();
     assert_eq!(
         serde_json::to_value(inventory.get(&next.id).unwrap()).unwrap(),
         serde_json::to_value(&next).unwrap()
@@ -367,7 +377,9 @@ fn pending_delete_cannot_cross_generations_and_legacy_success_cannot_repair_them
     legacy.state = "succeeded".into();
     legacy.request = serde_json::to_string(&(&old.id, old.revision, 0u64, false)).unwrap();
     save_operation(&inventory.db.lock().unwrap(), &legacy).unwrap();
-    inventory.reconcile_deleted_artifacts().unwrap();
+    inventory
+        .reconcile_deleted_artifacts_snapshot(None)
+        .unwrap();
     assert_eq!(
         inventory.get(&old.id).unwrap().generation,
         changed.generation
@@ -401,4 +413,63 @@ fn abandoned_move_cannot_resurrect_and_a_new_move_uses_a_new_operation() {
         std::fs::read(target.join("media.mkv")).unwrap(),
         b"PAR_FAILURE retained input"
     );
+}
+
+#[test]
+fn a_relocation_in_review_is_abandoned_automatically_and_keeps_the_original() {
+    let (_tmp, db, _source, target) = fixture();
+    FAULTS.with(|f| f.borrow_mut().insert("before_move", libc::EINVAL));
+    assert!(db.relocate(91, &target).is_err());
+    let source = db.for_job(91).unwrap().unwrap();
+    let op = db.pending_relocations(&source.id).unwrap().remove(0);
+    assert_eq!(op.state, "review", "{:?}", op.error);
+    let mut aged = db.get(&source.id).unwrap();
+    aged.updated_at = now() - 2 * super::exits::HOLD_EXIT_SECONDS;
+    save_artifact(&db.db.lock().unwrap(), &aged).unwrap();
+    // Database-only at open: a relocation is never touched there.
+    assert_eq!(db.exit_wedged_states(0, false).unwrap().abandoned, 0);
+    let report = db
+        .exit_wedged_states(super::exits::HOLD_EXIT_SECONDS, true)
+        .unwrap();
+    assert_eq!(report.abandoned, 1, "{report:?}");
+    assert_eq!(db.operation(&op.id).unwrap().state, "cancelled");
+    let after = db.for_job(91).unwrap().unwrap();
+    assert!(after.hold.is_none());
+    assert_eq!(
+        std::fs::read(after.path.join("media.mkv")).unwrap(),
+        b"PAR_FAILURE retained input",
+        "the original stays where it was"
+    );
+    // Idempotent.
+    assert_eq!(db.exit_wedged_states(0, true).unwrap().abandoned, 0);
+}
+
+/// nuc4, 2 rows: "published generation changed during source unlink". A
+/// hard-link park whose source was already unlinked, and whose parked
+/// publication is since gone (`source_gone`): there is nothing left to
+/// refresh. The cleanup blocked before 0.9.1 is re-run on its timed exit
+/// and closes with no operator action.
+#[test]
+fn a_hardlink_cleanup_blocked_on_a_vanished_publication_completes() {
+    let (_temp, inventory, source, target) = fixture();
+    fs::RENAME_FAILURE.with(|f| f.set(Some(libc::EINVAL)));
+    super::relocation::FAIL_SOURCE_UNLINK_REFRESH.with(|fail| fail.set(true));
+    let relocation = inventory.relocate(91, &target).unwrap();
+    assert!(!source.exists());
+    let mut published = inventory.for_job(91).unwrap().unwrap();
+    published.state = "source_gone".into();
+    save_artifact(&inventory.db.lock().unwrap(), &published).unwrap();
+    let mut operation = inventory.operation(&relocation.operation_id).unwrap();
+    let mut movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
+    assert_eq!(movement["cleanup_done"], false);
+    movement["cleanup"]["state"] = "blocked".into();
+    movement["cleanup"]["error"] = "published generation changed during source unlink".into();
+    operation.request = serde_json::to_string(&movement).unwrap();
+    save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+
+    inventory.exit_wedged_states(0, true).unwrap();
+    inventory.reconcile_relocations().unwrap();
+    let operation = inventory.operation(&relocation.operation_id).unwrap();
+    let movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
+    assert_eq!(movement["cleanup_done"], true, "{}", movement["cleanup"]);
 }

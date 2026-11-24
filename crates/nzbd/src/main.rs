@@ -26,6 +26,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Convert snapshots to exact plain JSON for rollback. Stop the daemon first.
+    SnapshotPlain {
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Inventory ownership lock directory (defaults to state-dir).
+        #[arg(long)]
+        inventory_dir: Option<PathBuf>,
+        /// Highest queue document schema accepted by the rollback binary.
+        #[arg(long)]
+        max_schema: u32,
+    },
     /// Quarantine file operations after restoring a backup. Stop the daemon first.
     ArtifactsRestore {
         #[arg(long)]
@@ -128,6 +139,20 @@ fn main() -> anyhow_lite::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::SnapshotPlain {
+            state_dir,
+            inventory_dir,
+            max_schema,
+        } => {
+            let inventory_dir = inventory_dir.as_deref().unwrap_or(&state_dir);
+            let paths =
+                nzbd_state::materialize_plain_snapshots(&state_dir, inventory_dir, max_schema)
+                    .map_err(|error| anyhow_lite::Error::msg(error.to_string()))?;
+            for path in paths {
+                println!("Materialized exact JSON: {}", path.display());
+            }
+            Ok(())
+        }
         Command::ArtifactsBackup { state_dir, output } => {
             let inventory = nzbd_state::artifacts::Inventory::open(&state_dir)
                 .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
@@ -151,6 +176,8 @@ fn main() -> anyhow_lite::Result<()> {
             bind,
             monitor_bind,
         } => {
+            // Restart phase timings (status `startup`) count from here.
+            let _ = nzbd_engine::startup_phases::boot_instant();
             // No config, mirror, TLS, or state-volume access precedes this bind.
             let control = control::Controller::start(
                 control::monitor_bind(monitor_bind.as_deref())?,
@@ -268,7 +295,11 @@ fn post_config(
         unpack: cfg.post.unpack,
         cleanup: cfg.post.cleanup,
         deobfuscate_final: cfg.post.deobfuscate_final,
-        failure_action: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action),
+        failure_action: if cfg.post.keep_failed_downloads {
+            nzbd_post::manager::FailureAction::Park
+        } else {
+            nzbd_post::manager::FailureAction::Delete
+        },
         failed_dir: Some(
             cfg.post
                 .failed_dir
@@ -318,6 +349,28 @@ fn disk_guard_roots(cfg: &nzbd_config::Config) -> Vec<nzbd_engine::volumes::Disk
         .collect()
 }
 
+/// Configured payload roots startup reconciles besides the recorded ones:
+/// the completed and failed directories and every category destination.
+fn payload_roots(cfg: &nzbd_config::Config) -> Vec<PathBuf> {
+    let mut roots = vec![
+        cfg.dest_dir(),
+        cfg.post
+            .failed_dir
+            .as_ref()
+            .map(|path| nzbd_config::expand_home(path))
+            .unwrap_or_else(|| nzbd_config::expand_home(&cfg.paths.main_dir).join("failed")),
+    ];
+    roots.extend(
+        cfg.categories
+            .iter()
+            .filter_map(|category| category.dest_dir.as_ref())
+            .map(|path| nzbd_config::expand_home(path)),
+    );
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn torrent_payload_roots(cfg: &nzbd_config::Config) -> Vec<PathBuf> {
     let mut roots = vec![cfg.torrent_dir()];
     roots.extend(
@@ -341,8 +394,9 @@ fn engine_tuning(cfg: &nzbd_config::Config) -> Tuning {
         daily_quota_bytes: cfg.queue.daily_quota_mb * 1024 * 1024,
         monthly_quota_bytes: cfg.queue.monthly_quota_mb * 1024 * 1024,
         quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
-        health_abort: nzbd_post::manager::FailureAction::parse(&cfg.post.failure_action)
-            != nzbd_post::manager::FailureAction::None,
+        health_abort: true,
+        hold_deadline: Duration::from_secs(cfg.post.hold_deadline_secs.max(1)),
+        password_hold_deadline: Duration::from_secs(cfg.post.password_hold_deadline_secs.max(1)),
         ..Tuning::default()
     }
 }
@@ -394,6 +448,8 @@ fn cluster_runtime_config(
         pp_weight: c.pp_weight.max(1),
         disk_guard_roots: disk_guard_roots(cfg),
         torrent_payload_roots: torrent_payload_roots(cfg),
+        workspace_dir: cfg.configured_workspace_dir(),
+        keep_failed_downloads: cfg.post.keep_failed_downloads,
     };
     Ok((runtime, shared_dir))
 }
@@ -1223,6 +1279,8 @@ fn run(
     engine_cfg.torrent_payload_roots = torrent_payload_roots(&cfg);
     engine_cfg.max_active_downloads = cfg.max_active_downloads();
     engine_cfg.expected_installation_id = expected_identity;
+    engine_cfg.workspace_dir = cfg.configured_workspace_dir();
+    engine_cfg.payload_roots = payload_roots(&cfg);
 
     // Keep a shutdown handle outside the startup future: any later failure
     // (torrent restore, watch roots, router setup) must drain the accepted
@@ -1230,10 +1288,12 @@ fn run(
     let startup_engine = Arc::new(std::sync::Mutex::new(None::<nzbd_engine::EngineHandle>));
     let cleanup_engine = startup_engine.clone();
     let result = runtime.block_on(async move {
-        // History is a queue-terminal dependency for torrents even when
-        // Usenet post-processing is disabled: payload disposition must be
-        // durable before a confirmed removal can leave the active queue.
-        let history_db = if cfg.post.enabled || cfg.torrent.enabled {
+        // History is part of every job's terminal (pipeline contract v2
+        // §2.1): health and fetch failures are recorded by the queue owner
+        // even with post-processing disabled, and `job_pp_finished` is only
+        // sent once its history row is durable. The daemon does not start
+        // without it — an unopenable history store is a startup error.
+        let history_db = {
             let state_dir = cfg.state_dir();
             Some(open_history(
                 &state_dir,
@@ -1242,8 +1302,6 @@ fn run(
                 history_retention(&cfg),
                 cfg.history.index_dir.as_deref(),
             )?)
-        } else {
-            None
         };
         let _history_worker = history_db.as_ref().map(|db| db.start_worker()).transpose()
             .map_err(|e| anyhow_lite::Error::msg(e.to_string()))?;
@@ -1996,8 +2054,11 @@ mod tests {
             } else {
                 cfg.dest_dir()
             };
-            let published_dir =
-                destination.join(format!("storage-contract.runner-{}", allocation.generation));
+            // Contract §2.5: `<name>.job-<id>.runner-<gen>`.
+            let published_dir = destination.join(format!(
+                "storage-contract.job-{}.runner-{}",
+                job.0, allocation.generation
+            ));
             assert!(!published_dir.exists());
             if conflict {
                 std::fs::create_dir_all(&published_dir).unwrap();
@@ -2025,7 +2086,7 @@ mod tests {
                 assert!(!published_dir.join("payload.mkv").exists());
             } else {
                 assert_eq!(result.unwrap(), nzbd_post::manager::PpFinal::Success);
-                let (pp_status, final_dir) = tokio::time::timeout(Duration::from_secs(5), async {
+                let (outcome, publication) = tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         match pp_events
                             .recv()
@@ -2034,18 +2095,21 @@ mod tests {
                         {
                             Event::JobPpFinished {
                                 job: finished,
-                                pp_status,
-                                final_dir,
+                                outcome,
+                                publication,
                                 ..
-                            } if finished == job => break (pp_status, final_dir),
+                            } if finished == job => break (outcome, publication),
                             _ => continue,
                         }
                     }
                 })
                 .await
                 .expect("durable post-processing completion event");
-                assert_eq!(pp_status, "SUCCESS");
-                assert_eq!(final_dir.as_deref(), Some(published_dir.to_str().unwrap()));
+                assert_eq!(outcome, nzbd_types::TerminalOutcome::Completed);
+                assert_eq!(
+                    publication.map(|p| p.path).as_deref(),
+                    Some(published_dir.to_str().unwrap())
+                );
                 assert!(engine.export_job(job).await.unwrap().unwrap().ready());
                 assert_eq!(
                     std::fs::read(published_dir.join("payload.mkv")).unwrap(),
@@ -2185,15 +2249,24 @@ mod tests {
     }
 
     #[test]
-    fn post_config_maps_health_and_timeouts() {
-        let cfg = cfg_with(
+    fn post_config_maps_retention_and_timeouts() {
+        let mut cfg = cfg_with(
             "[post]\nhealth_action = \"park\"\ntool_timeout_secs = 0\nscripts_dir = \"~/scripts\"\n",
         );
         let pc = post_config(&cfg, 3, None);
         assert_eq!(
             pc.failure_action,
-            nzbd_post::manager::FailureAction::Park,
-            "the old `health_action` key still parses"
+            nzbd_post::manager::FailureAction::Delete,
+            "retention is opt-in even with a legacy health_action"
+        );
+        cfg.post.keep_failed_downloads = true;
+        assert_eq!(
+            post_config(&cfg, 3, None).failure_action,
+            nzbd_post::manager::FailureAction::Park
+        );
+        assert!(
+            engine_tuning(&cfg).health_abort,
+            "keeping files must not disable health abort"
         );
         assert_eq!(pc.slots, 3);
         // Zero timeout is clamped to something sane rather than "instant".
@@ -2218,7 +2291,7 @@ mod tests {
         assert_eq!(tuning.daily_quota_bytes, 5 * 1024 * 1024);
         assert_eq!(tuning.monthly_quota_bytes, 6 * 1024 * 1024);
         assert_eq!(tuning.quota_start_day, 28);
-        assert!(!tuning.health_abort);
+        assert!(tuning.health_abort);
 
         cfg.queue.quota_start_day = 0;
         cfg.post.failure_action = "park".into();

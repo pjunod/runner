@@ -134,7 +134,7 @@ test('a parked NZB fetch says why it waits, with no byte counters or bar, and th
     expect(text()).not.toContain('%');
     await act(async () => { jest.advanceTimersByTime(31 * 60 * 1000); });
     expect(text()).toContain('retrying in 29m');
-    const held = { ...job, control: { lifecycle: 'held', message: 'Held for review' } } as unknown as JobSummary;
+    const held = { ...job, control: { lifecycle: 'held', message: 'Held for a while' } } as unknown as JobSummary;
     await act(async () => tree.update(card(held)));
     expect(text()).not.toContain('Indexer refused');
   } finally {
@@ -161,12 +161,15 @@ test('managed child shows POST and scoped Keep without donor seed controls', asy
   expect(button('Seeding options')).toBeUndefined();
   expect(button('Keep on failure: off')).toBeDefined();
   expect(getFailureKeep).toHaveBeenCalledWith(child.id);
-  const held = { ...child, control: { lifecycle: 'held', retry_policy: 'review', manual_pause: true, message: 'Review payload' } } as unknown as JobSummary;
+  const held = { ...child, control: { lifecycle: 'held', cause: 'storage_unavailable', retry_policy: 'scheduled_retry', manual_pause: true, message: 'Storage went away' } } as unknown as JobSummary;
   await act(async () => tree.update(card(held)));
+  expect(text()).toContain('storage unavailable: Storage went away');
+  expect(text()).toContain('retries paused');
   await act(async () => button('Retry').props.onPress());
   expect(action).toHaveBeenCalledWith('resume');
-  const retrying = { ...held, control: { ...held.control!, retry_policy: 'scheduled_retry', manual_pause: false } };
+  const retrying = { ...held, control: { ...held.control!, manual_pause: false, deadline_in_s: 5400 } };
   await act(async () => tree.update(card(retrying)));
+  expect(text()).toContain('Fails as hold expired in');
   await act(async () => button('Pause retries').props.onPress());
   expect(action).toHaveBeenCalledWith('pause');
 });

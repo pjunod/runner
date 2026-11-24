@@ -1,9 +1,1487 @@
 # nzbd — Project Status
 
+## Out-of-space hold says what and where — 2026-11-15 (0.9.8)
+
+**Status:** branch `claude/enospc-where` (from main 648112d), draft PR.
+Owner: Claude (Opus 5.5 session). Root cause reviewed by Fable
+(agree-with-changes; changes taken). Next: adversarial review of the diff →
+fixes → `make fast-check` once → merge → Paul deploys.
+
+Field report: "out of space on a configured write volume — downloads held
+(observed from a write: post-processing job 3586: io: No space left on
+device (os error 28))" with 152 GiB free on /processing and no volume or
+path named. Root causes: (1) `capacity::reserve` refused a *forecast* with a
+synthetic `ENOSPC` indistinguishable from the kernel's, so a reservation
+shortfall latched all downloads as an observed write failure; (2) extraction
+reserved the job's whole size on the output dir *and* on the scratch
+workspace even on one filesystem (2× job size + 1 GiB + every in-flight
+claim — four jobs in post-processing at once easily exceed 152 GiB);
+(3) `PostError::Io(#[from] io::Error)` dropped the path at ~90 sites and the
+manager reported with path `None`; (4) the banner asserted "a configured
+write volume" without knowing which. Fix: typed `CapacityShortfall` naming
+root and numbers; reserve once per filesystem; `PostError::Fs { op, path }`
+everywhere, path passed to the report; each latched failure resolved to the
+storage-panel volume in web and mobile.
+
+Follow-ups: `nzbd_state::artifacts::Error::Io(#[from])` still drops paths
+(reaches post as `Artifact`); the writer's per-file reservation shortfall
+latches through the directory probe, which a successful probe write can
+clear while the forecast still fails.
+
+## Download throughput — 2026-11-15 (0.9.7)
+
+**Status:** branch `claude/runner-download-throughput` (from main 51d4980),
+adversarial review addressed, `make fast-check` green on the merge candidate
+(1,091 passed, 0 failed, 0 skipped, `NZBD_REQUIRE_TOOLS=1`). Owner: Claude
+(Opus 5.5 session). PR #337, merged; deployed (0.9.7, now 0.9.8).
+**Accepted on nuc4:** a 73.4 GiB, ~107 k-article job sustained 100.0 MiB/s
+untraced on 2026-11-18 (from 41.0 MiB/s in §10), 92 % of the 109 MiB/s
+target — [speed plan §15](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md).
+
+Root causes (benchmarked, [speed plan §15](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md)):
+the owner re-parsed and re-serialized each file's whole proof (every range)
+per article — quadratic in the file's article count, so throughput fell as
+files grew (994 → 610 articles/s from 1.5 k to 12 k articles) — and the
+writer still synced about once per article on GlusterFS. Fix: the writer's
+durability checkpoint (32 MiB / full coverage / 1 s / control command) is
+the unit of acknowledgement, one owner proof update per checkpoint; indexed
+range checks. (A sliding pipeline window was measured and left out — §15.)
+Durability is unchanged: nothing is acknowledged before the sync covering
+it. Bench: 59.5 → 125.2 MiB/s on a 12 k-article file, now flat with size.
+
+## NZB fetch retry ladder + retry now — 2026-11-15 (0.9.6, app 1.1.9)
+
+**Status:** built; branch `claude/nzb-fetch-retry-ladder`, draft PR. Owner:
+Claude (Opus 5.5 session). Adversarial review done (5 findings, all fixed). Next:
+fast-check → CI → merge → deploy (Paul).
+
+Field report: items sat in **Fetching NZB** after an indexer 429 with the
+next retry ~12 h out and no way to move them. Root cause: the fetch ladder
+treated the provider's `Retry-After` as a lower bound (`max(Retry-After,
+30/60/120/300 s)`), and quota-exhausted indexers answer with 12–22 h values
+(same mechanism as the 2026-11-01 report). The job panel's **retry now**
+only covered holds and failed-source cleanup.
+
+Changes:
+- Ladder is now 1, 5, 10, then every 30 min (429/503, timeouts, transport
+  errors). A `Retry-After` up to 30 min is a floor for that step; a longer
+  one is not obeyed, and the job's last error says what the indexer asked
+  (`indexer asked to wait 12h`).
+- A restarted fetch clamps a persisted deadline to its step, so rows parked
+  under the old policy come back within 30 min of the deploy.
+- `POST /api/v1/jobs/{id}/retry` on a fetching job ends the current wait
+  (fetch ladder or URL dispatcher backoff) and requests the NZB now; a repeat
+  refusal continues up the ladder. A kick names the deadline it saw, so a
+  double click cannot skip a later wait; in flight, held, or without queue
+  authority it answers 409. Web UI detail panel and the app's
+  expanded Fetching card (1.1.9) show **retry now** while a retry is
+  scheduled.
+- Unchanged: the URL dispatcher's worker-exit backoff (30/60/120/300 s) and
+  storage/coordination retry lanes.
+
+Post-deploy check: a fetching row with a 429 shows `next` within 1 min of
+its first refusal; **retry now** on it sends a request immediately (runner
+log: `operator requested an immediate NZB fetch retry`).
+
+## Park ENOENT (job 2710) — 2026-11-12 (0.9.4)
+
+**Status:** built; branch `claude/park-enoent` (from main 5e15dd3, pushed;
+no PR). Owner: Claude (Opus 5.5 session). Next: review → CI → merge →
+deploy.
+
+Root cause (read-only copy of nuc4's inventory, logs, filesystem): job 2710
+failed `publish`; on 2026-11-10 04:09Z its publication was parked to
+`/processing/failed/Strangers with Candy (1999)…job-2710-url-a4373393948b`
+(the move committed), but the row stayed `active` because the pre-0.9.1
+disposal never recorded. That parked directory was later removed outside
+Runner (no Runner delete exists for it; the row is still `active`). Every
+disposal attempt re-ran the park against a path that no longer exists →
+ENOENT on the ladder; `reconcile_missing` only checks completed / retained /
+unknown / retiring rows, so nothing noticed. The pre-publication remainder
+(65 files at `/processing/…job-2710-…`) is still there.
+
+Fix: a durable failed/cancelled job's current, owned generation is settled
+`source_gone` only on proven absence — under the mutation coordinator the
+root verifies and can be listed, and `fstatat` relative to the root
+descriptor finds no entry on two passes at least 10 min apart (the first
+records `first_missing_at`; a reappearance clears it) — and only with
+nothing in flight (no queued/running operation of any kind, no open intent,
+`transitioning` only once its transforms ended). In one transaction the row
+keeps its inventory, gets `gone_reason = missing from its verified root`
+(custody: gone, not removed), and the job's original download is parked in
+place with the failed TTL (its path logged). A crash between resumes. The
+disposal then records instead of retrying ENOENT.
+
+## Orphan 1704 — 2026-11-12 (0.9.3)
+
+**Status:** built; branch `claude/orphan-1704` (from main c05a15d, pushed;
+no PR). Owner: Claude (Opus 5.5 session). Next: review → CI → merge →
+deploy.
+
+0.9.2 left one attention row on nuc4: job 1704, `transitioning`, path gone,
+a pre-mount-id identity (`mount_id` empty). Root cause: legacy identities
+compare by device + inode, and the remount changed `/working`'s device
+number (70 → 80; inode 39714832 unchanged), so startup's root check failed
+and skipped the row silently every boot. Now a legacy record whose root
+fails only that way is rebound to the live device when there is positive
+evidence the root is the live volume: same root inode, the root directory is
+not empty, and its device is the device of the mount covering it in
+`/proc/self/mountinfo`, a real mount (not the root filesystem an unmounted
+mountpoint falls through to). The row then proceeds through the normal
+startup classification for its state (allocating / retiring / active /
+transitioning): a gone path settles `source_gone` with
+`gone_reason = legacy_root_rebind` (custody reports cleanup `gone`, not
+`removed`); a present path continues as any orphan. Without that evidence
+nothing changes.
+
+## Workspace exit — 2026-11-12 (0.9.2)
+
+**Status:** built; branch `claude/workspace-exit` (from main 8991151, pushed;
+no PR). Owner: Claude (Opus 5.5 session). Next: review → CI → merge →
+deploy to nuc4.
+
+0.9.1 on nuc4 raised attention from 28 to 44: the overdue check surfaced
+transform workspaces of long-finished jobs that had no exit. Every one of
+the 39 had a durable job terminal, yet retirement still demanded a
+finalization receipt and fresh scratch/source identities that can no longer
+appear.
+
+- **A finished job's workspace is removed** (closed scope): once the job's
+  terminal is durable (any outcome, emitted, salvage settled; not
+  keep-on-failure), a key-named, Runner-owned scratch directly under the
+  private workspace root is deleted. Scratch identity drift, a Keep or
+  missing ownership on the *source* (set by the old startup-orphan path),
+  and the missing receipt no longer apply. A person's Keep or hold on the
+  workspace itself still stands; nothing outside the private root is
+  touched. An unfinished journal of it ends `failed`; a source it left
+  `transitioning` becomes quiescent, and a cancelled job's leftover source
+  is parked with the failed TTL.
+- **Guards (Fable review):** never while the terminal's publication or a
+  delivery row names the scratch; a completed job's workspace only when its
+  transform failed or published its output; the job is the one the journal
+  names (a source row naming another job does not count); a source that
+  keeps its failure blocks it; the workspace root must verify (an unmounted
+  volume is never read as a removed workspace); the removal is journaled
+  (`deleting` → `deleted`) against the assessed revision and resumes after
+  a crash. Checked against a fresh read-only copy of nuc4's inventory: all
+  39 rows qualify (the 40th workspace belongs to a job with no terminal yet).
+- **Stale errors:** a `transferred` row carries no earlier attempt's error
+  (ENOSPC, lost lease); cleared at open and at delivery.
+- **Stale `transitioning`:** a row no transform, relocation or intent holds
+  is classified at startup like an orphaned allocation (parked with the
+  failed TTL) — also when its directory no longer verifies, instead of a
+  writer-retirement hold whose exit would release it back.
+- Jobs 2871/2900/2902 converged on 0.9.1 (disposed 03:13Z). 2710 is on the
+  bounded disposal ladder (ENOENT on its park move); it settles within the
+  12-attempt budget.
+
+## Post-move fixes — 2026-11-12 (0.9.1)
+
+**Status:** built; Fable's adversarial review (8 findings + 4 low) folded in.
+Branch `claude/post-move-fixes` (pushed; no PR yet). Owner: Claude (Opus 5.5
+session). Next: PR → full CI once → merge → deploy to nuc4. Not deployed.
+
+What the 2026-11-11 state-dir move on nuc4 exposed, and what changed:
+
+- **Failed copy publications (2713/2770/2811/2812/2856/2885).** The publish
+  move kept its source "until the delivery row exists"; the job failed
+  `publish` instead, so the processing copy stayed forever and every
+  disposal pass reported "incomplete". Now the remainder follows the
+  disposition: **Delete** (the published generation deleted by a succeeded
+  delete op) retires it by closed scope; **Park** parks it *in place* with
+  the failed TTL — PAR volumes and unextracted archives are never wiped by a
+  park. A blocked retirement also parks with the TTL. Keep-on-failure: never.
+- **Failed jobs' unfinished transforms (2871/2900/2902).** Extract journals
+  stuck in `retry` (startup-only ladder, ENOENT workspace) pinned the
+  source `transitioning`. They end with the failed attempt (journal
+  `failed`, missing scratch `source_gone`, source `active`); a journal
+  whose scratch is gone or never finished allocating is cancelled at
+  startup. No file is touched.
+- **Bounded disposal.** An incomplete disposal with no operation ladder of
+  its own climbs a durable ladder (1 min doubling, 6 h cap; forced retries
+  and attempts with a live operation ladder do not count). After 12 it
+  settles *and* parks every live row of the job with the failed TTL in the
+  same transaction.
+- **Interrupted allocations.** An `allocating` row at a name only Runner
+  gives (transform key, `.job-<N>-`) stays Runner's: empty + orphaned →
+  rmdir (non-recursive) and `deleted`; with bytes → parked with the TTL;
+  live job → its active allocation. Other names keep the old unowned path.
+- **workspace_dir.** Migration resolves every root the transform journals
+  recorded to where its live workspaces are (the old root, `workspace_dir`,
+  or the new state dir's default), renames same-filesystem ones into
+  `workspace_dir`, rewrites only to a location holding every live workspace
+  that still exists, and treats an unreadable root as unknown. Runs with
+  the default root too. On nuc4 the 39 workspaces are already at
+  `/processing/transform-workspaces` (`/processing/queue` no longer exists;
+  checked read-only 2026-11-12), so the rows are rewritten there.
+- **Reconciled roots.** Startup also reconciles the configured completed,
+  failed, category and workspace roots (a missing unused one is a no-op).
+- **History marker.** Written in two forms: the absolute
+  `.history-index-path` (every build reads it; rollback-safe) and
+  `.history-index-path.rel` (relative to the state dir, preferred). An old
+  absolute marker whose file is gone resolves to the configured index by
+  its trailing path. **Known limitation:** with only an old-format marker
+  and the old copy still present (copy-style move by an older build), open
+  still refuses — the same check protects switching back from `index_dir`.
+- **Rediscovery.** Scans skip in-flight destinations, directories holding
+  one (categories) and `.runner-*` staging. A duplicate `unknown` row of
+  Runner's own row (same path *and* directory object) is closed (`deleted`
+  record, event pointer, no bytes touched); an unregistered directory with
+  a verifying manifest naming one of this installation's generations
+  becomes `transferred`. Manifests are read once per row revision.
+- **Attention / Not Runner's.** Content Runner did not create is listed as
+  `foreign` ("Not Runner's"), never deleted, blocking nothing. Attention
+  keeps errors, blocked cleanups and open intents visible and adds a
+  time check: a timed hold past `HOLD_EXIT_SECONDS`, a retention deadline
+  past due, or an in-progress state older than a day (each + 1 h) is
+  flagged. Tested over every state × hold, with overdue fixtures that must
+  appear.
+- **Hard-link publications** that a park moved onward (or a delete
+  removed) no longer block their source cleanup on "published generation
+  changed during source unlink".
+
+- **Blocked relocation cleanups get a timed exit.** nuc4 had 28 (read-only
+  copy of its inventory, 2026-11-12): 26 "configured root identity changed
+  or volume is unavailable" — the NFS mount source was renamed by a remount
+  (`qnap:/working` → `qnap-storage:/working`; same type, root, mount point
+  and inode), so every identity recorded before it mismatched; identities
+  now rebind when only the mount source changed. 2 "published generation
+  changed during source unlink" — hard-link parks whose parked copy is since
+  gone; nothing is left to refresh, so the cleanup completes. Every blocked
+  cleanup is re-verified on a backoff (now, then 1 h, 2 h, … ≤ 1 day, 6
+  rounds); if it stays blocked, the retained source is parked for retention
+  (immediately for a delivered success or a Delete, the failed TTL
+  otherwise) and the cleanup closes once it is gone.
+- **Retention of long-id rows.** Retention requests for Runner's derived
+  rows (`source-move-…`, `scratch-…`, ids over 110 bytes) were refused by
+  the 128-byte request-id limit on every tick; they now use a digest id.
+
+## No wedges: runner side of the pipeline rewrite plan — 2026-11-11 (0.9.0)
+
+**Status:** built (startup items 1–7 plus no-wedge tasks 1–3); Fable's
+adversarial review (12 findings) and a second pass (9) folded in — see
+*Review fixes* below.
+Branch `claude/no-wedge` (pushed; no PR yet). Owner: Claude (Opus 5.5
+session). Next: full CI once → PR → merge. Not deployed.
+Rebased on main after #305 (0.8.1).
+
+Every stuck state named in the 2026-11-11 brief now has an automatic exit
+through the normal paths; nothing below needs a one-off script on upgrade.
+
+- **W1 ctime.** Published files compare by object + size + mtime
+  (`Identity::same_publication`) at intent commit and digest reuse.
+- **W7 / job 2709.** `prepare_delivery`, `commit_prepared_delivery` and
+  `finish()` build a committed per-file publication from its journal (new
+  `relocation_intents.manifest` column) and never re-read the publication.
+  2709 gets its delivery row on the next follow-up.
+- **W2 stale salvage.** `settle_salvage(none)` refused while a move is open;
+  the intent-commit transaction reopens `settled_none`; the salvage is
+  delivered from the journal even with the queue row retired
+  (`finish_committed_salvage`). Old rows reopen at open.
+- **W4 closed scope.** After a successful (or non-kept failed) delivery the
+  source tree is removed by root identity; nothing is retained for review.
+  Deliveries blocked on retained review files or "source changed outside
+  selected publication cleanup" retry once at open and complete.
+- **W3 retention / policy.** Expiry is wall-clock only (uptime clock and the
+  automation toggle removed). Curator-admitted, non-kept failures follow
+  `failure_action` once salvage settles (park-always replaced, Paul's call);
+  2713/2770/2811/2812/2856/2885 become due on the first rescan under
+  `delete` and are deleted by the retention tick. keep_on_failure is kept
+  indefinitely.
+- **W8 assessment loops (2710/2535).** Assessment is advisory: missing root
+  → nothing to assess; drift → one re-snapshot; then settles `unknown`.
+  The loop actually reproduced was a terminal job's restart verification
+  going review-required over a deleted file and refusing the follow-up's
+  export forever: terminal jobs (failed included) now get no verification
+  ticket. The W8 test runs in its original order and fails without that.
+- **W9.** A startup orphan is a parked failure with the TTL (legacy review
+  rows convert at startup). An ambiguous/unprovable transform replay
+  (`par_restore`, `extract`, `par_repair`) is cancelled and post-processing
+  re-runs it, instead of `review` + Keep on the source; old review rows are
+  abandoned at open. Startup removes a `.runner-file-N.part` only when its
+  file is finalized and the publication is the same object (a leftover
+  second name of link-then-unlink) — never the only copy (a GFID orphan
+  inside a brick is not visible to runner — infra).
+- **W5a latch.** Each write-observed ENOSPC is recorded by the operation
+  that failed and clears only on evidence from that operation: an
+  allocation on the same partial (fallocate past EOF, fsync, given back) or
+  the writer's next write to it; a finalize by its own job's retry (allowed
+  while latched); the terminal store by its replay; a post write when that
+  job's terminal lands. New-file probes (which Gluster DHT may place on the
+  other brick) remain only for unattributed reports (torrent backend), with
+  their prefix excluded from manifests and swept at startup; a removed
+  directory is probed via its nearest existing ancestor; a failure whose
+  object or job is gone is dropped. Operator resume still clears it;
+  statvfs never does.
+- **W5b no -shm.** Both DBs `locking_mode=EXCLUSIVE` before first access;
+  HistoryDb's second (reader) connection removed; `Inventory::close`
+  releases its connection for in-process reloads.
+- **W10 restart.** `POST /api/v1/restart` takes `Idempotency-Key` and
+  `?not_after=`; the UI sends both. It defers while PAR repair or
+  extraction runs (`restart_pending` in status; `?force=true` overrides) and
+  restarts when they finish; meanwhile no new repair or extraction starts
+  (drain). It expires at `not_after` (`restart_expired` in status), each
+  poll follows the backend currently serving (a reload since settles it),
+  a resent key answers pending/executed/expired/cancelled, and
+  `DELETE /api/v1/restart` cancels it. *Not built:* checkpoint/resume of a
+  repair across a forced restart.
+- **Cluster.** The copy ledger no longer exempts curator-admitted failures
+  under park-always (same policy as single-node). An engine without a
+  supplied history store opens a per-node `engine-history.<node>.sqlite`
+  (cluster nodes share `state_dir`; the store is EXCLUSIVE).
+- **Subtitles.** A job's subtitles anywhere in the tree are published with
+  its video at their relative path (season packs pair by stem or folder;
+  ambiguous ones go alongside).
+- **Startup verification (items 1–7, plus terminal jobs).** Paul: only the
+  file being written at restart may need anything. Writer proofs trusted on
+  any filesystem; startup classifies from metadata and tickets only jobs
+  with unproven ranges, identity conflicts or open lifecycle intents —
+  proven, paused and legacy jobs are released untouched (no file opened, no
+  byte read); allocation revalidation at lease time; lazy proof/identity
+  check at writer spawn (object = mount + inode, so an unacknowledged write
+  from the killed run no longer conflicts) and at PP admission; a mismatch
+  or a failed stat holds only that job, never demotes `Done`; legacy ranges
+  of this installation's own snapshot are stamped from a stat without a read
+  (overrides STARTUP_VERIFICATION_PLAN §3.1/§3.4/§4; PAR is the backstop);
+  root reconciliation runs on a background thread off the payload lane and
+  gates only intent jobs; `/api/v1/status` `startup` carries the phase
+  timings. Acceptance tests: 301-job GlusterFS-identity restart leases in
+  ~0.65 s (debug) with 0 payload bytes read and no paused-job opens; kill -9
+  at before_sync / after_sync / after journal append → only unacknowledged
+  segments re-fetched, final CRC correct; replaced inode holds only its job.
+- **Identity mismatch at writer spawn (task 1).** A replaced inode,
+  conflicting aliases or ranges incoherent with the recorded object no
+  longer hold the job: that one file's Done ranges and proof are discarded,
+  the next writer removes the file's names in the job's own directory and
+  re-downloads it. After 3 resets of the same file the job ends `failed/io`
+  (blameless, salvage allowed; the message says identity). Proven ranges
+  are checked against the file's live size (one stat at writer spawn, and
+  one per proven file at post-processing admission, off the owner loop): a
+  truncated or missing file is re-downloaded / verified. An existing hold
+  for one of these refusals retries at once on load.
+- **Every review/retained state has an exit (task 2).** `artifacts::exits`
+  registers each state and hold with its exit, and
+  `Inventory::exit_wedged_states` carries them out: at open (database-only,
+  no grace — upgrade and restart conversion) and on each maintenance tick
+  (all exits, after `HOLD_EXIT_SECONDS` = 1 h, so the flow that set a hold
+  gets its own follow-up first). Copies whose original is retained are
+  disposed; anything that may hold payload bytes is parked with the failed
+  TTL (Keep / keep_on_failure still retain it); locks on healthy rows are
+  released; refused disposals re-snapshot the closed scope and retry;
+  relocations in review are abandoned (original verified and kept; of a
+  target that cannot be put back, Runner-placed duplicates are removed and
+  an only-copy residue is owned and parked with the failed TTL). Lifting a
+  forced Keep (restore quarantine, pinned holds) restores the Keep the row
+  had or an operator gave it. Closed-scope removal walks raw names (never
+  follows symlinks; special files, non-UTF-8, any depth or count). Silent
+  recovery handoffs are cancelled after `failed_retention_days`; a held
+  cluster copy answers `retry`, not `retained`. Unowned/adopted content is
+  never touched.
+  Every exit is idempotent.
+- **Registry test (task 3).** `exits::tests` scans every crate's production
+  sources for state and hold strings the code writes and fails if one has no
+  registered exit; another fails if anything but unowned content needs an
+  operator; job statuses and hold causes are exhaustive matches. The table
+  below is printed by `cargo test -p nzbd-state --lib exits::tests::exit_table
+  -- --nocapture`.
+- **Decisions made without Paul (review later):** startup orphans park
+  whatever their eligibility flag (closed scope); an irrecoverable move's
+  residue that is the only copy is parked with the failed TTL rather than
+  deleted at once (review asked to delete Runner-placed files; that would
+  delete the only copy — conflict for Paul); a silent recovery consumer's
+  quiescence is taken as given after the failed TTL.
+- **`paths.workspace_dir` (nuc4 layout).** Transform workspaces follow
+  `paths.workspace_dir` (default `<state dir>/transform-workspaces`, so
+  nothing changes unless set; also a storage root, so discovery excludes it
+  and the disk guard watches it). After the operator moves the directory,
+  startup rewrites every recorded path under the old default in every
+  table (JSON at any nesting depth included) and re-stamps the moved
+  workspaces; idempotent, and skipped while the old root still holds
+  workspaces. Recommended: `queue_dir` (state) local, `main_dir`,
+  `workspace_dir` and `dest_dir` on the processing volume (same device →
+  publish by rename). Documented in CONFIGURATION.md and DEPLOY.md.
+- **Not done:** full suite not run (fast lane on the PR).
+
+### Review fixes (Fable, 2026-11-11)
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | failed finalize marked finalized → sweep deletes only copy | never finalized on failure; durable `failed/io`; sweep needs same-object publication |
+| 2 | ENOSPC dirs never pruned | gone object dropped; removed dir probed via existing ancestor |
+| 3 | new-file probe lands on the other brick | per-operation evidence (same file / own retry); dir probe only unattributed |
+| 4 | closed-scope removal refuses manifest-refused names | `fs::remove_tree_contents` (raw names, no-follow, one device, bottom-up) |
+| 5 | replaced inode blamed the release | `failed/io`, message `identity:` |
+| 6 | restart deferral could wait/fire late/go stale | drain, expiry, per-poll backend, key outcomes, cancel |
+| 7 | truncated same inode passed | live size vs highest proven end at spawn and PP admission |
+| 8 | restore Keep never lifted | prior Keep recorded and restored on release (upgrade rule) |
+| 9 | old history index opened with -shm | RW + EXCLUSIVE + no checkpoint |
+| 10 | PARK_PIN dropped operator Keep | only the pin's Keep cleared |
+| 11 | irrecoverable move target unowned forever | duplicates removed, only-copy residue owned + parked |
+| 12 | handoffs no TTL; ledger `retained` for held copy | TTL cancel; held copy answers `retry` |
+
+Second review pass (2026-11-11, on `paths.workspace_dir` and the fixes above):
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | moved workspace root re-stamped only the row; journal kept old identity → reconcile could orphan an in-flight workspace | journal scratch + attempt dirs re-stamped in the same tx |
+| 2 | path rewrite counted `instr` matches → re-stamp every start | counts/touches only changed values |
+| 3 | crash between commit and sidecar → stale sidecar forever | re-stamp driven by recorded/live root mismatch; stale own sidecar repaired |
+| 4 | finalize/post ENOSPC with a job that cannot retry held intake until manual resume | partial or job-dir probe when not runnable; a runnable job retries itself (post-side holds were never gated by the latch) |
+| 5 | probe walked above an unmounted root → false Cleared/Gone | bounded at the guarded root, recorded device required; missing root holds |
+| 6 | probe truncated to a stale size | live-writer files skipped; release to current size |
+| 7 | restart drain set outside the slot lock | drain derived from the slot under its lock; DELETE always clears |
+| 8 | remover emptied same-device bind mounts; deep-move temp names collided after crash | mount id (statx) scope; unique temp names, collision retry |
+| 9 | admission stat `Short` looped on terminal jobs (no-op verification) | `verification_inert` jobs owe no admission stat |
+
+Third review pass (2026-11-11, on the latch probe and the remover):
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | device recorded once; an NFS/autofs remount (new `st_dev`) held until operator resume | parent-filesystem device recorded too; root missing or on the parent's device holds, any other device rebinds and probes |
+| 2 | grouped roots recorded as their common path (`/` for two bind mounts) → device never matched | each member root recorded with the group's device; every-root probe uses one member per device |
+| 3 | post jobs in `space_retry_jobs` were a no-op (only the download-side storage release reads it) | removed; post-side holds were never gated by the latch |
+| 4 | release `set_len(max(current, len))` could regrow a file truncated mid-probe | `set_len(current)` |
+| 5 | remover fell back to device-only scope silently without statx mount id | one warning with the reason |
+
+### State and hold exits
+
+| Scope | State / hold | Exit |
+|---|---|---|
+| job | `queued` | event: a download slot leases it |
+| job | `downloading` | event: all articles done or failed → post-processing or failed/health |
+| job | `paused` | policy: stopped by a person (or seed policy); the person resumes it |
+| job | `held` | timer: hold cause retry policy; the hold deadline ends it failed/hold_expired |
+| job | `fetching` | event: URL fetch succeeds or fails failed/fetch |
+| job | `post_queued` | event: a post-processing slot admits it |
+| job | `post_processing` | event: the stage finishes; the job ends completed or failed/<reason> |
+| job | `completed` | terminal |
+| job | `failed` | terminal |
+| job | `deleted` | terminal |
+| job hold cause | `engine_unavailable` | timer: retry ladder; deadline → failed/hold_expired |
+| job hold cause | `storage_unavailable` | timer: retry ladder; deadline → failed/hold_expired |
+| job hold cause | `capacity` | timer: resumes when the resource returns; deadline → failed/hold_expired |
+| job hold cause | `quota` | timer: resumes when the resource returns; deadline → failed/hold_expired |
+| job hold cause | `allocation` | timer: resumes when the resource returns; deadline → failed/hold_expired |
+| job hold cause | `mount_unavailable` | timer: mount re-checked every pass; deadline → failed/hold_expired |
+| job hold cause | `missing_tool` | timer: retry ladder; deadline → failed/hold_expired |
+| job hold cause | `password_required` | timer: retry ladder; deadline → failed/hold_expired |
+| artifact | `allocating` | event: allocation commit; startup classifies an interrupted one (missing → source_gone, present → unowned adoption) |
+| artifact | `active` | event: the job finishes: delivery, failure policy, or retirement |
+| artifact | `active_unverified` | event: queue admission verifies it (→ active) or it stays an unowned adoption candidate |
+| artifact | `transitioning` | event: relocation/intent finishes or unwinds (intent reconciliation, then the review-op exit) |
+| artifact | `retiring` | event: writer stop; startup reclassifies an interrupted one |
+| artifact | `completed` | event: delivery cleanup removes the closed-scope source |
+| artifact | `retained` | timer: its hold's exit (HOLD_EXITS); an unheld retained owned orphan is parked with the failed TTL |
+| artifact | `unknown` | operator (unowned only): discovered content Runner did not create; never deleted automatically |
+| artifact | `parked_failed` | timer: failed-retention TTL → retention deletion (Keep / keep_on_failure: policy) |
+| artifact | `recovery_staged` | event: consumer import receipt; a cancelled/failed recovery's copy is disposed |
+| artifact | `recovery_imported` | timer: retention TTL → deletion |
+| artifact | `deleting` | event: the delete operation finishes or retries |
+| artifact | `delete_failed` | timer: delete retry ladder; a conflict re-snapshots the closed scope and retries |
+| artifact | `deleted` | terminal |
+| artifact | `source_gone` | terminal |
+| operation | `queued` | timer: not_before / next_retry, then runs |
+| operation | `running` | event: the worker finishes; startup resumes an interrupted one |
+| operation | `retry` | timer: next_retry ladder |
+| operation | `review` | timer: exit_wedged_states: delete → retry or cancel; relocate → abandon (unwind) or close; transforms abandoned (W9); restored-backup → cancel |
+| operation | `retained` | event: startup-orphan receipt row; closes when the orphan is reclaimed or disposed |
+| operation | `preview` | event: retention preview: applied or superseded by the next preview |
+| operation | `succeeded` | terminal |
+| operation | `cancelled` | terminal |
+| operation | `failed` | terminal |
+| operation | `pending` | event: its worker claims it |
+| operation | `stopping` | event: worker stop acknowledgement |
+| operation | `transferred` | terminal |
+| recovery | `staging` | event: publication finishes or fails; reconcile_recoveries resumes it |
+| recovery | `publishing` | event: publication finishes or fails; reconcile_recoveries resumes it |
+| recovery | `published` | timer: consumer claim/import receipt or cancellation; cancelled after failed_retention_days without a claim |
+| recovery | `claimed` | timer: consumer import receipt or cancellation; cancelled after failed_retention_days without a claim heartbeat |
+| recovery | `cancel_pending` | event: worker quiescence acknowledgement (taken as given after failed_retention_days of silence); unclaimed ones cancel on reconcile |
+| recovery | `imported` | timer: receipt-scoped source prune (automatic after HOLD_EXIT_SECONDS), then the source's TTL |
+| recovery | `partial` | timer: receipt-scoped source prune (automatic after HOLD_EXIT_SECONDS), then the source's TTL |
+| recovery | `review` | timer: restored backup: cancelled by exit_wedged_states; its staged copy is disposed |
+| recovery | `pruned` | terminal |
+| intent | `open` | event: restart reconciliation decides finish or unwind |
+| intent | `finishing` | event: finish completes; a refusal goes to the review-op exit |
+| intent | `unwinding` | event: unwind completes; a refusal goes to the review-op exit (close; never an only copy) |
+| intent | `committed` | terminal |
+| intent | `unwound` | terminal |
+| delivery cleanup | `pending` | event: the delivery's source cleanup runs |
+| delivery cleanup | `running` | event: cleanup worker; startup turns an interrupted one into retry |
+| delivery cleanup | `retry` | timer: cleanup_next_retry_at |
+| delivery cleanup | `blocked` | timer: policy change wakes it; otherwise retried after HOLD_EXIT_SECONDS |
+| delivery cleanup | `succeeded` | terminal |
+| delivery cleanup | `done` | terminal |
+| delivery cleanup | `removed` | terminal |
+| url admission | `runner_owned` | event: the admitted job's own lifecycle |
+| daemon | `starting` | event: startup completes or the process exits |
+| artifact hold | `waiting for writer stop` | event: writer stop; startup reclassifies an interrupted retirement |
+| artifact hold | `transform workspace` | event: transform finishes; workspace retirement disposes the scratch |
+| artifact hold | `recovery:<id>` | event: recovery finishes; a failed/cancelled one releases, an imported one is receipt-pruned after HOLD_EXIT_SECONDS |
+| artifact hold | `awaiting complete import receipt` | event: consumer import receipt; a cancelled/failed recovery's copy is disposed |
+| artifact hold | `review` | timer: unowned: adoption (operator); owned: refused disposal re-snapshotted and retried, otherwise released |
+| artifact hold | `review: files changed; adoption required` | operator (unowned only): adopted content changed; never deleted automatically |
+| artifact hold | `review: preexisting accepted output` | operator (unowned only): output Runner did not create |
+| artifact hold | `review: cancelled recovery` | timer: released; the source keeps its bytes and lifecycle |
+| artifact hold | `review: cancelled recovery staging` | timer: copy disposed; the recovery source holds the original |
+| artifact hold | `review: unselected source files remain` | timer: released; the source follows its TTL |
+| artifact hold | `review: unselected source files remain after receipt cleanup` | timer: released; the source follows its TTL |
+| artifact hold | `review: relocation staging` | event: its relocate operation ends; left over after that, parked with the failed TTL |
+| artifact hold | `review: abandoned relocation staging` | timer: copy disposed; abandon verified the original source |
+| artifact hold | `review: interrupted move` | timer: move abandoned (unwind; else Runner-placed duplicates removed and an only-copy residue parked with the failed TTL); the job fails io and parks the source |
+| artifact hold | `review: workspace cleanup` | timer: scratch re-snapshotted (closed scope) and its retirement retried |
+| artifact hold | `review: subprocess quiescence unconfirmed` | timer: released at the next open (no subprocess outlives the process) or after HOLD_EXIT_SECONDS |
+| artifact hold | `review: interrupted transform` | timer: released; post-processing re-runs the transform (W9) |
+| artifact hold | `review: interrupted writer retirement` | timer: gone → source_gone; replaced → unowned adoption; present → released |
+| artifact hold | `review: allocation has no recovered job` | timer: owned: parked with the failed TTL (W9); unowned: adoption |
+| artifact hold | `review: superseded by accepted generation` | timer: materialization predecessor parked with the failed TTL |
+| artifact hold | `review: superseded private processing source` | timer: parked with the failed TTL |
+| artifact hold | `review: previous external job generation` | timer: owned: parked with the failed TTL; unowned: adoption |
+| artifact hold | `review: managed seed metainfo mismatch` | timer: seed directory (closed scope) parked with the failed TTL |
+| artifact hold | `review retained source` | timer: parked with the failed TTL |
+| artifact hold | `restored backup: review required` | timer: released; the row gets back the Keep it had before the restore |
+
+## Storage I/O on every filesystem; mobile graphs and versions — 2026-11-11
+
+**Status:** branch `fix/storage-io-mobile` (runner 0.8.1, mobile 1.1.8).
+Owner: Claude (Opus 5.5 session). Server deploy and phone installs are
+Paul's. Adversarial review (Sonnet) ran and its findings are folded in.
+
+**Local gate (NZBD_REQUIRE_TOOLS=1, nothing skipped):** fmt; clippy
+`--workspace --all-targets -D warnings`; nzbd-state `io_meter` 4 and
+`fileops` 3; nzbd-engine `disk_io` 10, `volumes` (all but the root-only
+permission test, which fails identically on main), `writer::tests` 17,
+torrent device mapping; nzbd-post `tools` 16 (including a sub-interval dd
+run charged in full) and `fingerprint` 3; nzbd-api lib 92; engine e2e
+storage inventory; UI harnesses (1,025 DOM assertions, boot); mobile
+typecheck and jest 206. The meter tests also ran on nynuc itself (the CI
+runner, kernel 7.0, uutils coreutils), where two CI attempts had failed on
+the tests' choice of `dd`/`tee`.
+
+**Why:** on nuc3 only the completed row graphed. `/processing` is a
+GlusterFS FUSE mount, which has no kernel I/O counters, so it read "I/O
+n/a". It was also named "processing · completed" because torrent payloads
+were classed as completed.
+
+- **Engine.** `nzbd_state::io_meter` counts Runner's own bytes per
+  filesystem at the payload paths: article writer; par2/7z/unrar from
+  `/proc/<pid>/io`, sampled every 100 ms while they run (probed on nynuc
+  and nuc3, kernel 7.0: live counters are exact; an exited child's are
+  denied even before reaping, so each run's last interval is lost;
+  splice()-based copies such as uutils `tee`/`dd` are never counted, and
+  par2/7z/unrar don't use them); the cross-filesystem copy and its readbacks;
+  hashing/CRC passes, quick checks and writer readbacks through a `Metered`
+  file wrapper; torrent transfer (verified bytes written, uploaded bytes
+  read). Filesystems without kernel counters now report `source: runner`.
+  Header sniffs of a few KiB are not counted.
+- **Naming.** Torrent payloads and per-category torrent folders are
+  processing. Volume readings carry their exact role list.
+- **Mobile 1.1.8.** Storage rows show the same 3-minute write/read graph
+  and rates (side by side with capacity on phones, below it on iPad), from
+  the `storage_io` stream frame. The split Downloads / Post-processing
+  toggles were already in 1.1.7.
+- **Mobile versions.** 1.1.5–1.1.7 bumped only `app.json`; the committed
+  native projects stayed at 1.1.4 (iOS build 14, Android 13), so every
+  device build since installed as 1.1.4. All four version sources now say
+  1.1.8 (iOS 20, Android 19) and a test fails if they disagree.
+
+**Post-deploy checks:** both nuc3 rows draw a graph; hover `/processing`'s
+graph and it says "Runner's own"; `/processing` is named processing. On each
+phone, Settings or About shows 1.1.8, and the queue header has Downloads
+and Post-processing toggles.
+
+**Decisions made without Paul (review later):** on GlusterFS the graph is
+Runner's own traffic, labelled as such, because nothing inside the
+container can see the volume's other clients. A category whose name
+contains " · " is split as two roles when it shares an exact path with
+another role; harmless unless that category's torrent folder is also on a
+different filesystem from the torrent root.
+## Processing drain: NFS publication fix + SQLite advisory — 2026-11-11
+
+**Status:** open [#304](https://github.com/pjunod/runner/pull/304), owner
+Claude (Opus 5.5 session; taken over from the GPT/codex session that opened
+it). Next: adversarial review → fold in findings → CI once → merge.
+**Deployed ahead of merge** on nuc3 (image `nzbd:processing-drain-2b5f9e4`,
+binary SHA256 `718dc859…5845`, rollback tag
+`nzbd:before-processing-drain-20261109`) because the running image kept
+failing publications with "publication file changed before commit" and
+holding `/processing` full. The deployed build is `2b5f9e4`; the advisory
+bump below is dependency-only and ships with the next main build.
+
+- **Root cause (state).** The NFS link/unlink rename fallback kept the
+  old-name descriptor open past the unlink, so NFS's deferred
+  silly-rename unlink bumped the published inode's ctime after the intent
+  captured its identity. Old-name handles now close only after the verified
+  target handle pins the inode (`rename_exclusive_from_open` takes the
+  caller's guard into the fallback; the keep-source link branch still holds
+  it). Live probe: 6/20 late ctime changes with old handles open, 0/20 when
+  closed first.
+- **RUSTSEC-2026-0459.** `rusqlite` 0.40 → 0.41 (workspace and vendored
+  hiqlite), `serde_rusqlite` 0.43 → 0.44, so `libsqlite3-sys` is 0.39.1.
+  `uuid` moves 1.24 → 1.29 because rusqlite 0.41 requires it. hiqlite's
+  three `stmt.columns()` call sites collect the new iterator; recorded as a
+  local vendor delta in `vendor/README.md`. plurx's vendored copy still pins
+  0.40 and needs the same bump.
+- **Ops on nuc3 (not code).** Brick-level ENOSPC with 132 GiB free in
+  aggregate: the Gluster distribute volume's nuc3 brick was at 0 bytes while
+  nuc4 had free space. Both bricks carried a 5 % ext4 root reserve that
+  Gluster's posix space check cannot use; set to 0 % (Gluster's own
+  `storage.reserve`, default 1 %, is the guard). nuc3 brick +3 GiB from its
+  VG. Eight ctime-only publication intents re-verified by SHA256 and repaired
+  offline with receipts under the NAS task root `claude/`.
+- **Adversarial review (Sonnet subagent), folded in.** Found the same
+  old-name-open-at-unlink bug in the torrent staging publish (`staged`,
+  `output`, `copied` open across `rename_exclusive`): now closes the first
+  two and hands `copied` to the new `fileops::rename_exclusive_from_open`.
+  The fallback test now asserts the target inode is pinned at unlink and
+  that the hook ran. Not taken (pre-existing, recorded for later): unlink
+  by name after verify is not pinned against a concurrent name swap; native
+  `renameat2` success does not compare the guard with the renamed inode;
+  `rename_identity_matches` ignores ctime; no real-NFS integration test.
+
+## Storage I/O in the overview — 2026-11-08
+
+**Status:** draft [#303](https://github.com/pjunod/runner/pull/303) (runner
+0.8.0). Next: the full fast lane once, then merge. Owner: Claude (Opus 5.5
+session). Not deployed — deploy is
+Paul's. The adversarial review was cut short at Paul's call to hurry and did
+not report; nothing from it is folded in.
+
+**Local gate (NZBD_REQUIRE_TOOLS=1, nothing skipped):** fmt; clippy
+`--workspace --all-targets -D warnings`; nzbd-engine `disk_io` 10 and
+`volumes` 21 (one, `inaccessible_path_is_unknown…`, fails only as root
+because root ignores permission bits — it fails identically on main and
+passes run as `nobody`); nzbd-api lib 92 (including the docs contract and
+the idle-stream `hb` test); engine e2e storage inventory; UI harnesses
+(1,024 DOM assertions, boot). Not run here: the full `make fast-check` and
+the rest of the workspace suite; run them once on the PR. A live daemon was
+checked in headless Chrome, light and dark, 1100 px and 400 px: the
+overview is 109 px tall, the same as 0.7.0.
+
+**Post-deploy checks:** on nuc3, the processing and completed rows show
+`block` or `nfs` rates (hover the graph for the source); a SMB or FUSE
+mount reads "I/O n/a". `curl -s :6789/api/v1/status | jq '.storage[].io'`
+shows the source per row.
+
+Paul approved option 2 of the mockups (split panel, rate-graph style).
+
+- **Engine.** `disk_io` samples once a second on its own thread, from procfs
+  only: `/proc/diskstats` for block devices (anonymous `st_dev` such as btrfs
+  falls back to the mount source), `/proc/self/mountstats` server bytes for
+  NFS, otherwise `unsupported` with the filesystem type. Rates older than
+  5 s are withheld as `stale`. Each storage row also gets a `name`
+  (processing / completed / both) from its roles; the role `label` is
+  unchanged because the disk guard and file lifecycle key on it.
+- **API.** `storage[].name` and `storage[].io {source, detail, read_bps,
+  write_bps}` on `/api/v1/status`. The tick omits `io` so its de-duplication
+  still holds on an idle queue; `/api/v1/events?storage_io=1` adds a
+  `storage_io` frame (1 Hz, only on change, not counted as stream activity).
+- **Web UI.** Each row: capacity on the left, three-minute write/read graph
+  and rates on the right. Used / total and roles moved to the tooltip.
+- **Fixed during the build:** the dev_t minor mask was wrong for majors above
+  4095 (caught by the test).
+
+**Decision made without Paul (review later):** I/O moved off the tick onto
+an opt-in frame, because per-second counters stopped an idle stream ever
+going quiet, including for the mobile app, which does not draw the graph.
+
+## Split pause: downloads and post-processing pause independently — 2026-11-08
+
+**Status:** merged as [#302](https://github.com/pjunod/runner/pull/302) (runner 0.7.0,
+mobile 1.1.7). Owner: Claude (Opus 5.5 session). Not deployed — deploy is
+Paul's. The adversarial review was cut short at Paul's call to hurry and did
+not report; nothing from it is folded in.
+
+**Local gate (NZBD_REQUIRE_TOOLS=1, nothing skipped):** fast-lane contract;
+UI harnesses (1,002 DOM assertions); fmt, check, clippy `-D warnings`;
+cluster lib 59 and cluster_e2e 23 (including the new post-pause lease gate);
+the startup lane; the torrent lane's unit suites; post-pause 3; compat 18;
+engine e2e 36; docs contract 3; mobile typecheck and jest 192. Not run here:
+the rqbit maintained-patch-series check, which downloads upstream rqbit and
+gets a 403 from this workspace's network. This branch does not touch rqbit.
+
+**Post-deploy checks:** pause post-processing from the web UI and confirm the
+badge, that a job that finishes downloading waits under "Waiting to
+post-process", and that a running repair completes its stage, then shows
+"held"; resume it. Confirm `nzbd_post_paused` on `/metrics` and that
+curator's NZBGet `status` shows `PostPaused`.
+
+Paul asked for downloads and post-processing to pause separately, without
+disturbing the UI. The approved mockup is what shipped.
+
+- **Engine.** `post_paused` sits beside `download_paused`: persisted in
+  `queue.json` (absent reads as running, so old documents behave as before),
+  carried on the snapshot, adopted on failover, flipped only by
+  `PausePost`/`ResumePost` client commands and attributed on
+  `PostPauseChanged`. The snapshot is published before the epoch bump so a
+  parked stage never wakes onto the stale flag.
+- **Post-processing.** Enforced at `Stages::enter`, the one place a stage
+  begins. The running stage finishes and its span closes, then the job parks
+  before the next stage. Jobs not yet started wait before taking a slot or
+  owner admission and stay `post_queued`. Cancelling a parked job starts no
+  further stage.
+- **API / compat.** `POST /api/v1/queue/actions/pause-post|resume-post`;
+  `pause|resume` still mean downloads. `post_paused` is on `/api/v1/status`
+  and the tick, `post_pause_changed` on SSE, `nzbd_post_paused` on
+  `/metrics`. NZBGet `pausepost`/`resumepost` previously fell through to
+  "Invalid procedure" with `PostPaused` hardcoded false; both now drive the
+  lane.
+- **Web UI.** "Pause queue / Resume queue" become **Downloads** and
+  **Post-processing** toggles in the same spot (the row is narrower than
+  before). A paused lane latches amber with a ▶. Each lane has its own
+  "paused · by <client>" badge. The waiting-to-post-process heading shows
+  "held · post-processing paused"; a post job reads "holds after this stage"
+  while its stage runs and "held" once parked.
+- **Mobile.** The same two lane toggles and a paused indicator.
+
+**Decision made without Paul (review later):** the post pause takes effect at
+a stage boundary rather than interrupting a running stage, because cutting
+off par2 or an extract means redoing the whole stage. In cluster mode the
+authority grants no new post lease while paused; a lease already running on
+a worker finishes its attempt rather than parking mid-way.
+
+## Pipeline contract v2 M6b — legacy wire fields removed, persisted `held` — 2026-11-08
+
+**Merge only after deploy confirmation.** Before this merges, Paul confirms
+all three: every curator runs **M2+**; every runner node runs at least **M3
+(0.4.0)**; and every runner node runs **0.5.0 (M6a)**. The last is a hard
+gate now that `held` is persisted: a node older than 0.5.0 cannot decode a
+`held` status a 0.6.0 node writes to the shared queue. **Status:** draft PR
+[#297](https://github.com/pjunod/runner/pull/297) on
+`claude/pipeline-v2-m6b-runner` (runner 0.6.0), stacked on M6a
+(now targets `main`; M6a merged as #296 `fb6f1b9`, merged up). Fable
+re-review r2 at `c36d368`: two should-fixes and three minors, all resolved
+(`af35a35`); re-review requested. Not merged, not deployed.
+
+- **Review r2 fixes.**
+  - **Rollback wedge closed.** Automatic-control markers are stamped in
+    the 0.5.0 form (`Held` → `paused`, the held control beside it). Their
+    identity hashes the statuses, so a node rolled back to 0.5.0 still
+    validates, applies or drops a marker 0.6.0 wrote; this build restores
+    `Held` from the control on read. Test:
+    `a_held_marker_is_stamped_in_the_050_form_and_reads_back_held`.
+  - **A lost hold is no longer silent.** `normalize_hold_status` returns a
+    `HoldStatusChange`. A `held` row whose control no longer holds becomes
+    `paused` and logs a warning with the job and the control found. That
+    covers the queue-snapshot load, imports, replicated authority, adopted
+    worker checkpoints, and cluster `decode_intent` (once per job and
+    control revision).
+  - **Minors.** The receipt `outcome` list in `INTEGRATION.md` now includes
+    `held`. The debug-assert diagnostic filter now matches its predicate.
+    The `normalize_hold_status` doc notes the `manual_pause` + unknown
+    control-version checkpoint case.
+  - **New tests.** `a_persisted_hold_reloads_held_and_recovers_and_a_050_snapshot_loads_held`
+    (e2e) covers three things: save→reopen keeps `held` and hold recovery
+    releases it; a 0.5.0 `paused` + held snapshot loads `held`; a `held`
+    row without a control loads `paused`. The owner test now counts exactly
+    one `held` status change per hold, and none for a pause inside it.
+
+- **Persisted `JobStatus::Held`.** A hold is now its own status: `held`
+  exactly while `control.lifecycle == "held"`, `paused` only for a person's
+  (or seed policy's) pause. `hold_job` writes `Held`; every release writes
+  the status it returns to. `projected_status` is the identity, and
+  `status_projected` stays on the wire as the same value. Helpers:
+  `Job::normalize_hold_status` (on every load — the queue snapshot, an
+  imported/adopted row, a replicated cluster row via `decode_intent`, a
+  worker control checkpoint) turns a 0.5.0 `paused` + held control into
+  `held` and a `held` without a holding control into `paused`; `Job::stop`
+  stops a job without deciding why (`Held` if its control holds); and
+  `JobStatus::is_stopped`. Automatic-control markers a 0.5.0 node stamped
+  are read with the same mapping, because their identity hashes the status.
+  A debug assertion at publish checks that status and hold record agree.
+- **Audit of every `JobStatus::Paused` site** (about 80 non-test). Where
+  `Paused` meant "stopped either way", it now reads `Paused | Held`, which
+  keeps the behaviour. Where it meant a person's pause, it stays `Paused`.
+  Where a stop path set `Paused` on a job that might be held (cluster
+  writer stop, deletion fence, seed policy, the torrent fact reducer's
+  storage-full / missing-content / seed-limit stops, worker adoptions), it
+  now calls `stop()`. Sites where the distinction changes behaviour:
+  - **Force priority no longer runs a held job.** `job_schedulable` let a
+    force-priority `Paused` job download, and a hold was `Paused`.
+    Test: `force_priority_runs_a_paused_job_but_not_a_held_one`.
+  - **Seed-policy rollback no longer turns a held seed `Completed`.** It now
+    restores only a `Paused` status.
+  - **A detached seed's released `torrent_seed_forget` hold** leaves it
+    `paused`, not still `held`.
+  - **A torrent `Ready`/`Resumed` fact no longer starts a held torrent.**
+    The reducer's `!= Paused` checks are now `!is_stopped()`.
+  - **A pause inside a hold keeps `held`** (with `manual_pause`), and a job
+    paused before it was held returns to `paused` on a storage release.
+    Test: `a_hold_is_held_and_a_pause_inside_it_is_remembered`.
+  - **Leases.** The leader revokes a lease whose durable intent is `held`,
+    as it did for `paused`.
+- **Wire and clients.** Native API and SSE `status` are `held` for a hold.
+  NZBGet compat shows `PAUSED` for both. `/metrics` gains
+  `nzbd_jobs{status="held"}` (holds were counted under `paused`). A request
+  admission receipt's `outcome` reads `held`. The web UI and the mobile app
+  (1.1.6) treat `held` like the old `paused` wherever they keyed on the
+  status: pending-op resolution, torrent pause state, the resume action,
+  the ETA. Curator already reads holds from `status_projected` /
+  `control`, so it needs no change.
+- **`pp_status` / `final_dir` removed** from `Event::JobPpFinished` and
+  `event_json`. Every curator since M2 applies a Runner event only as a typed
+  fact (`outcome`/`reason`/`publication`). The failed-cleanup admission's
+  event filter now matches a failed terminal whose reason's history status is
+  `FAILURE/`-prefixed — the same set it matched by string. History rows keep
+  their own `status` and `final_dir`.
+- **v1 delivery shims removed:** the stored row's `status: "ready"` (local
+  and cluster private rows), the local `deliveries.accepted_at` /
+  `consumer_receipt_id` columns (dropped on open, rows kept; test
+  `v1_acceptance_columns_are_dropped_on_open`), and `includeAccepted` (query
+  types and OpenAPI; a request that still sends it is answered). The
+  `deliveries` rows themselves stay: contract §2.5 is the authority on that
+  feed (now said in ADR-20).
+- Docs: `INTEGRATION.md` (queue statuses, §2.3 holds, compatibility table),
+  `USAGE.md`, ADR-20.
+
+**Not built in this branch (decisions for Paul / plan defects):**
+- Plan defect, now enforced: IMPL_RUNNER §8 gates the persisted `held` on
+  "every node runs M1a+", but an M1a/M3 node cannot decode `held`. The gate
+  is every node on 0.5.0 (above).
+- **`custodyState` / `sourceCleanupStatus` receipt fields.** They are not
+  just wire fields: `custody_state == "curator"` guards receipt outcome
+  updates, source pinning and publication paths in the engine (`queue.rs`
+  `sync_url_admission_receipts`, `owner.rs`
+  `refresh_pinned_url_admission_custody` / `pin_unpinned_failed_source`, the
+  admission merge) and the cluster admission path, fed by the
+  `Delivery:Custody` / `Artifact:Custody` / `Delivery:SourceCleanup` params.
+  Kept, per the orchestrator after Fable's #297 review: `custody_state ==
+  "curator"` is a monotonic pin. Without it, after a restart, a completed
+  transfer whose queue row retired answers `deleted` on
+  `/request-admissions/<token>`, and cluster projection can overwrite the
+  handoff. Removing them needs a replacement for that pin. The proposed
+  rule (a receipt with a recorded `terminalOutcome` is settled) is not
+  enough on its own. Left deprecated on the wire.
+- `cluster_deliveries.accepted_at` stays in the replicated schema (always
+  NULL): dropping it is a cluster-wide hiqlite schema change with no
+  correctness benefit.
+- The `review: interrupted move` hold clear in `commit_intent` stays:
+  `relocation.rs` still writes that hold for non-intent moves, so the clear
+  is live code, not a rollback shim.
+
+**Fast lane, r2 (after merging `origin/main` `fb6f1b9`):**
+- clippy workspace `-D warnings`: clean.
+- Library tests:
+  - types 14/14;
+  - engine 354/355 (fails only the root-only `volumes` test);
+  - state 340/340;
+  - cluster 58/58.
+- Integration tests:
+  - `cluster_e2e`: 22/22;
+  - engine `e2e` holds (including the new reopen test): 6/6.
+- `make fast-check-docs`: 3/3.
+
+**Fast lane run (head after merging M6a `e14022c`):**
+- `cargo clippy --workspace --all-targets --locked -D warnings`: clean.
+- `nzbd-engine --lib`: 353/354. The one failure is the root-only
+  `volumes::…inaccessible_path…`, untouched.
+- `nzbd-types --lib`: 14/14.
+- `nzbd-post --lib`: 121/121.
+- `nzbd-state --lib`: 339/339 (2 ignored).
+- `nzbd-api --lib`: 89/89.
+- `nzbd-compat --lib`: 18/18.
+- `nzbd-cluster --lib`: 58/58. One fixture there now writes `Held` for a
+  pause inside a hold.
+- `nzbd-post` integration: `terminal_first` 15/15, `publication` 15/15,
+  `failure_regressions` 6/6, `pp_pipeline` hold/capacity 3/3.
+- `nzbd-engine` `e2e` hold/enospc/stranded/paused: 6/6.
+- `nzbd-cluster` `cluster_e2e` (`--test-threads=1`): 22/22.
+- `make fast-check-docs`: 3/3.
+- `make ui-test`: boot ok; DOM 984 assertions.
+- mobile `tsc --noEmit` and jest: 177/177.
+
+**Post-deploy checks:**
+- `curl -sN -H "Authorization: Bearer $TOK" $NZBD/api/v1/events | grep -m1 job_pp_finished`
+  carries no `pp_status`.
+- `sqlite3 <state>/artifacts.sqlite "SELECT name FROM pragma_table_info('deliveries')"`
+  lists no `accepted_at`.
+- `curl -s $NZBD/api/v1/jobs | jq '[.jobs[] | select(.control.lifecycle=="held") | .status] | unique'`
+  is `["held"]` (or `[]`).
+- `curl -s $NZBD/metrics | grep 'nzbd_jobs{status="held"}'` is present.
+- Curator's Activity still shows held downloads as held, and the next
+  completion importing.
+
+## Pipeline contract v2 M6a — one clock per job, errno not text, docs from the contract — 2026-11-08
+
+**Status:** draft PR [#296](https://github.com/pjunod/runner/pull/296) on `claude/pipeline-v2-m6a-runner` (runner 0.5.0),
+base `main` (M3 #283 merged in). Adversarial review r1 (Fable): REQUEST
+CHANGES, all seven findings fixed (fb59323, 50ae889, 43d9408, c50432d) —
+re-review requested. Not merged, not deployed.
+
+- **Review r1 fixes.** An io error rebuilt from its kind kept no errno, so a
+  dropped mount on the deobfuscate stage parked as `failed/io`:
+  `nzbd_state::io_context` now wraps the original as `source()` (deobfuscate,
+  recovery `at`/`at_dir`), and `io_error_hold_cause` reads the wrapped error
+  before falling back to a kind table that mirrors the errno table. Policy
+  (Paul's call via the orchestrator): `EROFS` and `ENETDOWN`/`ENETUNREACH`
+  hold `storage_unavailable`; `EMFILE`/`ENFILE`/`ENOMEM` stay `failed/io`.
+  A full state volume under the terminal store latches out-of-space instead
+  of reading as corruption. CI: `make fast-check-docs` (the two doc contract
+  tests) runs in the Rust lane and, for a docs-only diff, in its own lane.
+  Not fixed here, filed as issues by the orchestrator: worker-leased hold
+  deadline enforcement; salvage retry-every-scan on a full volume.
+Safe to merge right after M3: no wire field is removed and nothing persisted
+changes shape. Plan: `IMPL_RUNNER.md` §8 / `PIPELINE_REWRITE_PLAN.md` M6.
+M6b (wire removals, persisted `Held`) is stacked on this branch and merges
+only after deploy confirmation.
+
+- **Backoff clocks collapsed** to the hold ladder and the disposal ladder.
+  Holds: the owner's `HOLD_RETRY_DELAYS_SECONDS` only — the PP manager's
+  second scheduler (`schedule_recoverable_post_retry` /
+  `prepare_recoverable_post_retry`, `POST_RETRY_DELAYS_SECONDS`, its jitter)
+  and `QueueCommand::SchedulePostRetry` / `EngineHandle::schedule_post_retry`
+  are deleted; the owner already schedules every timed hold it writes and
+  re-arms an unscheduled one on load. Disposal: `Operation.next_retry`. The
+  `*PP:failed-cleanup-next-retry/blocked-since/last-error` params (no writer
+  since M1a) are dropped when the queue loads (`drop_retired_params`);
+  `failed_cleanup` on the job summary keeps the attempt count. The
+  verification backoff (`owner_recovery.rs`) is unchanged.
+- **Errno, not text.** `is_out_of_space` / `is_storage_unavailable` /
+  `io_hold_cause` are replaced by `errno_hold_cause`, `io_error_hold_cause`
+  (`raw_os_error()`, else the std kind, else the wrapped error),
+  `error_hold_cause` (walks `source()` to the io error or a SQLite
+  `DiskFull`/`SystemIoFailure` code) and `stderr_hold_cause` — the one text
+  rule, for subprocess output. Writer errors, payload resolution, allocation,
+  terminal write faults, `pp_verdict`, salvage (now `Result<_, PostError>`),
+  disposal and torrent io errors are typed. Still text, each named at its
+  call site: par2/unrar/7z output and `PostError::Subprocess`,
+  `EngineError::Lifecycle` messages, a torrent backend's error string, a
+  persisted operation error, and the pre-v2 `io` hold message (goes in M6b).
+- **cfg(test) twins deleted** where a test-only wrapper carried the doc
+  comment of the production path: `Owner::reschedule_hold`,
+  `Inventory::reconcile_deleted_artifacts`, `reconcile_transforms(_root)`,
+  `ControlStore::commit_url_outbox`, `tls::server_config`. `spawn_writer`
+  stays as test support and says so.
+- **Docs.** `docs/INTEGRATION.md` rewritten from the contract with every
+  literal read from `event_json` and the handlers (deprecated fields marked
+  "removed in M6b"); 29 superseded plans and finished status/review records
+  moved to `docs/archive/` with one-line pointers; `docs/README.md` indexes
+  every file; ADR-20 (`docs/adr/0020-pipeline-contract-v2.md`, row in
+  `ARCHITECTURE.md` §15).
+- **Accept tests.** `nzbd-api` `integration_doc_names_every_sse_event` (doc
+  event tables == `event_json` names and the SSE handler's frame literals;
+  a new `Event` variant does not compile until listed);
+  `crates/nzbd/tests/docs_index.rs` (index lists every doc; every relative
+  link in `docs/` and `README.md` resolves).
+- **Rolling-upgrade read for M6b:** `JobStatus::Paused` deserializes
+  `"held"` (`#[serde(alias = "held")]`), so a node on this release reads the
+  persisted `held` status an M6b node writes as today's representation
+  (`Paused` + `control.lifecycle == "held"`). M6b therefore needs every node
+  on **0.5.0 (M6a)**, not merely M1a: an M1a/M3 node cannot decode `held`.
+- **Found doing it:** the web job detail read `post_timing`, `url_fetch` and
+  `failed_cleanup` under camelCase keys the API never sends, so none of the
+  three lines ever rendered; fixed, asserted in the UI DOM harness. An
+  extractor's full-disk report during salvage settled the obligation empty;
+  it is now a `StorageFull` io error and the obligation waits for space.
+
+**Deleted (non-test, approx.):** PP retry scheduler ~95 lines,
+`SchedulePostRetry` command/handle ~70, failed-cleanup progress fields and
+param list ~15, text classifiers ~30, cfg(test) wrappers ~35. Whole-branch
+non-test diff under `crates/`: +901 / −614 (includes the new classifier,
+its tests in `lib.rs`, and the 198-line doc test).
+
+**Behaviour change to review:** an `io::Error` whose *message* names a full
+or dropped volume but whose errno does not (e.g. `io::Error::other("… (os
+error 5)")`) is now a terminal `failed/io` (parked, no blame) instead of a
+hold. Real errno-bearing errors classify exactly as before.
+
+**Fast lane run:** `cargo clippy -p nzbd-post -p nzbd-engine -p nzbd-api
+-p nzbd-cluster -p nzbd-state -p nzbd --all-targets --features
+nzbd-state/test-support -- -D warnings` clean; `cargo test -p nzbd-engine
+--lib` 336/337 (the failure is `volumes::…inaccessible_path…`, a mode-000
+directory check that cannot fail as root in this sandbox; file untouched);
+`cargo test -p nzbd-post --lib` 120/120; `nzbd-post` `failure_regressions`
+6/6, `terminal_first` 15/15, `pp_pipeline` capacity hold 1/1; `nzbd-engine`
+e2e enospc/stranded/post-hold 3/3; `nzbd-state --lib` transforms /
+writer_naming / relocation_failure / artifacts tests 123 passed; `nzbd-api
+--lib` torrent_admission 25/25 and the doc test; `nzbd` `docs_index` 2/2
+and `tls` 6/6; `nzbd-cluster --lib delivery` 3/3. Full suite not run (the
+orchestrator's merge gate).
+
+**Not verified:** the UI DOM harness assertion (`crates/nzbd/tests/ui_dom.rs`
+needs the full `nzbd` test build; left to the gate); behaviour on macOS
+(`EREMOTEIO` is Linux-only and gated); anchors inside doc links (the link
+test checks paths only).
+
+**Decisions for Paul:** versions — M6a 0.5.0, M6b 0.6.0.
+`FILE_LIFECYCLE_OPERATIONS.md` stays live (it is the operations reference
+M3 updated), while `FILE_LIFECYCLE_PLAN/REVIEW/STATUS` are archived. The
+BitTorrent reports stay in place because the release-review script reads
+them. Out-of-repo links in the archived file-lifecycle docs (to a sibling
+`monarr` checkout) became code spans.
+
+**Post-deploy checks:** none new — no wire or schema change. A held job's
+`control.next_retry_at_unix` still advances 30 s → 1 m → 2 m → 5 m
+(`curl -s $NZBD/api/v1/jobs | jq '.jobs[] | select(.status_projected=="held") | .control | {cause, retry_attempt, next_retry_at_unix}'`).
+
+## Pipeline contract v2 M3 — journaled per-file publication, one hash, no ack — 2026-11-07
+
+**Status:** draft PR [#283](https://github.com/pjunod/runner/pull/283) on
+`claude/pipeline-v2-m3-runner` (runner 0.4.0), `main` (with M1a #281) merged
+in (latest `1f73dea`, PR #284); review round 1 addressed (below). Not merged, not deployed. Plan:
+`IMPL_RUNNER.md` §7 / `PIPELINE_REWRITE_PLAN.md` M3.
+
+**M3 must not reach nuc3 before curator #95 (M2) is deployed there.** Curator
+v1 retries `accept`'s 410 forever (a visible `Error`, warn logs) and, with the
+`accepted` filter gone, re-pages the whole `/deliveries` feed every sweep.
+
+**Review r1 (#283, Fable) — resolutions:**
+- *1 (blocking) manager at boot:* `crash_after_*_finishes_with_manager_at_boot`
+  for every crash point (10 s delivery deadline, inside the 30 s rescan).
+  Root causes: `job_status_changed` was keyed on the owner's status, which
+  never leaves `Post` during boot verification (only the snapshot shows
+  `queued`) — now emitted from the published projection, after it is stored;
+  the manager now rescans on the owner's next queue change after a deferred
+  export/admission, on a `completed` terminal's emission and when an attempt
+  ends with one; `drop_unneeded_verifications` lifted its fence without an
+  epoch bump; boot verification and payload recovery failed against a
+  restart's reconciliation lease and backed off 10 s+ (they now wait on its
+  release); `resume_committed_publication` wrote the delivery row **before**
+  the terminal (now terminal, then row, then source retirement);
+  `finish_stamped_delivery` reads the owed delivery from the terminal row.
+  The publication suite went from ~230 s to ~30 s.
+- *2 (blocking) data loss:* a cross-volume unwind removes a copy only while
+  the source holds the journaled original; a linked repair input drops its
+  publication name only while the source name is the same inode; otherwise
+  conflict, copy retained. Tests for both.
+- *3:* `Finishing` re-entry re-locates unjournaled renames; new crash point
+  `after_rename_before_journal` in the inventory and post (c) suites.
+- *4:* *Abandon move and retain original* (Files/Attention, the existing
+  `abandon-relocation` route) covers per-file moves: unwind, or close without
+  deleting anything and register the target for review; the job then fails
+  `io` and parks. A stuck move's operation error is mirrored onto the
+  artifact.
+- *5:* the cross-volume capacity reservation is held for the whole move (and
+  a restart's finish reserves what is left to copy).
+- *6:* (e) asserts its one outcome: boot verification holds the job for
+  repair, no terminal.
+- *7:* re-covered — a recovery copy whose streamed bytes disagree with the
+  journaled digest never lands; a lease expiring mid-copy stops at the next
+  chunk and the same attempt finishes.
+- *8:* INTEGRATION §2a documents what identity without a digest proves
+  (inode/device/size/mtime/ctime).
+- *9:* a second selected publication of a generation is `Conflict`.
+- *10:* intents whose artifact/operation is gone close as unwound with
+  evidence; a pre-M3 queued deletion unwinds the move.
+- *11:* cluster `accept` answers 410 before any lookup.
+- *12:* one `RETRY_LADDER_SECONDS` / `retry_delay()` replaces eight copies.
+- *13:* the cross-volume tests find a second device (tmpfs, temp dir, test
+  binary's volume) and fail under `NZBD_REQUIRE_TOOLS` instead of skipping.
+- Contract copy: §2.5's "rename" admits a hard link for PAR repair inputs.
+
+**M6 must delete** (rollback shims kept for one release): the
+`deliveries.accepted_at`/`consumer_receipt_id` columns, `delivery_row_json`'s
+`status`, the cluster `encode_record` status shim and
+`cluster_deliveries.accepted_at`, both `include_accepted` params (local and
+cluster), the v1 delivery row write and `pp_status`/`final_dir`,
+`custodyState`/`sourceCleanupStatus`, and the `review: interrupted move` hold
+rewrite in `commit_intent` (`intents.rs`).
+
+- **The move is journaled before it starts.** A selected publication inserts
+  its intent into the new `relocation_intents` table (generation, target,
+  every selected file's identity, journaled digest and destination) in the
+  same transaction as the relocation `Operation`, before the first rename.
+  `crates/nzbd-state/src/artifacts/intents.rs`.
+- **Selected files only, per file.** Same volume: `rename_exclusive`
+  (renameat2 `RENAME_NOREPLACE`, PR #247 link + unlink fallback kept); a file
+  without a journaled digest gets one read pass. Cross volume: one streaming
+  copy per file into `<dst>.part` that hashes as it writes. The processing
+  directory keeps only unselected siblings and is disposed of after the
+  delivery row. The "always stage privately" branch for selections is gone.
+  Exception (decision for Paul): a selected file that is still a PAR repair
+  input of the source (`repair_dependency`) is linked, not renamed, so the
+  set stays repairable after curator deletes the publication — the existing
+  test `failed_health_par_tool_failure_still_publishes_good_sibling_and_retains_repair_set`
+  requires it.
+- **Manifest written last.** `.runner-manifest.json` = `{generation, job,
+  transfer, created_at, cross_volume, files[{path,bytes,sha256}], digest}`,
+  `.part` + fsync + exclusive rename, the deployed `runner-manifest-v1`
+  digest. Publications are named `<name>.job-<id>.runner-<gen>`.
+- **Restart reconciliation** (startup root workers, the 30 s tick, and every
+  explicit retry / PP restart via `reconcile_job_intents`): manifest present →
+  commit; every file found unchanged in the target or the source → finish;
+  anything missing or changed → unwind (moved files back by identity, target
+  removed, the generation's next publication fails `io`). One of the two,
+  logged with per-file evidence. While an intent is open: `disposal_allowed`
+  is `None`, deletion requests are refused, the retire sweep waits, and the
+  source shows under Files → Attention.
+- **One hash pass.** The delivery record reuses the journaled digests; with
+  the scratch tree gone, so are the extra reads.
+- **Delivery after history** (already M1a's #280-2 ordering, kept). The v1
+  delivery record is still written for one release and now carries the
+  manifest body (`manifest`). Salvage resumes a committed move from its
+  journal instead of selecting again from the publication.
+- **No acceptance.** `POST /deliveries/{id}/accept` answers `410 Gone` (local
+  and cluster). Deleted: `accept_delivery`, `Delivery.accepted_at`,
+  `consumer_receipt_id`, `Delivery.status` and its derivation, the
+  `include_accepted` filters (local and cluster discovery — the query param
+  is accepted and ignored for one release), the test-only
+  `accept_cluster_delivery`. `/deliveries` is documented as the
+  reconciliation feed; `custodyState`/`sourceCleanupStatus` are `deprecated`
+  in `/api/v1/openapi.json`.
+- **Park root failures are journaled** (orchestrator addition, contract
+  §2.6): a move whose destination root cannot be created — a failed-source
+  park onto an unavailable volume — now records a `relocate` operation in
+  `retry` with the error and the 30 s/1 m/2 m/5 m ladder, notes it on the
+  artifact (Files → Attention) and so drives `disposal_retry_at`; the same
+  request supersedes it (keeping the attempt count) once the root exists.
+  Test `park_root_creation_failure_lands_on_the_operation_ladder`.
+- **Found while testing the journal:** a job's own attempt reconciles its
+  open intent under its processing lease (a reconciliation lease is refused
+  by the attempt's own use), and the retire sweep gates only the retirement
+  on an open intent, not the salvage that finishes it.
+- **Engine fix found by the restart tests:** a boot verification that was
+  waiting for its payload root when the terminal replay stamped the job was
+  never run or cleared, so the job could be neither exported nor admitted
+  again (crash after the history write → restart hung). Such verifications
+  are now dropped (`drop_unneeded_verifications`).
+- **Tests** (fast lane; `TMPDIR=/dev/shm` because the shared workspace disk
+  had < 1 GiB free, below the capacity guard's headroom), after review r1:
+  - `crates/nzbd-post/tests/publication.rs` 15/15 — (a)
+    `same_volume_publication_renames_selected_only`, (c)
+    `crash_after_{rename_before_journal,first_rename,last_rename,manifest,history,delivery}`
+    both `_finishes_on_restart` and `_finishes_with_manager_at_boot`, (e)
+    `crash_with_corrupted_source_unwinds`, `delivery_row_written_after_history`.
+    The one intermittent failure seen in review r1 work (no delivery in
+    10 s, ~1 in 10 full-suite runs) was reproduced under CPU load and fixed
+    at the root: the owner emits `job_pp_finished` **before** writing the
+    terminal's `emitted` flag, so a manager scan woken by the event could
+    read `emitted = false`, classify it as merely pending, and wait for the
+    30 s rescan. The owner now announces a queue change when the terminal
+    chain releases (`release_terminal`), and an unemitted terminal is a
+    deferred follow-up that waits for it. Free disk at the failure was
+    1.6 GB on `/` and 7.9 GB on the tmpfs the tests use — not disk
+    exhaustion. After the fix: 20/20 full-suite runs under two `yes` loads.
+    `terminal_first::queue_changes_after_the_emitted_flag_lands` fails
+    without the fix and passes with it.
+  - `nzbd-state` lib 340 passed, 2 ignored (pre-existing performance
+    probes): `artifacts::intents::tests` 19, incl. (b)
+    `manifest_digest_matches_curator_fixture`, (d) `nfs_fixture_fallback_chain`,
+    the cross-volume set on a real second device (/dev/shm vs the disk).
+  - `nzbd-post` lib 120, `pp_pipeline` 34, `terminal_first` 15,
+    `failure_regressions` 6, `rename_producer` 2.
+  - `nzbd-api` lib 88, `nzbd-cluster` lib 57, `nzbd-engine` lib 315/316 — the
+    failure is environmental (`inaccessible_path_is_unknown…` sets mode 000,
+    which root ignores; untouched by this branch).
+  - Clippy `-D warnings` on the five touched crates, all targets.
+- **CI gate 1 on #283** (`f492aa9`): the sealed cluster PP generation
+  copied the worker publication's `.runner-manifest.json` as payload, so its
+  file list never matched the journaled one ("selected PP publication changed
+  after its durable journal committed", retried every 150 ms) and no cluster
+  delivery appeared — the three `cluster_e2e` READY/remote-PP timeouts. The
+  manifest is now excluded from the sealed payload (`c74608a`). Two
+  `cluster_e2e` tests and one `nzbd` bin test asserted v1 behaviour M3
+  removes (contract §2.5: accept → 410 for every id, publications named
+  `<name>.job-<id>.runner-<gen>`) and were updated. Local: `cluster_e2e`
+  22/22 in 237 s; `nzbd` bin 27/27.
+- **Cluster publications carry the manifest** (orchestrator, contract
+  §2.5): the leader, after landing the sealed payload in its publication
+  directory and before the cluster delivery row, writes `.runner-manifest.json`
+  through the single-node writer (`write_runner_manifest`: `.part`, fsync,
+  exclusive rename, directory fsync); `generation` is the result id,
+  `cross_volume` is true (the payload was copied), and its digest is the
+  row's `manifestDigest`. `cluster_e2e`
+  `delivery_receipts_survive_authority_restart_and_consumer_removed_publication`
+  asserts it. Local: `cluster_e2e` 22/22, 250.6 s (plus a 64 s build);
+  `nzbd-cluster` lib 57; `nzbd-state` lib 340.
+- **Not verified:** `cargo test --workspace` and clippy `--workspace` (the
+  gate's); `NZBD_REQUIRE_TOOLS=1`; a real NFS mount (no CI NFS fixture exists — (d) drives the
+  fallback through the EINVAL rename seam); deploy.
+- **Engine fix 2:** a boot verification that read an allocation the
+  startup intent reconciliation had just replaced (the job's artifact moved
+  to its publication) was blocked as `review` forever ("allocation authority
+  changed before verification"). The owner now reloads the allocation and
+  verifies again. Before this fix one run settled only after a 10 s + 20 s
+  backoff; with it every restart test settles in about a second.
+- **Post fix:** `finish_stamped_delivery` treated a transient export refusal
+  (verification or journal loading) as "row gone" and retired the job
+  without its delivery row; it now waits.
+- **(e) end to end:** after the unwind, the engine's own boot verification
+  sees the corrupted file's CRC and holds the job for a generation-safe
+  repair before post-processing runs again; the `failed/io` terminal IMPL §7.2
+  names happens when publication is attempted (asserted at the inventory
+  level). The post-level test asserts the hold (review r1 #6). Nothing is
+  published or disposed.
+- **Decisions for Paul:**
+  - Review r1 #4: an abandoned publication move fails the job `io` on its
+    next attempt and parks the source (the generation keeps its one intent
+    row), rather than allowing a second publication of that generation.
+  - Review r1 #1: boot verification and payload recovery now block their
+    worker thread on a reconciliation lease's release (condvar) instead of
+    failing and backing off; the lease is held only for one pass.
+  - `accept` answers `410` (IMPL §7.4; the contract's one-release `200`
+    was M1a's release).
+  - The `accepted_at`/`consumer_receipt_id` columns stay (written NULL, never
+    read) and persisted rows keep `status:"ready"` for one release, so an M1a
+    rollback or mixed-version cluster can still decode them; M6 drops both.
+  - The publication generation is the source artifact's generation (IMPL
+    said a fresh id), so delivery ids, `Delivery:Generation` and source
+    retirement keep their keys.
+  - `relocation_intents` has four columns beyond IMPL §3.3 (transfer,
+    operation, source_dir, evidence) — reconciliation needs them.
+  - Published PAR repair inputs are linked, not renamed (above).
+  - The fs-ops counter is keyed by inventory, not thread-local (publication
+    runs on a blocking worker); `rename` counts payload files, the
+    manifest's own commit rename is `manifest_write`.
+  - Cross-volume copies keep the source's mode (the scratch copy was 0600);
+    the manifest is 0644.
+
+**Post-deploy checks:** history `stages` show `move` p90 < 60 s over the first
+day; `GET /api/v1/artifacts?filter=attention` lists no `transitioning`
+sources after the first restart (no open intents).
+
+## Pipeline contract v2 M1b — surfaces — 2026-11-07
+
+**Status:** built on `claude/pipeline-v2-m1b-runner` (stacked on M1a, mobile
+1.1.5, iOS build 17, Android 16), not merged, not deployed. Plan:
+`IMPL_RUNNER.md` §6.
+
+- **Web queue row:** a held job names its cause, then Runner's message, the
+  retry timing and the deadline countdown (`deadline_unix`, else
+  `deadline_in_s`), with the existing pause/retry button.
+- **Web Files tab:** a parked source shows why (failure reason, assessment
+  text, `salvage pending`) on the row and in the details panel. To carry the
+  reason, `Artifact` gains `failure_reason`, written in the same transaction
+  as the terminal row (`artifacts/terminals.rs`).
+- **Mobile:** held cards show cause + message, `retries paused`, and the
+  deadline countdown; `holdAction` no longer models a review policy. The app
+  has no Files tab, so there is no parked-source surface there.
+- **Docs:** USAGE (held row, parked sources), MOBILE (held card), INTEGRATION
+  (`failure_reason`/`salvage` on artifact rows, `deadline_in_s` semantics).
+- **Deleted:** the mobile review-hold special case (`AUTOMATIC` list and the
+  "a person decides" branch).
+- **Not verified:** no screenshots of a held row or a parked Files row (no
+  browser or device in the build workspace); full `ui_dom` Rust gate not run
+  (the node harness was run directly).
+- **Decision for Paul:** `controlPending: review_required` ("Source needs
+  review") is a control-acceptance state, not a hold, and was left alone.
+
+## Pipeline contract v2 M1a — review rounds (#280, #281) — 2026-11-08
+
+**Status:** all #280 findings fixed on `claude/pipeline-v2-m1a-runner`
+(PR #281, draft). Highlights since the first entry below:
+
+- Completed terminal before the delivery row and source retirement, with
+  crash repair from the stamped `Delivery:*` markers.
+- `PostError::Identity`; native torrent failures, partial torrents and
+  worker post-processing results are typed terminals through the shared
+  chain. In a cluster exactly one node records each terminal: the leader
+  when it holds the history store, else the worker that writes the history
+  row.
+- Unrecorded terminals are kept and retried on the owner; a stored row is
+  never forgotten.
+- Failed-source assessment restored: `recoverable` / `unknown` (unproven
+  payload) / `unusable`. Only `unusable` is deleted on the default policy.
+- Cluster cleanup ledger: publish/io/identity/hold_expired raw copies are
+  retained (park-always); a worker disposes its own attempt copy after the
+  leader accepts the result.
+- Flakes fixed at the root:
+  - Transforms ran outside attempt custody, racing the artifact tick.
+  - Operator Keep and recovery staging were refused while a maintenance
+    lease was held; they now wait for the lease to be released.
+
+**Behaviour change for Paul:** failed-source disposal now retries on the
+disposal operation's own durable `next_retry` ladder until it succeeds,
+visible on `/api/v1/artifacts`. The old in-memory, three-attempt budget —
+which retired the queue row with a `delete failed: …` note after about 60 s —
+is gone. A failed row stays queued until its disposal is recorded.
+
+**Deleted-scenario coverage:**
+- v2 tests: `a_failed_attempt_that_left_no_files_retains_nothing`,
+  `absent_integrity_proof_is_unknown_not_cleanup_authority` and
+  `failed_park_losing_admission_after_move_is_fenced_and_retried`.
+- The fenced-park test uses a test-support admission-loss injection. In
+  code, disposal no longer records an outcome when the admission was lost
+  after the move.
+
+
+**Open:** `terminal_junk_with_explicit_keep_retains_owned_sources_and_reports_custody`
+failed once in a full `cluster_e2e` run (1 of 22). I could not reproduce it
+in 40 further runs:
+- 2 more full-suite runs.
+- 12 runs as 4 parallel copies.
+- 12 runs as 6 parallel copies with 4 CPU burners.
+- 4 standalone runs.
+
+No failure message was captured. The free disk on this shared VM dropped to
+about 0.7–1.8 GB several times that day (other agents' builds), and several
+unrelated tests then failed with ENOSPC. That is the leading suspect, not
+confirmed.
+
+**Retry-now on the disposal ladder** (`claude/pipeline-v2-m1a-tests`):
+- Test: `retry_now_runs_a_failed_source_follow_up_past_its_disposal_ladder`
+  (v2 of the deleted `retry_now_releases_a_due_failed_source…`). A park
+  relocate hits EIO before commit and goes onto its own ladder. The
+  manager's rescan waits for it; Retry now parks and records it at once.
+- Fixed: a park that moved its bytes but did not commit was recorded as
+  `no payload`. Disposal now treats an unresolved delete/relocate operation
+  as holding the payload (`Inventory::disposal_in_flight`).
+- Fixed: Retry now could not complete such a park before `next_retry`.
+  Terminal custody verifies the pre-move path, which is gone. A forced
+  follow-up now resumes the pending relocation first
+  (`Inventory::retry_disposal_now`, the post-retry resume path).
+- Open, not fixed: a park whose destination root cannot be created fails
+  before its operation is written. It has no durable ladder and is not
+  visible on `/api/v1/artifacts`; only the 30 s rescan retries it. The
+  relocate request records the destination root's identity, so fixing this
+  means reworking that request. That is a relocation change, outside M1a.
+
+**Tests changed to v2 behaviour (contract clause):**
+- `terminal_unusable_cluster_completion_…` → `…_parks_raw_copies_and_drains_sealed_generations`:
+  §2.2, publish always parks.
+- `completed_text_document_is_retained_with_visible_review_action` →
+  `…_is_one_publish_failure_with_bytes_retained`: §2.2/§2.3, a
+  post-processing failure is terminal and there is no review hold.
+
+## Pipeline contract v2 M1a — terminal first, typed at the source — 2026-11-07
+
+**Status:** built on `claude/pipeline-v2-m1a-runner` (runner 0.3.0), not merged,
+not deployed. Plan: `IMPL_RUNNER.md` §5 / `PIPELINE_REWRITE_PLAN.md` M1a.
+Curator M2 depends on this landing first.
+
+- **One terminal per job, durable before it is announced.** A new
+  `job_terminals` row in the artifacts DB, together with the job's salvage
+  obligation in one transaction. Then the history append, the queue-row
+  markers, and the single `job_pp_finished` built from that row. Each step is
+  flagged on the row and replayed at boot and every 30 s.
+  `inject_terminal_crash` (test-support) proves the replay produces one
+  history row and one event.
+- **Typed at the producer.** The closed `FailureReason` set is health · fetch
+  · par · unpack · script · publish · io · identity · hold_expired.
+  - `fetch` carries `FetchCause` gone/indexer_unavailable (`fetch::cause_of`).
+  - `blames_release` and `salvage_possible` are decided by the reason.
+  - Producers:
+    - A write failure is `io`, not `health`.
+    - yEnc and overlap conflicts are `identity`.
+    - A zero-article health failure never reaches post-processing.
+    - URL fetch failures are `fetch`.
+    - PP failures go through `pp_verdict`.
+    - Operator delete is `cancelled` and carries the transfer.
+- **Holds are environmental, automatic, and end.**
+  - `HoldCause` lost io, identity_conflict and post_failure.
+    `HoldPolicy::Review` and the first-cause lock are gone.
+  - Every hold gets `deadline_unix`/`deadline_in_s` from `[post]
+    hold_deadline_secs` (a day) or `password_hold_deadline_secs` (a week).
+    Past the deadline the job fails `hold_expired`, even when the queue is
+    paused.
+  - At boot, persisted legacy holds convert to the matching terminal. This
+    waits until startup verification has run.
+- **Salvage and disposal follow the terminal** (`failure_followup`). Salvage
+  publishes the verified part as a `kind: salvage` delivery and emits
+  `job_publication_ready`. Disposal precedence is keep_on_failure, then
+  park-always (publish/io/identity/hold_expired), then `failure_action`. A
+  failed queue row retires only once both have settled. keep_on_failure only
+  affects retention.
+- **R3:** a verified file with an unknown extension is sniffed (magic bytes,
+  then ffprobe), so obfuscated Matroska publishes. The payload list gains
+  m2ts/mts/vob/mpg/mpeg/iso/mka.
+- **Wire:**
+  - `job_pp_finished` has the full contract field set. The legacy names stay
+    until M6.
+  - New events: `job_status_changed` and `job_publication_ready`.
+  - `status_projected` ("held") and `transfer` in `/api/v1/jobs`.
+  - `/history` returns `incarnation`, `head_seq` and `retained_min_seq`.
+  - `/deliveries` rows return `kind`.
+  - `accept` is a 200 no-op, and the cluster no longer depends on it.
+  - The admission receipt has typed `failure_reason`, `fetch_cause`,
+    `blames_release` and `salvage`.
+- **Deleted:**
+  - `HoldPolicy::Review` and `automatic()`.
+  - The io/identity_conflict/post_failure causes.
+  - `Owner::retry_hold` (cfg(test)) and the first-cause lock.
+  - `post_hold_cause`, `handle_failed_job(_admitted)`, `failed_source_assessment` and
+    `FailedSourceAssessment`, `replay_failed_disposition`, and
+    `record_failed_cleanup_retry`.
+  - The lifecycle `FailureAction::Delete` override.
+  - The `DeliveryAcceptance` and cluster `Acceptance` bodies.
+  - Non-test Rust totals vs main: +2961 / −1391.
+- **Acceptance tests:**
+  - `crates/nzbd-post/tests/terminal_first.rs`: 6/6.
+  - Engine: `write_failure_is_io_not_health`,
+    `zero_article_health_failure_skips_pp_admission`,
+    `fetch_404_is_gone_fetch_503_exhausted_is_indexer_unavailable` (unit),
+    and `legacy_identity_conflict_hold_converts_at_boot`.
+  - API: `accept_answers_200_noop`,
+    `operator_delete_emits_cancelled_terminal_with_transfer` and
+    `old_curator_fixture_parses_new_event`.
+  - State: `rebuild_changes_incarnation`.
+- **Not built:**
+  - `cluster_terminal_releases_lease_once_disposes` (a multi-node e2e).
+  - `partial_torrent_is_io_with_salvage_pending` (needs a torrent fixture).
+  - The intents half of `retire_sweep_waits_for_salvage_and_open_intents`.
+  - `manifest_digest_golden_vector_unchanged` against
+    `.runner-manifest.json`, which is M3. The existing `a0acee1d…` vector
+    test still passes.
+  - The fetch test is a classifier unit test rather than two URL jobs.
+- **Not verified:**
+  - `cargo test --workspace` (the fast-lane rule forbids it).
+  - Runs with `NZBD_REQUIRE_TOOLS=1`.
+  - The cluster and torrent paths beyond `cargo check`/clippy.
+  - Deploy and live checks.
+  - Mobile still models `review` holds. That is harmless: an unknown policy
+    already offers Retry.
+- **Decisions for Paul:** park-always for publish/io/identity, the contract
+  default, which both reviewers recommend. It also applies to
+  `hold_expired`, since an expired hold is environmental.
+
+## Pipeline contract v2 — M0 (contract in the repo) — 2026-11-07
+
+**Status:** in progress on `claude/pipeline-v2-m0-runner` · **Owner:** Claude
+(Opus builder session) · **PR:** [#279](https://github.com/pjunod/runner/pull/279) · **Plan:**
+`PIPELINE_REWRITE_PLAN.md` M0 (project doc).
+
+- Added [docs/PIPELINE_CONTRACT.md](docs/PIPELINE_CONTRACT.md), the r4
+  contract that the M1a/M1b/M3/M6 runner work builds to. When code and
+  contract disagree during the rewrite, the contract describes the target.
+- "Being replaced by" banner on `docs/INTEGRATION.md`; `CURATOR_DELIVERY.md`
+  and `HELD_JOBS_PLAN.md` marked superseded.
+- Docs only: no code, no version bump.
+
+## Empty failed sources retained "for recovery" — 2026-11-02
+
+**Status:** fixed on `codex/empty-failed-source`, paired with Curator
+`codex/runner-failure-handoff`. Field report (Paul, 2026-11-02, eleven Dexter:
+Resurrection jobs #2192–#2202): "curator is just sitting there like it doesn't
+know. I would expect it to instantly know the status of the downloads is
+failed, and to continue queueing up more attempts" — "interconnection is a
+first class citizen between the two apps. time to act like it".
+
+- Every job failed `FAILURE/HEALTH` before a file finished; each
+  `/processing/<job>` was empty. `failed_source_assessment` classified an
+  empty outcome set as `unknown`, so the source was "retained for recovery:
+  no regular source files were available…" as `runner_owned`. Curator holds
+  replacement while Runner owns failed bytes, so the season froze behind
+  eleven empty directories.
+- The retained generation was never pinned into the request receipt (the
+  history row got `Artifact:Id` without `Artifact:Generation`), so a later
+  delete or Keep in Files could not reach Curator either: the hold was
+  permanent even with a person trying to clear it.
+- Fix: an empty outcome set is `unusable` (the PP path already said so) and is
+  disposed at failure time. The file-lifecycle tick disposes retained failed
+  sources whose complete manifest is empty, unless Keep is set, through the
+  same generation-bound `failed-delete-<artifact>` authority Keep-off uses.
+  Retained failures pin id + generation. Receipts written before the pin adopt
+  their job's allocation on the next lookup, so the eleven live rows settle on
+  deploy with no click.
+- Review (Fable): root cause confirmed. Two follow-ups taken: an owned
+  `source_gone` source now settles the receipt like a delete (121 live
+  artifacts are `source_gone`), and the sweep reads one directory instead of
+  walking a manifest, with a cursor past 200 rows. Reverted: purging every
+  `unknown` source — that bucket holds complete no-CRC episodes, which are
+  salvageable. Live check: all eleven Dexter artifacts are `retained`, owned,
+  cleanup-eligible, no Keep, no hold, zero files.
+- CI found `acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor`
+  failing under load (main 4/4 green, branch 1 in 2–3 red). Cause: the sweep ran
+  ahead of the ordered tick steps, shifting their timing into a window where
+  that test publishes while the engine's first maintenance tick runs. The sweep
+  now runs last in the tick (its deletes run on the next tick): 6/6 green.
+  The underlying exposure — that test racing the engine's immediate first
+  tick — predates this change and is left for a separate fix.
+
 ## Held jobs with no way out — 2026-11-01
 
 **Status:** fixed on `fix/held-jobs-always-have-an-exit`; plan and root cause
-in [docs/HELD_JOBS_PLAN.md](docs/HELD_JOBS_PLAN.md). Field report: #2181 and
+in [docs/archive/HELD_JOBS_PLAN.md](docs/archive/HELD_JOBS_PLAN.md). Field report: #2181 and
 #2183 on nuc3 sat `HELD` with only *delete* after a sub-six-minute
 `/processing` outage (ENOTCONN, EIO) — "this keeps happening".
 
@@ -84,7 +1562,7 @@ retry, time waited, attempt) instead of empty byte counters, and
 
 ## Download incident recovery — 2026-10-01
 
-Implementation in progress in an isolated agent clone. See [live progress and merge status](docs/DOWNLOAD_INCIDENT_STATUS.md). One combined PR; adversarial review at merge readiness, followed by required validation.
+Implementation in progress in an isolated agent clone. See [live progress and merge status](docs/archive/DOWNLOAD_INCIDENT_STATUS.md). One combined PR; adversarial review at merge readiness, followed by required validation.
 
 ## Files tab rework — 2026-09-28
 
@@ -158,7 +1636,7 @@ read only complete suffix lines, preserving sorted-file merge semantics.
 
 **Status:** adversarial review findings addressed; local affected checks passed.
 Live CI and merge status are tracked in PR [#237](https://github.com/pjunod/runner/pull/237).
-[Live delivery status](docs/HISTORY_LOADING_STATUS.md) tracks review, final
+[Live delivery status](docs/archive/HISTORY_LOADING_STATUS.md) tracks review, final
 verification, and merge. Indexed page reads no longer await replay; an owned
 worker handles shared reconciliation and local repair. Local index relocation,
 consistent pagination, and Dev enable controls preserve the recovery contracts
@@ -169,7 +1647,7 @@ in the [reviewed proposal](docs/HISTORY_LOADING_PLAN.md).
 
 **Status:** `nuc3` service restored after three saved magnets delayed API
 readiness for about six minutes; PR [#236](https://github.com/pjunod/runner/pull/236)
-contains the code fix and [review record](docs/STARTUP_RECOVERY_REVIEW.md).
+contains the code fix and [review record](docs/archive/STARTUP_RECOVERY_REVIEW.md).
 Not merged or deployed. The code restores local torrents, opens the API, then
 retries pending network sources in a cancellable background task. Review
 findings added a real-daemon regression, accurate concurrent-removal logs,
@@ -223,7 +1701,7 @@ Docs: CONFIGURATION `[torrent]` client identity; ADR-19 amendment item 12.
 **Status:** adversarial review approved after fixes. UI boot, 599 DOM
 assertions, formatting, and diff checks pass. Required CI and merge state are
 tracked in [PR #232](https://github.com/pjunod/nzbd/pull/232).
-See [the live work status](docs/TORRENT_QUEUE_STATUS.md) for scope, decisions,
+See [the live work status](docs/archive/TORRENT_QUEUE_STATUS.md) for scope, decisions,
 review findings, validation, and merge progress. Existing queue layout retained;
 seeding and completion gain distinct sections, metrics, and durable controls.
 
@@ -433,7 +1911,7 @@ unrun in this pass.
 - ✅ Mobile BitTorrent prerequisites (2026-08-06): Android release artifacts now fail closed unless a private upload key is fully configured outside version control, Basic auth encodes non-ASCII credentials as UTF-8, and Node 22 CI pins the mobile typecheck, Jest suite, and secretless release refusal. The future M3 mobile surface no longer inherits those P0 defects; M3 torrent UI work remains downstream of completing the tracked M2 slices #154–#160 and final activation #163
 - ✅ Operator documentation (2026-07-18): reworked `README` (accurate status, quickstart, doc index) + `docs/INSTALL.md` (binaries/Docker/Homebrew/source/musl), `docs/CONFIGURATION.md` (full annotated `nzbd.toml` reference), `docs/USAGE.md` (CLI, UI, *arr hookup, feed filter language, scripts, deobfuscation), `docs/DEPLOY.md` (copy-paste recipes: Docker by hand incl. volume map + lifecycle, Compose, Kubernetes, systemd, multi-node cluster)
 - ✅ Docker config mount fixed (2026-07-25): the shipped Compose recipe delivered the config through a Compose `configs:` entry — always mounted **read-only** — so every settings-editor save failed with `Read-only file system (os error 30)`; `docs/INSTALL.md`, `docs/DEPLOY.md` and the README used `:ro` config binds for the same net effect. All four now bind the config **directory** read-write (`./config:/etc/nzbd`), which also sidesteps the Docker-invents-a-directory trap for a missing config file and lets the first-run wizard write one. `dev/docker-compose.yml`'s ownership hint corrected to `chown -R 1000:1000` (the container runs as UID 1000; `$USER` only works if you happen to be 1000). Guard test `shipped_compose_files_mount_the_config_writable` fails the build if a shipped compose file goes read-only again; Kubernetes stays deliberately read-only and DEPLOY.md now says the editor is view-and-copy there
-- ✅ Dev discovery image build fix (2026-09-19): the single adversarial review found no actionable P0–P3 issues and the scoped fast lane is green, as recorded in [`docs/DEV_COMPOSE_BUILD_STATUS.md`](docs/DEV_COMPOSE_BUILD_STATUS.md). The dev Compose file now assigns its local build definition to both services so a clean host never tries to pull the checkout-only `nzbd:dev` tag while `docker compose up --build` is building it.
+- ✅ Dev discovery image build fix (2026-09-19): the single adversarial review found no actionable P0–P3 issues and the scoped fast lane is green, as recorded in [`docs/archive/DEV_COMPOSE_BUILD_STATUS.md`](docs/archive/DEV_COMPOSE_BUILD_STATUS.md). The dev Compose file now assigns its local build definition to both services so a clean host never tries to pull the checkout-only `nzbd:dev` tag while `docker compose up --build` is building it.
 - ✅ Deployable examples under `examples/`: `docker-compose/` (compose + `nzbd.toml.example`), `kubernetes/` (namespace/secret/PVC/deployment/service/kustomization + README incl. RWX cluster shape), `systemd/` (hardened unit)
 - ✅ `dev/` local-build compose (image from the repo Dockerfile, `compose watch` rebuilds, throwaway `dev/data/`, gitignored dev config) + root `.dockerignore` (target/ was going into every build context); example configs are parse-tested against the real validator (`nzbd-config/tests/examples.rs`)
 
@@ -542,7 +2020,7 @@ unrun in this pass.
 
 - ✅ Version identifies the build, from the footer (field request 2026-07-26: a version pinned at the top that never changes identifies nothing — "which build is nuc3 running?" burned three debugging rounds in one evening): the header chip moved into the footer (`nzbd v0.1.0+g729114f — …`), and the string now carries **build identity**: `nzbd-api/build.rs` emits `NZBD_VERSION_FULL` (Cargo version `+g<9-char hash>`, `-dirty` when the tree was, bare when the build saw no git — the Docker context strips `.git` deliberately) and `NZBD_BUILT` (UTC compile stamp, dependency-free civil-from-days; layer-cached rebuilds keep their stamp — same binary, same build). Status DTO gains `built`; the footer tooltip shows it. Tests: build-env shape (api), footer placement + version/tooltip render (DOM harness, 218 assertions)
 
-- ✅ **Integration phase 1 — nzbd's side of the monarr pipeline** (N1–N7 of [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md); master plan lives in the monarr repo). The seam between nzbd and its consumer was a 30 s timer plus an inference: an *arr polled history and guessed from rows. Everything here is additive and the compat surface is untouched (golden tests pass unmodified) — current consumers keep working against every intermediate state.
+- ✅ **Integration phase 1 — nzbd's side of the monarr pipeline** (N1–N7 of [docs/archive/INTEGRATION_PLAN.md](docs/archive/INTEGRATION_PLAN.md); master plan lives in the monarr repo). The seam between nzbd and its consumer was a 30 s timer plus an inference: an *arr polled history and guessed from rows. Everything here is additive and the compat surface is untouched (golden tests pass unmodified) — current consumers keep working against every intermediate state.
   - ✅ **N1 post-processing events** — `job_finished` fires at *download* completion, so verify/repair/unpack/move/scripts were log lines only and no event ever carried a path. `job_pp_stage` marks each transition; `job_pp_finished` carries `final_dir`, `pp_status`, the job's params and a `history_seq` cursor, published through the new `EngineHandle::emit` onto the engine's own broadcast (a second bus would mean a second ordering). **The ordering is normative**: the event is emitted only after `HistoryDb::record` returns, so a consumer can react and immediately read `?since_seq=<history_seq-1>` with no race and no retry loop. The terminal paths that never reach PP — health gate, failed fetch — emit it too with their existing `FAILURE/*` strings, because an event that *usually* fires teaches consumers to add a timeout instead of trusting it
   - ✅ **N2 SSE resume** — engine frames carry `id: <seq>` (also `"seq"` in the body), stamped by one pump task so every consumer sees the same numbers in the same order; the last 1024 are replayed on `Last-Event-ID`, and a gap the ring cannot cover — or an id from a previous process, since `seq` resets on restart — answers `event: reset` rather than a stream that looks contiguous and is not. `tick`/`hb`/`log` stay unnumbered: stream-local views, not engine facts
   - ✅ **N3 history cursor** — `seq` on history entries (the local rowid) and `?since_seq=N` returning newer rows ascending, hidden included (hidden means *another* client imported it, not that it never happened). Kept out of the portable JSONL, which is re-imported into indices that assign their own rowids. `?limit=` is byte-identical to before
@@ -556,7 +2034,7 @@ unrun in this pass.
 
 - ✅ The settings editor could delete a password and report success (field report 2026-07-26, minutes after the durability fix landed: "suddenly having issues connecting to my newsgroup server even though my newsgroup account is still fine" → "it imported the config file but lost my password"). Secrets are plaintext in `nzbd.toml`; the editor masks them to `***unchanged***` for display and `merge_masked_secrets()` swaps the real ones back on save. Two silent holes. **(1)** An unresolvable mask — renamed server, newly added server, a running config that never held that secret — was written through as `None`: the password was *deleted*, the save returned **200**, and nothing said a word. Masks that cannot be resolved are now left in place, the merge returns the list of them (`#[must_use]`), and `PUT /api/v1/config` answers 422 naming the exact field to retype; the strict validator is a second net behind it. **(2)** Nothing on the boot path rejected a config that still contained the mask, so a file restored from a copy taken out of the editor left the daemon authenticating with the literal string `***unchanged***` against a perfectly healthy account — the symptom pointing at the provider, the cause three days earlier in a text editor. `Config::validate()` now refuses any masked secret and names both the field and where such a file comes from; `Config::parse_toml_unvalidated()` is the single seam that skips validation, for the editor's merge path only. And the trap that produced the bad file is gone at the source: the editor's **Download** used to hand back the masked text named `nzbd.toml` — the exact filename you drop into `/etc/nzbd` — and now names it `nzbd-masked.toml` behind a "NOT A USABLE CONFIG" header, with an inline warning in the editor itself. This mattered more than it looked: the mirror shipped hours earlier would have replicated a password-less config onto the data volume and restored it on every boot. Tests: masked-config-refused-at-boot (per field, with a near-miss string that must still parse), unresolvable-mask-reported-not-blanked (index fallback still works; the second server is reported, left masked, and fails validation), the masked round trip re-pinned through the unvalidated seam, a daemon e2e that PUTs an unresolvable mask and demands 422 + the real secret still on disk (verified to return `{"ok":true}` against the old merge), and DOM harness 272→278 on the download naming/header. ARCHITECTURE §11 + CONFIGURATION.md updated
 
-  - ✅ **History forget is durable everywhere (2026-08-05)** — [the confirmed delete-resurrection defect](docs/DEFECT_HISTORY_DELETE.md) is closed with portable JSONL tombstones. `HistoryDb::delete` appends one mutation per `(job, completed_at)` before removing the derived SQLite row; every upgraded node projects those mutations into `history_tombstones`, and inserts refuse a covered key. File order cannot act as a cluster clock, so the tombstone is monotone and compaction keeps it even after the obsolete entry line disappears. The UI no longer brings a forgotten row back on refresh, `?since_seq=` never publishes it under a fresh cursor, and delete → Undo/requeue leaves no lying `DELETED` record. Tests cover three replay cycles, hidden re-appends, lexically later peer files, fresh-index convergence, compaction, the native API requeue flow, and the unchanged NZBGet golden surface
+  - ✅ **History forget is durable everywhere (2026-08-05)** — [the confirmed delete-resurrection defect](docs/archive/DEFECT_HISTORY_DELETE.md) is closed with portable JSONL tombstones. `HistoryDb::delete` appends one mutation per `(job, completed_at)` before removing the derived SQLite row; every upgraded node projects those mutations into `history_tombstones`, and inserts refuse a covered key. File order cannot act as a cluster clock, so the tombstone is monotone and compaction keeps it even after the obsolete entry line disappears. The UI no longer brings a forgotten row back on refresh, `?since_seq=` never publishes it under a fresh cursor, and delete → Undo/requeue leaves no lying `DELETED` record. Tests cover three replay cycles, hidden re-appends, lexically later peer files, fresh-index convergence, compaction, the native API requeue flow, and the unchanged NZBGet golden surface
   - ⬜ Next: monarr phase 2 (native client + push subscription) consumes all of this; nothing here waits on it
 
 - ✅ A client chip is a glance, not a User-Agent dump (field report 2026-07-27, screenshot: one chip in the API-clients strip ran the full width of the page). The strip renders whatever `User-Agent` each client sent, and an open browser tab sends ~130 characters of Mozilla-compatibility archaeology — so the browser's own chip dwarfed and pushed down the two chips that answer the question the strip exists for (*is the \*arr connected?*). `clientLabel()` now collapses a browser agent to browser + major version + platform (`Chrome 150 (macOS)`), matching most-specific-first so Edge and Opera are not read as Chrome and Chrome's own `Safari/` token is not read as Safari; a product token (`Monarr/0.7.0`, `Sonarr/4.0.0.748`) is already the short name and is passed through untouched, capped only against an absurd one. The raw agent is not lost — it moved to the first line of the tooltip, where length costs nothing — and the chip's reconciler **key stays the raw agent**, because two browsers can collapse to the same label and a duplicate key would merge two clients into one row. Chip CSS tightened (11 px, 2×9 padding, 6 px gap) with a `max-width` + ellipsis belt so no future agent can stretch the strip past the table above it; the empty-state chip is a chip again, its sentence of explanation moved to its own tooltip. Tests: DOM harness 272→303 — Chrome/Firefox/Edge/Safari-on-iOS labels, the unrecognised-Mozilla fallback, product tokens and the absurd-token cap, missing agent, the chip text/tooltip split, quiet vs live, and two same-label browsers still reconciling to two chips
@@ -567,17 +2045,28 @@ unrun in this pass.
 
 - ✅ The requestor placeholder stopped eating its own tail, and one directory means one job (field report 2026-07-29, screenshot: **sixteen queued jobs, every one of them titled `monarr/0.11.0 · drunkenslug · monarr/0`** — "it's not getting the names correctly"). Went and looked, and the daemon's own log had both renames three seconds apart. **(1) `requestor_name` took its discriminator from `job.name` — the field the rename it feeds then overwrites.** It runs twice for a URL job, once at admission and once when the fetch completes, and the second call read the first's output: the first eight characters of `monarr/0.11.0 · drunkenslug · e44dbc35` are `monarr/0`. That is a fixed point, and the *same* fixed point for every job from one client and one indexer. The ident now comes from `original_name` — what the client called it, which nothing overwrites — and falls back to `#<job id>` when that is missing or merely repeats a part already in the name. **(2) A provisional name masked the NZB.** `complete_url_fetch` re-ran the evidence pass with the *current* name as the hint, and a provisional name reads as perfectly informative — that is its whole design — so `name_from_evidence` handed it straight back and the par2 set sitting right there in the NZB was never consulted. Sixteen jobs whose recovery sets named them exactly (`72.Hours.2026.2160p.NF.WEB-DL…`, `The.Death.of.Robin.Hood.2026…`) were titled after their requestor instead. A provisional name now offers **no** hint at all: ask the NZB alone, and if it has nothing, keep the placeholder. **(3) The consequence, which was the real damage: `rename_job(storage_too)` writes `dir_name` from the name, so sixteen jobs shared one download directory** — `/working/monarr/completed/monarr_0.11.0 · drunkenslug · monarr_0/` — two releases interleaved in a folder, post-processing verifying and moving them as though they were one. A name can never be relied on to be unique (a placeholder is built from client + indexer, identical across every add; and a duplicate add is legitimate anyway), so uniqueness is no longer left to luck: `QueueState::unique_dir_name` appends the job id on collision, admission and every rename go through it, and the owner loop renames via `set_job_name` rather than the free function. **(4) The queue already in this state repairs itself on boot** rather than needing fifteen deletes by hand: a job with an open name is told what it is by its own stored file list (`name_from_files` — the same evidence pass, asked of `FileEntry` names instead of a parsed NZB), and a shared directory is split — but only for a job that has written nothing, because moving the folder of one with bytes in it orphans them. Tests: 7 new — the placeholder is stable under repetition (three passes), two jobs from one requestor stay distinct, a provisional name no longer masks the NZB, a fetch with no evidence still keeps its placeholder, two jobs never share a directory (duplicate add *and* colliding rename), boot repairs names and splits directories while leaving a part-written job's folder alone, and `name_from_files` agrees with the NZB pass. Suite 326→333
 
-- 🔶 **The re-grab loop (field report 2026-07-31: ~1 TB of duplicates — "5 copies of true lies?")** — diagnosed live on nuc3, four defects feeding one loop. **(1)** repair asks for delayed par blocks it can never receive: `unpause_par_blocks` prices vols via `vol_par_blocks`'s `.volXX+NN.` filename parse, which obfuscated posts don't carry, so `freed==0` → silent "nothing left to fetch" → every job with ≥1 failed article (of ~116k) dies PAR_FAILURE with 4–5 GB of recovery data paused beside it — repair has NEVER succeeded on nuc3. **(2)** terminal failures leave their full dirs in the category tree: ~523 GB of corpses in the last 100 history rows alone. **(3)** dozens of observed ENOSPC (writer/finalize/PP) never flip the disk-low guard — statvfs said fine, intake ran at wire speed into a full volume, 725 GB burned in one day. **(4)** monarr half-imports successful season packs on the same full disk, surfaces nothing, cleans up nothing, re-grabs (five True Lies in 10 h; the same NZB twice in 6 min). Handoff plan with evidence, guardrails, milestones (nzbd F1–F3 · monarr M1–M4 · nuc3 runbook R1–R7): **[docs/REGRAB_LOOP_PLAN.md](docs/REGRAB_LOOP_PLAN.md)**. No code changed in this commit — the plan is the handoff. Also verified healthy while in there: the `2453665` dir-uniquifier live, monarr 0.13.0 params + pickup on 100/100 rows (the rename-breaks-matching hypothesis is dead).
+- 🔶 **The re-grab loop (field report 2026-07-31: ~1 TB of duplicates — "5 copies of true lies?")** — diagnosed live on nuc3, four defects feeding one loop. **(1)** repair asks for delayed par blocks it can never receive: `unpause_par_blocks` prices vols via `vol_par_blocks`'s `.volXX+NN.` filename parse, which obfuscated posts don't carry, so `freed==0` → silent "nothing left to fetch" → every job with ≥1 failed article (of ~116k) dies PAR_FAILURE with 4–5 GB of recovery data paused beside it — repair has NEVER succeeded on nuc3. **(2)** terminal failures leave their full dirs in the category tree: ~523 GB of corpses in the last 100 history rows alone. **(3)** dozens of observed ENOSPC (writer/finalize/PP) never flip the disk-low guard — statvfs said fine, intake ran at wire speed into a full volume, 725 GB burned in one day. **(4)** monarr half-imports successful season packs on the same full disk, surfaces nothing, cleans up nothing, re-grabs (five True Lies in 10 h; the same NZB twice in 6 min). Handoff plan with evidence, guardrails, milestones (nzbd F1–F3 · monarr M1–M4 · nuc3 runbook R1–R7): **[docs/archive/REGRAB_LOOP_PLAN.md](docs/archive/REGRAB_LOOP_PLAN.md)**. No code changed in this commit — the plan is the handoff. Also verified healthy while in there: the `2453665` dir-uniquifier live, monarr 0.13.0 params + pickup on 100/100 rows (the rename-breaks-matching hypothesis is dead).
 
 ## Operator checklist 👤
 
 - ✅ Push `main` (done — CI ran; `badges` branch is CI-owned, never push it: `git branch -D badges && git fetch --prune`)
 - ✅ Enable hooks on your clone (done — your pre-push ran the suite)
-- ⬜ **Redeploy nuc3** on a current image. The missing `./config:/etc/nzbd` bind is no longer load-bearing — this build keeps a durable copy of the config on `/data` and restores it on boot, so the wizard cannot eat the install again — but add the mount anyway and the warning banner goes away: `mkdir config && docker cp nzbd:/etc/nzbd/nzbd.toml ./config/ && chown 1000 config/nzbd.toml`, add the volume line, `docker compose up -d --build`. Deployed 2026-07-29 18:49 UTC as `0.2.0+unknown`: the running code is current through `2453665`, but the deploy drops the build arg and the deploy checkout is stale (`make docker-build` "missing" there = pre-`30e811b` Makefile) — pull + rebuild per [REGRAB_LOOP_PLAN.md](docs/REGRAB_LOOP_PLAN.md) §8 R5 until the footer stops saying `+unknown`
-- ⬜ **Drain the re-grab loop** (before any redeploy): pause the queue, reclaim ~530 GB of confirmed-failure corpses (exact `rm` list in [REGRAB_LOOP_PLAN.md](docs/REGRAB_LOOP_PLAN.md) §8 R2 — do NOT touch the EPSiLON S04 / Bates S01 dirs), answer the `df`/gluster-quota question (§9 Q1), then have monarr re-import the two half-landed packs
+- ⬜ **Redeploy nuc3** on a current image. The missing `./config:/etc/nzbd` bind is no longer load-bearing — this build keeps a durable copy of the config on `/data` and restores it on boot, so the wizard cannot eat the install again — but add the mount anyway and the warning banner goes away: `mkdir config && docker cp nzbd:/etc/nzbd/nzbd.toml ./config/ && chown 1000 config/nzbd.toml`, add the volume line, `docker compose up -d --build`. Deployed 2026-07-29 18:49 UTC as `0.2.0+unknown`: the running code is current through `2453665`, but the deploy drops the build arg and the deploy checkout is stale (`make docker-build` "missing" there = pre-`30e811b` Makefile) — pull + rebuild per [REGRAB_LOOP_PLAN.md](docs/archive/REGRAB_LOOP_PLAN.md) §8 R5 until the footer stops saying `+unknown`
+- ⬜ **Drain the re-grab loop** (before any redeploy): pause the queue, reclaim ~530 GB of confirmed-failure corpses (exact `rm` list in [REGRAB_LOOP_PLAN.md](docs/archive/REGRAB_LOOP_PLAN.md) §8 R2 — do NOT touch the EPSiLON S04 / Bates S01 dirs), answer the `df`/gluster-quota question (§9 Q1), then have monarr re-import the two half-landed packs
 - ⬜ Optional stopgap until F2 ships: `[post] health_action = "delete"` so health-gated failures stop leaving partials
 - ⬜ Optional: `brew install par2 p7zip` for full local test coverage (without them the tool-backed tests self-skip; CI always runs them)
 - ⬜ Branch protection for `main`
 - ⬜ Flip repo to public (decided 2026-07-18; Settings → Danger Zone → Change visibility) — Coverage/Test-count badges render once flipped
 - ⬜ Real-provider download smoke test
 - ⬜ Real-Gluster cluster soak (CLUSTERING.md §11)
+
+## 2026-11-13 — 0.9.5 pipeline closeout candidate
+
+Fixes #298 worker hold deadlines and #299 salvage retry clocks; reconciles
+transferred-source presence with descriptor-relative, two-pass absence evidence.
+Exact control/grant/source expiry intent is durable before reporting. Terminal
+history is independent of custody joins; failed assessment parks/preserves unknown
+bytes and retains error/audit. Unproven stop/custody stays visible and pending.
+Keep, legacy enrollment, ordinary deletion validators and approval fences remain.
+Draft candidate in adversarial review; final real gate and merge not yet claimed.
+Paul deploys. No production mutation or purge in this engineering pass.

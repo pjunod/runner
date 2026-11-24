@@ -2,25 +2,53 @@
 //!
 //! SQLite owns intent and policy; external sidecars own allocation identity.
 //! Nothing in a media payload is a marker or grants permission to remove it.
+mod cleanup_review;
+pub use cleanup_review::CleanupReview;
 mod cluster;
 mod cluster_keep;
+mod job_disposition;
 pub use cluster::{remove_cluster_generation_copy, ClusterArtifactCopy, ClusterCopyCleanup};
 pub use cluster_keep::{ClusterFailureKeepStatus, ClusterFailureKeepTarget};
+pub use job_disposition::{
+    JobAdmissionBinding, JobDisposition, JobDispositionAction, JobDispositionRecord,
+    JobDispositionRequest, JobDispositionState,
+};
 pub(crate) mod fs;
+
+/// Name prefix of the engine's out-of-space directory probe files (W5a):
+/// excluded from every payload manifest.
+pub const SPACE_PROBE_PREFIX: &str = ".nzbd-space-probe-";
 mod policy;
 mod publication;
 pub use policy::{RetentionChange, RetentionPreview};
 mod delivery;
+pub mod exits;
 mod materialization;
+mod salvage_retry;
 pub use materialization::{
     external_generation_identity, ExternalGeneration, ExternalGenerationFile,
 };
+mod intents;
+pub use intents::{
+    write_runner_manifest, IntentFile, IntentState, ManifestFile, RelocationIntent, RunnerManifest,
+    RUNNER_MANIFEST_NAME,
+};
 mod recovery;
 mod relocation;
-pub use delivery::{Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages};
-pub use relocation::{RelocationResult, SelectedPublication};
+pub use delivery::{
+    Delivery, DeliveryFile, DeliveryFileOutcome, DeliveryRunnerStages, PreparedDelivery,
+};
+pub use relocation::{RelocationResult, SelectedPublication, SupersededOutcome, SupersededSource};
 mod startup;
+mod terminals;
 pub use startup::StartupReconciliation;
+pub use terminals::{
+    DisposalLadder, JobTerminal, SalvageOutcome, SalvageState, TerminalStep,
+    DISPOSAL_ATTEMPT_BUDGET,
+};
+#[cfg(test)]
+mod operation_index_tests;
+mod operation_queries;
 mod tasks;
 mod torrent;
 pub use torrent::TorrentSourceReader;
@@ -30,12 +58,14 @@ mod transforms;
 mod url_resolutions;
 mod worker_controls;
 mod worker_stops;
+pub mod writer_naming;
 pub use url_resolutions::{
     url_source_identity, url_storage_retry_deadline, UrlFileReservation, UrlResolutionFault,
-    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry,
+    UrlResolutionRecord, UrlResolutionStore, UrlStorageRetry, MAX_SOURCE as MAX_URL_SOURCE_BYTES,
 };
 pub use worker_stops::{
-    same_worker_operation, WorkerStopRequest, WorkerStopTicket, WorkerStoppedReceipt,
+    same_worker_operation, WorkerAssemblyRetirement, WorkerStopRequest, WorkerStopTicket,
+    WorkerStoppedReceipt,
 };
 mod workspace_lifecycle;
 pub use recovery::{Receipt, ReceiptFile, Recovery, RecoveryFile};
@@ -54,7 +84,8 @@ pub use worker_controls::{
     WORKER_CONTROL_CONTEXT_PARAM,
 };
 pub use workspace_lifecycle::{
-    AttemptUse, FinalizationProof, SourceGeneration, StagedCompletion, WorkspaceAssessment,
+    AttemptUse, FailedCleanupProof, FinalizationProof, SourceGeneration, StagedCompletion,
+    WorkspaceAssessment,
 };
 
 #[cfg(test)]
@@ -68,8 +99,16 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("inventory data: {0}")]
     Json(#[from] serde_json::Error),
+    /// The operation did not acquire execution capacity; retry without
+    /// treating unchanged artifact metadata as an ownership conflict.
+    #[error("operation deferred: {0}")]
+    Busy(&'static str),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    CleanupBlocked(String),
+    #[error("{reason}")]
+    CleanupRetry { next_retry: i64, reason: String },
     #[error("artifact not found")]
     NotFound,
 }
@@ -99,9 +138,53 @@ impl Identity {
             // user-reviewed actions; automatic cleanup is cohort-gated.
             self.device == other.device
         } else {
-            self.mount_id == other.mount_id
+            self.mount_id == other.mount_id || same_mount_rebound(&self.mount_id, &other.mount_id)
         }) && self.inode == other.inode
             && self.directory == other.directory
+    }
+}
+
+/// The fields of a `fs::mount_id` tuple: platform, then length-prefixed
+/// filesystem type, mount source, root within the filesystem, mount point.
+fn mount_fields(mount_id: &str) -> Option<Vec<&str>> {
+    let (platform, mut rest) = mount_id.split_once('\n')?;
+    let mut fields = vec![platform];
+    while !rest.is_empty() {
+        let (length, tail) = rest.split_once(':')?;
+        let length: usize = length.parse().ok()?;
+        let value = tail.get(..length)?;
+        fields.push(value);
+        rest = tail
+            .get(length..)?
+            .strip_prefix('\n')
+            .unwrap_or(tail.get(length..)?);
+    }
+    Some(fields)
+}
+
+/// A remount that changed only the mount *source* string — an NFS server
+/// alias (`qnap:/working` → `qnap-storage:/working`), a re-resolved FUSE
+/// source — is the same filesystem when the platform, filesystem type, root
+/// within it and mount point are unchanged. The inode (and the directory
+/// flag) are still compared by the caller, and every payload identity under
+/// it is compared the same way, so a different filesystem mounted in its
+/// place does not pass. Without this, every row recorded before such a
+/// remount reports "configured root identity changed" forever.
+fn same_mount_rebound(left: &str, right: &str) -> bool {
+    match (mount_fields(left), mount_fields(right)) {
+        (Some(a), Some(b)) if a.len() == 5 && b.len() == 5 => {
+            a[0] == b[0] && a[1] == b[1] && a[3] == b[3] && a[4] == b[4]
+        }
+        _ => false,
+    }
+}
+impl Identity {
+    /// Contract §2.5 / principle 5: a published file's identity is its
+    /// object, size and modification time (plus the journaled digest the
+    /// caller carries). Never ctime: link/unlink, NFS silly-rename removal
+    /// and chmod move ctime without touching the bytes.
+    pub fn same_publication(&self, other: &Self) -> bool {
+        self.same_object(other) && self.bytes == other.bytes && self.modified == other.modified
     }
 }
 impl PartialEq for Identity {
@@ -159,8 +242,8 @@ pub struct Artifact {
     pub created_at: i64,
     pub updated_at: i64,
     pub retention_seconds: u64,
+    /// Wall-clock expiry (W3): due when `deadline <= now`, across restarts.
     pub deadline: Option<i64>,
-    pub eligible_seconds: u64,
     #[serde(default)]
     pub files: Vec<FileEntry>,
     pub error: Option<String>,
@@ -169,6 +252,21 @@ pub struct Artifact {
     /// "not measured yet" until this is set — never "empty".
     #[serde(default)]
     pub inspected_at: Option<i64>,
+    /// Contract §2.2/§2.6: the salvage obligation the job's terminal record
+    /// put on this source (`pending`, then `published` or `settled_none`).
+    /// Mirrored from `job_terminals`, which is the authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salvage: Option<String>,
+    /// Contract §2.2: the `FailureReason` wire string of the terminal that
+    /// parked this source (`unpack`, `hold_expired`, …), mirrored from
+    /// `job_terminals` so the Files tab can say why the bytes are here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    /// Why a `source_gone` row is gone when Runner did not remove it and the
+    /// finding rests on weaker evidence than a verified root (for example
+    /// `legacy_root_rebind`). Custody reports it as gone, not removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gone_reason: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -201,15 +299,46 @@ impl Artifact {
             && self.hold.is_none()
             && self.retention_seconds > 0
     }
-    pub fn earliest_expiry(&self, now: i64) -> Option<i64> {
+    pub fn earliest_expiry(&self) -> Option<i64> {
         if !self.eligible() {
             return None;
         }
-        Some(self.deadline?.max(
-            now.saturating_add(self.retention_seconds.saturating_sub(self.eligible_seconds) as i64),
-        ))
+        self.deadline
     }
 }
+/// Exact receipt-custody metadata from the current artifact row. This does
+/// not contain file manifests and cannot serve as payload or identity proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactCustody {
+    pub generation: String,
+    pub state: String,
+    pub owned: bool,
+    pub keep: bool,
+    pub keep_on_failure: bool,
+    /// See `Artifact::gone_reason`: gone, not removed by Runner.
+    pub gone_reason: Option<String>,
+}
+
+impl ArtifactCustody {
+    fn from_header(raw: &str) -> Result<Self> {
+        let header: Artifact = serde_json::from_str(raw)?;
+        Ok(Self {
+            generation: header.generation,
+            state: header.state,
+            owned: header.owned,
+            keep: header.keep,
+            keep_on_failure: header.keep_on_failure,
+            gone_reason: header.gone_reason,
+        })
+    }
+}
+
+// The expression must match in the index and SELECT. Invalid JSON remains
+// invalid instead of making one corrupt row prevent index creation on reopen.
+const RECEIPT_CUSTODY_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS artifacts_receipt_custody ON artifacts(id,CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END)";
+const RECEIPT_CUSTODY_QUERY: &str = "SELECT CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END FROM artifacts INDEXED BY artifacts_receipt_custody WHERE id=?1";
+const RECEIPT_CUSTODIES_QUERY: &str = "SELECT id,CASE WHEN typeof(data)='text' AND json_valid(data) THEN json_remove(data,'$.files') ELSE data END FROM artifacts INDEXED BY artifacts_receipt_custody WHERE id IN (SELECT value FROM json_each(?1))";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Operation {
     pub id: String,
@@ -224,12 +353,22 @@ pub struct Operation {
     pub error: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct ConsumerDeleteBinding {
+    artifact: String,
+    generation: String,
+    revision: u64,
+    disposition_id: String,
+    owned_selection: String,
+}
+
 /// New deletes bind authorization to an allocation, never just its reusable
 /// row ID. Old journals remain readable but cannot authorize startup repair
 /// without generation evidence.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum DeleteRequest {
+    Consumer(ConsumerDeleteBinding),
     ManagedSeed(torrent_seed::ManagedSeedDeleteRequest),
     // Exact cancellation receipt and immutable owned selection binding keep
     // explicit byte authority separate from mutable Keep/revision changes.
@@ -241,6 +380,13 @@ enum DeleteRequest {
 impl DeleteRequest {
     fn fields(&self) -> (&str, u64, u64, bool, Option<&str>) {
         match self {
+            Self::Consumer(request) => (
+                &request.artifact,
+                request.revision,
+                0,
+                false,
+                Some(&request.generation),
+            ),
             Self::ManagedSeed(request) => (
                 &request.artifact,
                 request.revision,
@@ -287,25 +433,35 @@ pub enum ListFilter {
     /// Everything still on disk (the default view).
     #[default]
     Live,
-    /// Live records that need a person: not owned, on hold, or in error.
+    /// Live Runner records a person must look at (`exits::ATTENTION_SQL`):
+    /// a hold with no automatic exit, an error / blocked cleanup / open
+    /// intent, or a row that has outlived its registered exit.
     Attention,
+    /// Live content Runner did not create (unowned, not handed off by
+    /// Runner): informational, never deleted automatically, blocks nothing.
+    Foreign,
     /// Live records Runner owns outright.
     Owned,
     /// Deleted / source-gone records kept for the audit trail.
     Cleared,
 }
+/// Live content Runner did not create: unowned and not a publication
+/// Runner handed to its consumer (`transferred`).
+const FOREIGN_SQL: &str = "json_extract(data,'$.owned')=0 AND state<>'transferred'";
 impl ListFilter {
-    fn sql(self) -> &'static str {
+    fn sql(self) -> String {
         match self {
-            Self::All => "1=1",
-            Self::Live => "state NOT IN ('deleted','source_gone')",
-            Self::Attention => {
-                "state NOT IN ('deleted','source_gone') AND (json_extract(data,'$.owned')=0 OR json_extract(data,'$.hold') IS NOT NULL OR json_extract(data,'$.error') IS NOT NULL)"
-            }
+            Self::All => "1=1".into(),
+            Self::Live => "state NOT IN ('deleted','source_gone')".into(),
+            Self::Attention => format!(
+                "state NOT IN ('deleted','source_gone') AND NOT ({FOREIGN_SQL}) AND {}",
+                exits::ATTENTION_SQL.as_str()
+            ),
+            Self::Foreign => format!("state NOT IN ('deleted','source_gone') AND {FOREIGN_SQL}"),
             Self::Owned => {
-                "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1"
+                "state NOT IN ('deleted','source_gone') AND json_extract(data,'$.owned')=1".into()
             }
-            Self::Cleared => "state IN ('deleted','source_gone')",
+            Self::Cleared => "state IN ('deleted','source_gone')".into(),
         }
     }
 }
@@ -341,6 +497,7 @@ pub struct ListCounts {
     pub all: u64,
     pub live: u64,
     pub attention: u64,
+    pub foreign: u64,
     pub owned: u64,
     pub cleared: u64,
     pub live_bytes: u64,
@@ -353,15 +510,25 @@ pub struct ListPage {
 }
 
 pub struct Inventory {
+    writer_naming: Mutex<std::collections::VecDeque<writer_naming::NamingEvidence>>,
+    naming_leases: Mutex<std::collections::HashMap<(u32, u32), writer_naming::NamingLease>>,
+    retired_naming: Mutex<Vec<writer_naming::ProducerRead>>,
     db: Mutex<Connection>,
     allocation_uses: Mutex<std::collections::HashSet<u32>>,
     reconciliation_uses: Mutex<std::collections::HashSet<(String, String)>>,
+    /// Signalled whenever a reconciliation/namespace use is released, so an
+    /// operator request can wait out a maintenance pass's momentary lease
+    /// instead of failing against it.
+    reconciliation_released: std::sync::Condvar,
     workspace_uses: Mutex<std::collections::HashMap<(String, String), usize>>,
     workspace_cursor: Mutex<String>,
     _process_lock: File,
     worker_session: String,
     closed: std::sync::atomic::AtomicBool,
     state_dir: PathBuf,
+    /// Root of transform workspaces (`paths.workspace_dir`); defaults to
+    /// `<state_dir>/transform-workspaces`.
+    workspace_dir: std::sync::RwLock<PathBuf>,
     pub installation: String,
     // Serialized mutation coordinator. Reads never wait for filesystem work.
     mutation: Mutex<()>,
@@ -370,8 +537,8 @@ pub struct Inventory {
     // publication checkpoint.
     publication_active: Mutex<std::collections::HashSet<String>>,
     relocation_active: Mutex<std::collections::HashSet<String>>,
-    clocks: Mutex<std::collections::HashMap<String, (u64, Instant)>>,
     reconcile_cursor: Mutex<String>,
+    empty_failed_cursor: Mutex<String>,
     // One task runner at a time: the maintenance tick and an API kick can
     // both drain the queue, and a task must never execute twice.
     tasks: Mutex<()>,
@@ -390,6 +557,16 @@ impl Drop for AllocationReservation<'_> {
             .unwrap()
             .remove(&self.job);
     }
+}
+
+/// The Operation retry ladder, seconds after the Nth failed attempt
+/// (review #283-12: one ladder, not a copy per caller).
+pub(crate) const RETRY_LADDER_SECONDS: [i64; 4] = [30, 60, 120, 300];
+
+/// Backoff after `attempts` failed attempts (1-based; the last rung
+/// repeats).
+pub(crate) fn retry_delay(attempts: u32) -> i64 {
+    RETRY_LADDER_SECONDS[(attempts.saturating_sub(1) as usize).min(RETRY_LADDER_SECONDS.len() - 1)]
 }
 
 pub fn now() -> i64 {
@@ -433,6 +610,11 @@ fn save_operation(db: &Connection, op: &Operation) -> Result<()> {
     )?;
     Ok(())
 }
+/// The transform workspace root when `paths.workspace_dir` is not set.
+pub fn default_workspace_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("transform-workspaces")
+}
+
 fn event(db: &Connection, artifact: &str, kind: &str, detail: &str) -> Result<()> {
     db.execute(
         "INSERT INTO events(artifact,at,kind,detail) VALUES(?1,?2,?3,?4)",
@@ -610,6 +792,12 @@ impl Inventory {
             Connection::open(state_dir.join("artifacts.sqlite"))?
         };
         db.busy_timeout(Duration::from_secs(5))?;
+        // W5b: EXCLUSIVE before the first access, so WAL never creates or
+        // maps `-shm` (unsupported on network filesystems; a truncated one
+        // crash-looped nzbd with SIGBUS). The inventory is one connection
+        // behind `artifacts.lock`; the CLI's backup/restore open it the same
+        // way and refuse while the daemon holds it.
+        db.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
         if let Some(expected) = expected {
             let actual: String = db.query_row(
                 "SELECT value FROM meta WHERE key='installation'",
@@ -630,6 +818,10 @@ impl Inventory {
           CREATE INDEX IF NOT EXISTS artifacts_job ON artifacts(job);
           CREATE INDEX IF NOT EXISTS artifacts_path ON artifacts(path);
           CREATE INDEX IF NOT EXISTS artifacts_state ON artifacts(state,updated_at);
+          CREATE TABLE IF NOT EXISTS job_disposition_sources(artifact TEXT NOT NULL,source_generation TEXT NOT NULL,job INTEGER NOT NULL,transfer TEXT NOT NULL,instance TEXT NOT NULL,admission_generation TEXT NOT NULL,PRIMARY KEY(artifact,source_generation));
+          CREATE INDEX IF NOT EXISTS job_disposition_source_admission ON job_disposition_sources(job,transfer,instance,admission_generation);
+          CREATE TABLE IF NOT EXISTS job_dispositions(id TEXT PRIMARY KEY,job INTEGER NOT NULL,transfer TEXT NOT NULL,generation TEXT NOT NULL,stopped INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(job,transfer,generation));
+          CREATE INDEX IF NOT EXISTS job_disposition_fences ON job_dispositions(job,transfer) WHERE stopped=0;
           CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS worker_controls(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS worker_authority(job INTEGER PRIMARY KEY,data TEXT NOT NULL);
@@ -640,15 +832,23 @@ impl Inventory {
           CREATE TABLE IF NOT EXISTS worker_completion_receipts(id TEXT PRIMARY KEY,job INTEGER NOT NULL,data TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS operations_state ON operations(state);
           CREATE INDEX IF NOT EXISTS operations_artifact ON operations(artifact);
+          CREATE INDEX IF NOT EXISTS operations_transform_scratch ON operations(json_extract(json_extract(data,'$.request'),'$.scratch.id'),json_extract(json_extract(data,'$.request'),'$.scratch.generation')) WHERE json_extract(data,'$.kind') IN ('extract','par_repair');
+          CREATE INDEX IF NOT EXISTS operations_scan_recent ON operations(json_extract(data,'$.kind'),json_extract(data,'$.created_at') DESC) WHERE json_extract(data,'$.kind')='scan';
+          CREATE INDEX IF NOT EXISTS operations_kind ON operations(json_extract(data,'$.kind'));
           CREATE TABLE IF NOT EXISTS recoveries(id TEXT PRIMARY KEY,artifact TEXT NOT NULL,state TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS workspace_finalizations(source TEXT NOT NULL,generation TEXT NOT NULL,outcome TEXT NOT NULL,proof TEXT NOT NULL,job INTEGER,activated INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source,generation));
-          CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,accepted_at INTEGER,consumer_receipt_id TEXT,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));
+          CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));
           CREATE TABLE IF NOT EXISTS delivery_cleanup_attempts(delivery_id TEXT NOT NULL,attempt INTEGER NOT NULL,started_at INTEGER NOT NULL,ended_at INTEGER,wait_ms INTEGER NOT NULL DEFAULT 0,outcome TEXT NOT NULL,error TEXT,PRIMARY KEY(delivery_id,attempt));
           CREATE INDEX IF NOT EXISTS deliveries_recent ON deliveries(sequence);
+          CREATE TABLE IF NOT EXISTS job_terminals(job INTEGER PRIMARY KEY,transfer TEXT,outcome TEXT NOT NULL,reason TEXT,fetch_cause TEXT,stage TEXT,message TEXT,blames_release INTEGER NOT NULL DEFAULT 0,salvage TEXT NOT NULL,keep_on_failure INTEGER NOT NULL DEFAULT 0,fetched TEXT NOT NULL,publication TEXT,markers TEXT NOT NULL,entry TEXT NOT NULL,history_seq INTEGER,history_incarnation TEXT,markers_stamped INTEGER NOT NULL DEFAULT 0,emitted INTEGER NOT NULL DEFAULT 0,disposal TEXT,salvage_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+          CREATE INDEX IF NOT EXISTS job_terminals_salvage ON job_terminals(salvage);
+          CREATE TABLE IF NOT EXISTS relocation_intents(generation TEXT PRIMARY KEY,job INTEGER NOT NULL,transfer TEXT,artifact TEXT NOT NULL,operation TEXT NOT NULL,source_dir TEXT NOT NULL,target_dir TEXT NOT NULL,cross_volume INTEGER NOT NULL,files TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+          CREATE INDEX IF NOT EXISTS relocation_intents_open ON relocation_intents(state);
           CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,artifact TEXT NOT NULL,at INTEGER NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL);
           CREATE INDEX IF NOT EXISTS events_artifact ON events(artifact,seq);
           INSERT OR IGNORE INTO meta VALUES('schema','1');
           INSERT OR IGNORE INTO meta VALUES('installation',lower(hex(randomblob(16))));")?;
+        db.execute_batch(RECEIPT_CUSTODY_INDEX_SQL)?;
         let backlog_migrated: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM meta WHERE key='delivery_backlog_migration')",
             [],
@@ -674,6 +874,18 @@ impl Inventory {
                 [],
             )?;
             tx.commit()?;
+        }
+        // M6b: there is no acceptance (contract §2.5). The v1 columns an M1a
+        // or older build wrote are dropped; nothing reads them.
+        for column in ["accepted_at", "consumer_receipt_id"] {
+            let present: bool = db.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name=?1",
+                [column],
+                |r| r.get::<_, i64>(0).map(|n| n != 0),
+            )?;
+            if present {
+                db.execute_batch(&format!("ALTER TABLE deliveries DROP COLUMN {column}"))?;
+            }
         }
         let has_cleanup_blocked_since: bool = db.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('deliveries') WHERE name='cleanup_blocked_since'",
@@ -703,6 +915,48 @@ impl Inventory {
                 )?;
             }
         }
+        // 0.9.0: the committed manifest lives in the move journal so a
+        // delivery row never re-reads a publication its consumer may have
+        // taken (contract §2.5). Additive and idempotent.
+        let has_intent_manifest: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('relocation_intents') WHERE name='manifest'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n != 0),
+        )?;
+        if !has_intent_manifest {
+            db.execute(
+                "ALTER TABLE relocation_intents ADD COLUMN manifest TEXT",
+                [],
+            )?;
+        }
+        // 0.9.2: a publication handed to its consumer carries no earlier
+        // attempt's error (the successful delivery is the later evidence).
+        // Idempotent.
+        db.execute(
+            "UPDATE artifacts SET data=json_set(data,'$.error',NULL) WHERE state='transferred' AND json_extract(data,'$.error') IS NOT NULL",
+            [],
+        )?;
+        {
+            let tx = db.transaction()?;
+            terminals::reopen_salvage_for_committed_publications(&tx, None)?;
+            // 0.9.0 closed scope (W4): a source cleanup an older build
+            // blocked on retained review files or per-file identity drift is
+            // retried once under the new rule. Once per store.
+            let migrated: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='closed_scope_cleanup_migration')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !migrated {
+                tx.execute("UPDATE operations SET data=json_set(data,'$.request',(json_set(json_extract(data,'$.request'),'$.cleanup.state','retry','$.cleanup.next_retry',0,'$.cleanup.error',NULL) || '')) WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.cleanup.state')='blocked'", [])?;
+                tx.execute("UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0,cleanup_blocked_since=NULL WHERE cleanup_status='blocked'", [])?;
+                tx.execute(
+                    "INSERT INTO meta(key,value) VALUES('closed_scope_cleanup_migration','1')",
+                    [],
+                )?;
+            }
+            tx.commit()?;
+        }
         // A `running` cleanup belongs to a worker from the previous process.
         // The inventory lock was acquired above, so no live worker can race
         // this one-time boot recovery.
@@ -715,6 +969,9 @@ impl Inventory {
             "UPDATE deliveries SET cleanup_status='retry',cleanup_error='previous cleanup worker interrupted',cleanup_next_retry_at=unixepoch() WHERE cleanup_status='running'",
             [],
         )?;
+        // Only this process holds the inventory lock. Recover abandoned
+        // non-Delivery claims through the same serialized journal format.
+        interrupted.execute("UPDATE operations SET data=json_set(data,'$.request',(json_set(json_extract(data,'$.request'),'$.cleanup.state','retry','$.cleanup.next_retry',0) || '')) WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.cleanup.state')='running'", [])?;
         interrupted.commit()?;
         let schema: String =
             db.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
@@ -755,24 +1012,36 @@ impl Inventory {
         }
         fs::sync_directory(&fs::open_dir(state_dir)?)?;
         let worker_session = id(&db)?;
-        Ok(Self {
+        let inventory = Self {
+            writer_naming: Mutex::new(std::collections::VecDeque::new()),
+            naming_leases: Mutex::new(std::collections::HashMap::new()),
+            retired_naming: Mutex::new(Vec::new()),
             db: Mutex::new(db),
             allocation_uses: Mutex::new(std::collections::HashSet::new()),
             reconciliation_uses: Mutex::new(std::collections::HashSet::new()),
+            reconciliation_released: std::sync::Condvar::new(),
             workspace_uses: Mutex::new(std::collections::HashMap::new()),
             workspace_cursor: Mutex::new(String::new()),
             _process_lock: process_lock,
             worker_session,
             closed: std::sync::atomic::AtomicBool::new(false),
             state_dir: state_dir.into(),
+            workspace_dir: std::sync::RwLock::new(default_workspace_dir(state_dir)),
             installation,
             mutation: Mutex::new(()),
             publication_active: Mutex::new(std::collections::HashSet::new()),
             relocation_active: Mutex::new(std::collections::HashSet::new()),
-            clocks: Mutex::new(std::collections::HashMap::new()),
             reconcile_cursor: Mutex::new(String::new()),
+            empty_failed_cursor: Mutex::new(String::new()),
             tasks: Mutex::new(()),
-        })
+        };
+        inventory.abandon_reviewed_transforms()?;
+        // No-wedge: upgrade and restart conversion of review/retained rows
+        // (database-only exits; the tick runs the rest).
+        if let Err(error) = inventory.exit_wedged_states(0, false) {
+            tracing::warn!(%error, "automatic exits at open deferred to the tick");
+        }
+        Ok(inventory)
     }
     fn mutation_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         let guard = self.mutation.lock().unwrap();
@@ -800,10 +1069,21 @@ impl Inventory {
         })
     }
     /// Called only after the engine's writers and maintenance tasks finish.
-    /// Old API handles retain read access but cannot mutate a restarted daemon.
+    /// Old API handles can no longer read or mutate a restarted daemon's
+    /// store: the connection (and its EXCLUSIVE lock) is released.
     pub fn close(&self) -> Result<()> {
-        let _guard = self.mutation.lock().unwrap();
-        if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let first_close = {
+            let _guard = self.mutation.lock().unwrap();
+            !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel)
+        };
+        self.invalidate_all_writer_naming();
+        self.drain_writer_naming();
+        if first_close {
+            // W5b: the store's EXCLUSIVE lock goes with its connection, so a
+            // replacement backend in this process can open it. A stale
+            // handle's reads now fail instead of answering from a store
+            // another owner is writing.
+            *self.db.lock().unwrap() = Connection::open_in_memory()?;
             self._process_lock.unlock()?;
         }
         Ok(())
@@ -833,6 +1113,50 @@ impl Inventory {
     }
     pub fn get(&self, key: &str) -> Result<Artifact> {
         read(&self.db.lock().unwrap(), "artifacts", key)
+    }
+    /// Read fresh custody metadata using the transactionally maintained
+    /// covering expression index, without loading or decoding file manifests.
+    /// Validate the remaining full Artifact header so malformed fields and
+    /// legacy defaults keep their existing semantics. No custody is cached.
+    pub fn receipt_custody(&self, key: &str) -> Result<ArtifactCustody> {
+        let raw: Option<String> = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare_cached(RECEIPT_CUSTODY_QUERY)?;
+            statement.query_row([key], |row| row.get(0)).optional()?
+        };
+        ArtifactCustody::from_header(&raw.ok_or(Error::NotFound)?)
+    }
+    /// Read all requested custody headers in one consistent SQLite statement
+    /// and one database-lock round trip. Missing keys are absent; malformed
+    /// rows retain their own errors without hiding unrelated valid rows.
+    pub fn receipt_custodies(
+        &self,
+        keys: &[String],
+    ) -> Result<std::collections::HashMap<String, Result<ArtifactCustody>>> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let keys = serde_json::to_string(keys)?;
+        let rows = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare_cached(RECEIPT_CUSTODIES_QUERY)?;
+            let rows = statement.query_map([keys], |row| {
+                // A non-text corrupt header is a per-row error too. Failure
+                // to step the statement itself still fails the whole read.
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(key, raw)| {
+                (
+                    key,
+                    raw.map_err(Error::Sql)
+                        .and_then(|raw| ArtifactCustody::from_header(&raw)),
+                )
+            })
+            .collect())
     }
     pub fn for_job(&self, job: u32) -> Result<Option<Artifact>> {
         let db = self.db.lock().unwrap();
@@ -884,7 +1208,7 @@ impl Inventory {
     pub fn list_page(&self, q: &ListQuery) -> Result<ListPage> {
         let db = self.db.lock().unwrap();
         let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        let mut where_sql = String::from(q.filter.sql());
+        let mut where_sql = q.filter.sql();
         let needle = q.q.trim();
         if !needle.is_empty() {
             let escaped = needle
@@ -938,6 +1262,7 @@ impl Inventory {
             (ListFilter::All, &mut counts.all),
             (ListFilter::Live, &mut counts.live),
             (ListFilter::Attention, &mut counts.attention),
+            (ListFilter::Foreign, &mut counts.foreign),
             (ListFilter::Owned, &mut counts.owned),
             (ListFilter::Cleared, &mut counts.cleared),
         ] {
@@ -1206,10 +1531,12 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 0,
             deadline: None,
-            eligible_seconds: 0,
             files: Vec::new(),
             error: None,
             inspected_at: None,
+            salvage: None,
+            failure_reason: None,
+            gone_reason: None,
         };
         save_artifact(&db, &a)?;
         drop(db);
@@ -1359,7 +1686,7 @@ impl Inventory {
     pub fn reconcile_missing(&self) -> Result<()> {
         let raws = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state IN ('completed','retained','unknown','retiring') AND id>?1 ORDER BY id LIMIT 1000")?;
+            let mut stmt = db.prepare("SELECT data FROM artifacts WHERE state IN ('completed','retained','unknown','retiring','transferred') AND id>?1 ORDER BY id LIMIT 1000")?;
             let cursor = self.reconcile_cursor.lock().unwrap().clone();
             let rows = stmt.query_map([cursor], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -1373,6 +1700,10 @@ impl Inventory {
             let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&original))? else {
                 continue;
             };
+            if original.state == "transferred" {
+                self.reconcile_transferred_absence(&original)?;
+                continue;
+            }
             if self.verify_root(&original).is_err() {
                 continue;
             }
@@ -1391,6 +1722,189 @@ impl Inventory {
                 current.updated_at = now();
                 current.revision += 1;
                 save_artifact(&self.db.lock().unwrap(), &current)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A handoff is not proof that the source directory is gone. Only two
+    /// descriptor-relative observations under the recorded mounted root may
+    /// retire it from Live. Keep all manifests, delivery and operation audit.
+    fn reconcile_transferred_absence(&self, original: &Artifact) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let mut current = self.get(&original.id)?;
+        if current.state != "transferred"
+            || current.generation != original.generation
+            || current.revision != original.revision
+            || current.path != original.path
+            || current.root != original.root
+            || current
+                .job
+                .is_some_and(|job| self.open_intent_for_job(job).unwrap_or(true))
+        {
+            return Ok(());
+        }
+        let key = format!(
+            "transferred-missing:{}:{}:{}",
+            current.id, current.generation, current.revision
+        );
+        let clear = || -> Result<()> {
+            self.db
+                .lock()
+                .unwrap()
+                .execute("DELETE FROM meta WHERE key=?1", [&key])?;
+            Ok(())
+        };
+        let Ok(root) = self.verify_root(&current) else {
+            return clear();
+        };
+        let Some(name) = current
+            .path
+            .strip_prefix(&current.root)
+            .ok()
+            .filter(|relative| relative.components().count() == 1)
+            .map(|relative| relative.as_os_str().to_owned())
+        else {
+            return clear();
+        };
+        // A readable pinned root, no symlink traversal, and ENOENT only.
+        if fs::names(&root).is_err() {
+            return clear();
+        }
+        if !matches!(fs::entry_missing_at(&root, &name), Ok(true)) {
+            return clear();
+        }
+        let db = self.db.lock().unwrap();
+        let in_flight: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled','failed','transferred'))",
+            [&current.id], |row| row.get(0))?;
+        if in_flight {
+            drop(db);
+            return clear();
+        }
+        let first: Option<i64> = db
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(first) = first else {
+            db.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2)",
+                params![key, now().to_string()],
+            )?;
+            return Ok(());
+        };
+        if now() < first.saturating_add(relocation::VANISHED_CONFIRM_SECONDS) {
+            return Ok(());
+        }
+        drop(db);
+        // Re-open the named root and recheck the leaf immediately before the
+        // disposition. A replaced root or reappearing leaf is unresolved.
+        let Ok(check) = self.verify_root(&current) else {
+            return clear();
+        };
+        if !matches!(fs::entry_missing_at(&check, &name), Ok(true)) {
+            return clear();
+        }
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        current.state = "source_gone".into();
+        current.gone_reason = Some("transferred source missing from its verified root".into());
+        current.updated_at = now();
+        current.revision += 1;
+        save_artifact(&tx, &current)?;
+        event(&tx, &current.id, "source_gone", "transferred directory absent from its verified root on two passes; not removed by Runner; handoff audit retained")?;
+        tx.execute("DELETE FROM meta WHERE key=?1", [&key])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Dispose of retained failed sources that hold no files.
+    ///
+    /// Retention exists to keep bytes that may still become media. A
+    /// retained generation whose complete manifest walk finds no regular file
+    /// keeps nothing, yet under Runner custody it is exactly what Curator
+    /// waits on before it may replace the failed release. Releases that failed
+    /// health before any file finished were retained this way "for recovery"
+    /// (field report 2026-11-02): eleven empty directories froze a whole
+    /// season. Classification now disposes them at failure time; this sweep
+    /// settles generations retained before that, and any whose bytes were
+    /// removed by hand, through the ordinary audited delete operation.
+    pub fn reconcile_empty_failed_sources(&self) -> Result<()> {
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare(
+                "SELECT data FROM artifacts WHERE state='retained' AND job IS NOT NULL AND id>?1 ORDER BY id LIMIT 200",
+            )?;
+            let cursor = self.empty_failed_cursor.lock().unwrap().clone();
+            let rows = stmt.query_map([cursor], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if raws.is_empty() {
+            self.empty_failed_cursor.lock().unwrap().clear();
+        }
+        for raw in raws {
+            let artifact: Artifact = serde_json::from_str(&raw)?;
+            *self.empty_failed_cursor.lock().unwrap() = artifact.id.clone();
+            if !artifact.owned
+                || !artifact.automatic_cleanup_eligible
+                || artifact.keep
+                || artifact.keep_on_failure
+                || artifact.hold.is_some()
+            {
+                continue;
+            }
+            let empty = {
+                let Some(_lease) = self.reserve_reconciliation(std::slice::from_ref(&artifact))?
+                else {
+                    continue;
+                };
+                if self.verify_root(&artifact).is_err() {
+                    continue;
+                }
+                let Ok(dir) = self.verify(&artifact) else {
+                    continue;
+                };
+                // One directory read per tick, not a manifest walk: the
+                // sweep runs every 30 s over /processing, which may be NFS.
+                // Only a directory with no entries at all qualifies; any
+                // entry, or an error reading it, leaves it for a person.
+                fs::names(&dir).is_ok_and(|names| names.is_empty())
+            };
+            if !empty {
+                continue;
+            }
+            // The same authority Keep-off uses for a no-Delivery failed
+            // source: a persisted `unusable` assessment pinned to this
+            // generation, then the generation-bound failed-delete operation
+            // (which a later Keep still cancels).
+            let assessed = match self.set_failure_assessment(
+                &artifact.id,
+                &artifact.generation,
+                "unusable",
+                "the failed attempt left no source files; nothing to retain",
+            ) {
+                Ok(assessed) => assessed,
+                Err(error) => {
+                    tracing::warn!(artifact = %artifact.id, %error,
+                        "empty retained failed source could not be assessed");
+                    continue;
+                }
+            };
+            let request = format!("failed-delete-{}", assessed.id);
+            match self.request_delete(&assessed.id, assessed.revision, &request, 0) {
+                Ok(_) => tracing::info!(
+                    artifact = %artifact.id,
+                    job = ?artifact.job,
+                    "retained failed source holds no files; disposing it"
+                ),
+                Err(error) => tracing::warn!(
+                    artifact = %artifact.id,
+                    %error,
+                    "empty retained failed source could not be queued for disposal"
+                ),
             }
         }
         Ok(())
@@ -1433,6 +1947,425 @@ impl Inventory {
         }
         Ok(root)
     }
+    /// Where transform workspaces are created.
+    pub fn workspace_dir(&self) -> PathBuf {
+        self.workspace_dir.read().unwrap().clone()
+    }
+
+    /// Use `dir` for transform workspaces (`paths.workspace_dir`). Rows
+    /// recorded under the default root (`<state_dir>/transform-workspaces`)
+    /// while `dir` is elsewhere — the operator moved the directory — are
+    /// rewritten to the same relative path under `dir` in every table. While
+    /// the old root still holds workspaces (not moved), nothing is rewritten:
+    /// they finish where they are. Then every workspace recorded under `dir`
+    /// whose recorded root is not the live root object (the root was moved
+    /// or copied there) is re-stamped — the artifact row, the transform
+    /// journal's own copy of the scratch and its attempt directories, and the
+    /// identity sidecar (Runner's private scratch: the move is the
+    /// operator's, not evidence against the payload). That re-stamp is
+    /// driven by the mismatch, not by this run's rewrite, so a crash between
+    /// the commit and the sidecar writes is finished by the next start.
+    /// Idempotent: a second run changes nothing. Returns the number of
+    /// rewritten values.
+    pub fn configure_workspace_dir(&self, dir: &Path) -> Result<usize> {
+        fs::absolute(dir)?;
+        let old = default_workspace_dir(&self.state_dir);
+        *self.workspace_dir.write().unwrap() = dir.to_path_buf();
+        let new_text = dir
+            .to_str()
+            .ok_or_else(|| Error::Conflict("non-UTF-8 workspace path".into()))?
+            .to_owned();
+        let mut rewritten = 0;
+        if dir != old {
+            if dir.starts_with(&old) || old.starts_with(dir) {
+                return Err(Error::Conflict(format!(
+                    "paths.workspace_dir {} must not be nested with the default {}",
+                    dir.display(),
+                    old.display()
+                )));
+            }
+            // Not moved (the old root still holds workspaces): the recorded
+            // absolute paths stay valid where they are, and only new
+            // workspaces go to `dir`. Rewriting them now would point them at
+            // nothing.
+            if std::fs::read_dir(&old).is_ok_and(|mut entries| entries.next().is_some()) {
+                tracing::warn!(old = %old.display(), new = %dir.display(),
+                    "workspace_dir changed but the default workspace root still holds workspaces; \
+                     existing ones finish where they are");
+            } else {
+                let old_text = old
+                    .to_str()
+                    .ok_or_else(|| Error::Conflict("non-UTF-8 workspace path".into()))?
+                    .to_owned();
+                rewritten = self.rewrite_workspace_paths(&old_text, &new_text)?;
+            }
+        }
+        // The previous root is not always `<state_dir>/transform-workspaces`
+        // of *this* state_dir: when the state directory itself moved, the
+        // workspaces were recorded under the old state_dir's default (or an
+        // older explicit `workspace_dir`). The roots the transform journals
+        // recorded are authoritative; each is resolved to where its
+        // workspaces actually are now.
+        for recorded in self.recorded_workspace_roots()? {
+            if recorded == dir || dir.starts_with(&recorded) || recorded.starts_with(dir) {
+                continue;
+            }
+            rewritten += self.migrate_recorded_workspace_root(&recorded, dir, &new_text)?;
+        }
+        let restamped = self.restamp_moved_workspaces(dir, &new_text)?;
+        if rewritten > 0 || restamped > 0 {
+            tracing::info!(from = %old.display(), to = %dir.display(), rewritten, restamped,
+                "transform workspace paths migrated");
+        }
+        Ok(rewritten)
+    }
+
+    /// Every root a transform journal recorded its scratch workspace under.
+    fn recorded_workspace_roots(&self) -> Result<Vec<PathBuf>> {
+        let db = self.db.lock().unwrap();
+        let mut statement = db.prepare(
+            "SELECT DISTINCT json_extract(json_extract(data,'$.request'),'$.scratch.root') FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.root') IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut roots = rows
+            .map(|root| root.map(PathBuf::from))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
+    }
+
+    /// Resolve one recorded workspace root (`recorded`, not `dir`) to where
+    /// its live workspaces are now: still there, under `dir`, or under this
+    /// state directory's default (the state directory moved wholesale).
+    /// Workspaces found on `dir`'s filesystem are renamed into `dir` (cheap,
+    /// same inodes; a crash midway is finished by the next start), so they
+    /// end up under the configured root. The recorded paths are rewritten
+    /// only to a location that holds every live workspace that still exists
+    /// anywhere (a workspace gone everywhere does not block it). Any root
+    /// that cannot be read (EACCES, EIO, a mount that is down) makes the
+    /// answer unknown: nothing is moved or rewritten. Returns the rewritten
+    /// values.
+    fn migrate_recorded_workspace_root(
+        &self,
+        recorded: &Path,
+        dir: &Path,
+        dir_text: &str,
+    ) -> Result<usize> {
+        let names = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT path FROM artifacts WHERE json_extract(data,'$.root')=?1 AND state NOT IN ('deleted','source_gone')",
+            )?;
+            let rows = statement.query_map([recorded.to_string_lossy()], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        }
+        .into_iter()
+        .filter_map(|path| Path::new(&path).file_name().map(|name| name.to_owned()))
+        .collect::<Vec<_>>();
+        // `Some(true)` present, `Some(false)` absent, `None` unknown.
+        let probe = |path: &Path| match path.symlink_metadata() {
+            Ok(_) => Some(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+            Err(_) => None,
+        };
+        let default = default_workspace_dir(&self.state_dir);
+        let mut places = vec![recorded.to_path_buf(), dir.to_path_buf()];
+        if default != recorded && default != dir {
+            places.push(default.clone());
+        }
+        let mut recorded_exists = false;
+        for (index, place) in places.iter().enumerate() {
+            match probe(place) {
+                Some(exists) => recorded_exists |= index == 0 && exists,
+                None => {
+                    tracing::warn!(root = %place.display(),
+                        "workspace root cannot be read; recorded workspaces are left as they are");
+                    return Ok(0);
+                }
+            }
+        }
+        if names.is_empty() {
+            // History only: point it at `dir` once the recorded root is gone.
+            return if recorded_exists {
+                Ok(0)
+            } else {
+                self.rewrite_workspace_paths(&recorded.to_string_lossy(), dir_text)
+            };
+        }
+        std::fs::create_dir_all(dir)?;
+        let Some(dir_device) = crate::io_meter::device_of_metadata(&std::fs::metadata(dir)?) else {
+            // Unknown volume identity cannot authorize moving legacy work.
+            return Ok(0);
+        };
+        let mut moved = 0usize;
+        for place in places.iter().filter(|place| place.as_path() != dir) {
+            let Ok(meta) = std::fs::metadata(place) else {
+                continue;
+            };
+            if crate::io_meter::device_of_metadata(&meta) != Some(dir_device) {
+                continue;
+            }
+            for name in &names {
+                let from = place.join(name);
+                let to = dir.join(name);
+                if probe(&from) == Some(true) && probe(&to) == Some(false) {
+                    std::fs::rename(&from, &to)?;
+                    moved += 1;
+                }
+            }
+        }
+        if moved > 0 {
+            fs::sync_directory(&fs::open_dir(dir)?)?;
+            tracing::info!(from = %recorded.display(), to = %dir.display(), moved,
+                "transform workspaces renamed into workspace_dir");
+        }
+        let mut location: Option<PathBuf> = None;
+        for place in &places {
+            let mut found = 0;
+            let mut elsewhere = false;
+            for name in &names {
+                match probe(&place.join(name)) {
+                    Some(true) => found += 1,
+                    Some(false) => {
+                        elsewhere |= places
+                            .iter()
+                            .any(|other| other != place && probe(&other.join(name)) == Some(true));
+                    }
+                    None => return Ok(0),
+                }
+            }
+            if found > 0 && !elsewhere {
+                location = Some(place.clone());
+                break;
+            }
+        }
+        match location {
+            Some(location) if location != recorded => {
+                let Some(text) = location.to_str() else {
+                    return Ok(0);
+                };
+                let count = self.rewrite_workspace_paths(&recorded.to_string_lossy(), text)?;
+                tracing::info!(from = %recorded.display(), to = %location.display(), rewritten = count,
+                    "transform workspace paths migrated from a recorded root");
+                Ok(count)
+            }
+            Some(_) => Ok(0),
+            None => {
+                let anywhere = names.iter().any(|name| {
+                    places
+                        .iter()
+                        .any(|place| probe(&place.join(name)) == Some(true))
+                });
+                if !anywhere {
+                    // Every live workspace is gone everywhere: the history
+                    // points at `dir`.
+                    return self.rewrite_workspace_paths(&recorded.to_string_lossy(), dir_text);
+                }
+                tracing::warn!(root = %recorded.display(),
+                    "recorded workspaces are split across roots; left as they are");
+                Ok(0)
+            }
+        }
+    }
+
+    /// Rewrite every recorded path under `old_text` to `new_text` in every
+    /// table: a whole value that is the root or under it, and every JSON
+    /// string that is, at any nesting depth. Counts only values that changed
+    /// (a value mentioning the old path unquoted mid-string, such as error
+    /// text, matches `instr` forever but is never rewritten or counted).
+    fn rewrite_workspace_paths(&self, old_text: &str, new_text: &str) -> Result<usize> {
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let tables = {
+            let mut statement = tx.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut rewritten = 0usize;
+        for table in tables {
+            let columns = {
+                let mut statement = tx.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (column, kind) in columns {
+                if !(kind.eq_ignore_ascii_case("TEXT") || kind.is_empty()) {
+                    continue;
+                }
+                // A request is JSON inside JSON, so its quotes arrive escaped.
+                let mut expression = format!("\"{column}\"");
+                let mut binds: Vec<String> = Vec::new();
+                for quote in ["\"", "\\\"", "\\\\\\\""] {
+                    for (from, to) in [
+                        (format!("{quote}{old_text}/"), format!("{quote}{new_text}/")),
+                        (
+                            format!("{quote}{old_text}{quote}"),
+                            format!("{quote}{new_text}{quote}"),
+                        ),
+                    ] {
+                        binds.push(from);
+                        binds.push(to);
+                        expression = format!(
+                            "replace({expression},?{},?{})",
+                            binds.len() + 1,
+                            binds.len() + 2
+                        );
+                    }
+                }
+                let value = format!(
+                    "CASE \
+                     WHEN \"{column}\" = ?1 THEN ?2 \
+                     WHEN substr(\"{column}\",1,length(?1)+1) = ?1||'/' THEN ?2||substr(\"{column}\",length(?1)+1) \
+                     ELSE {expression} END"
+                );
+                let sql = format!(
+                    "UPDATE \"{table}\" SET \"{column}\" = {value} \
+                     WHERE typeof(\"{column}\")='text' AND instr(\"{column}\",?1) > 0 \
+                     AND ({value}) IS NOT \"{column}\""
+                );
+                let mut values: Vec<&dyn rusqlite::ToSql> = vec![&old_text, &new_text];
+                values.extend(binds.iter().map(|value| value as &dyn rusqlite::ToSql));
+                rewritten += tx.execute(&sql, values.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(rewritten)
+    }
+
+    /// Re-stamp workspaces recorded under `dir` whose recorded root is not
+    /// the live root object, in one transaction: the artifact row (root and
+    /// scratch identity, manifest) and every transform journal naming that
+    /// scratch (its copy of the scratch and its attempt directories), so
+    /// startup reconcile still recognises the workspace as a transform's
+    /// and a resume verifies. Then repair any of this installation's
+    /// sidecars still recording a different root for a row that matches
+    /// disk. A missing root re-stamps nothing. Returns the rows re-stamped.
+    fn restamp_moved_workspaces(&self, dir: &Path, dir_text: &str) -> Result<usize> {
+        let Ok(root) = fs::open_dir(dir) else {
+            return Ok(0);
+        };
+        let live_root = fs::identity_for_file(&root)?;
+        let live_scratch = |path: &Path| -> Option<(File, Identity)> {
+            let file = fs::open_dir(path).ok()?;
+            let identity = fs::identity_for_file(&file).ok()?;
+            Some((file, identity))
+        };
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let rows = {
+            let mut statement = tx.prepare("SELECT data FROM artifacts WHERE json_extract(data,'$.root')=?1 AND state NOT IN ('deleted','source_gone')")?;
+            let rows = statement.query_map([dir_text], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut current = std::collections::HashMap::new();
+        let mut restamped = 0usize;
+        for raw in rows {
+            let mut a: Artifact = serde_json::from_str(&raw)?;
+            if !a.root_identity.same_object(&live_root) {
+                a.root_identity = live_root.clone();
+                if let Some((scratch, identity)) = live_scratch(&a.path) {
+                    if a.identity.is_some() {
+                        a.identity = Some(identity);
+                    }
+                    if let Ok(files) = fs::manifest(&scratch, 100_000) {
+                        a.files = files;
+                    }
+                }
+                a.revision += 1;
+                a.updated_at = now();
+                save_artifact(&tx, &a)?;
+                event(
+                    &tx,
+                    &a.id,
+                    "workspace_moved",
+                    &format!("workspace root moved to {dir_text}"),
+                )?;
+                restamped += 1;
+            }
+            current.insert(a.id.clone(), a);
+        }
+        let operations = {
+            let mut statement = tx.prepare("SELECT data FROM operations WHERE json_extract(data,'$.kind') IN ('extract','par_repair') AND json_extract(json_extract(data,'$.request'),'$.scratch.root')=?1")?;
+            let rows = statement.query_map([dir_text], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in operations {
+            let mut op: Operation = serde_json::from_str(&raw)?;
+            let mut workspace: Workspace = serde_json::from_str(&op.request)?;
+            if workspace.scratch.root_identity.same_object(&live_root) {
+                continue;
+            }
+            workspace.scratch.root_identity = live_root.clone();
+            if let Some((scratch, identity)) = live_scratch(&workspace.scratch.path) {
+                if workspace.scratch.identity.is_some() {
+                    // Same value as the row's, so the journal and the row
+                    // agree exactly (`is_transform_scratch`).
+                    let row = current
+                        .get(&workspace.scratch.id)
+                        .filter(|row| row.generation == workspace.scratch.generation)
+                        .and_then(|row| row.identity.clone())
+                        .filter(|row| row.same_object(&identity));
+                    workspace.scratch.identity = Some(row.unwrap_or(identity));
+                }
+                for attempt in &mut workspace.attempts {
+                    if attempt.identity.is_some() {
+                        if let Ok(directory) = fs::open_relative(&scratch, &attempt.directory) {
+                            attempt.identity = Some(fs::identity_for_file(&directory)?);
+                        }
+                    }
+                }
+            }
+            op.request = serde_json::to_string(&workspace)?;
+            save_operation(&tx, &op)?;
+        }
+        tx.commit()?;
+        drop(db);
+        drop(_guard);
+        for a in current.values() {
+            if a.owned && a.identity.is_some() && self.sidecar_records_other_root(a)? {
+                self.sidecar(a)?;
+            }
+        }
+        Ok(restamped)
+    }
+
+    /// This installation's sidecar for `a` exists but records a different
+    /// root (path or object) than the row, while the row's root is the live
+    /// one: left behind by a root move whose re-stamp committed but whose
+    /// sidecar write did not. A foreign or unreadable sidecar is not ours to
+    /// rewrite.
+    fn sidecar_records_other_root(&self, a: &Artifact) -> Result<bool> {
+        let marker = self
+            .state_dir
+            .join("artifact-identities")
+            .join(&a.id)
+            .join(format!("{}.json", a.generation));
+        let Ok(bytes) = std::fs::read(marker) else {
+            return Ok(false);
+        };
+        let Ok(data) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(false);
+        };
+        if data["installation"] != self.installation
+            || data["artifact"] != a.id
+            || data["generation"] != a.generation
+        {
+            return Ok(false);
+        }
+        let recorded_root: Option<Identity> =
+            serde_json::from_value(data["root_identity"].clone()).ok();
+        Ok(data["root"] != a.root.to_string_lossy().as_ref()
+            || data["path"] != a.path.to_string_lossy().as_ref()
+            || !recorded_root.is_some_and(|root| root.same_object(&a.root_identity)))
+    }
+
     fn verify(&self, a: &Artifact) -> Result<File> {
         self.verify_root(a)?;
         let file = fs::open_dir(&a.path)?;
@@ -1524,10 +2457,21 @@ impl Inventory {
     }
     pub(super) fn finish_artifact_unlocked(
         &self,
+        a: Artifact,
+        path: &Path,
+        root: &Path,
+        state: &str,
+    ) -> Result<Artifact> {
+        self.finish_artifact_checked(a, path, root, state, |_| Ok(()))
+    }
+
+    fn finish_artifact_checked(
+        &self,
         mut a: Artifact,
         path: &Path,
         root: &Path,
         state: &str,
+        check: impl FnOnce(&[FileEntry]) -> Result<()>,
     ) -> Result<Artifact> {
         let original = a.clone();
         // History may record a bounded PP failure while its independent
@@ -1537,6 +2481,31 @@ impl Inventory {
             && a.path == path
             && a.root == root
         {
+            return Ok(a);
+        }
+        // Contract §2.5: a committed per-file publication is finalized from
+        // its journal. It is visible, so its consumer may already have
+        // taken files out of it; re-reading it would only find that.
+        if matches!(state, "active" | "completed")
+            && matches!(a.state.as_str(), "active" | "completed")
+            && a.owned
+            && a.path == path
+            && a.root == root
+            && self.committed_publication_intent(&a)?.is_some()
+        {
+            if a.state == state {
+                return Ok(a);
+            }
+            a.state = state.into();
+            a.revision += 1;
+            a.updated_at = now();
+            let _coordinator = self.mutation_guard()?;
+            self.check_payload_capture(&original)?;
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            save_artifact(&tx, &a)?;
+            event(&tx, &a.id, "finalized", state)?;
+            tx.commit()?;
             return Ok(a);
         }
         if a.path == path && a.state == state {
@@ -1582,7 +2551,11 @@ impl Inventory {
         a.root_identity = fs::identity_for_file(&root_file)?;
         a.identity = Some(fs::identity_for_file(&dir)?);
         a.files = fs::manifest(&dir, 100_000)?;
+        check(&a.files)?;
         a.inspected_at = Some(now());
+        // The finalization commits a fresh snapshot: an earlier attempt's
+        // failure (a full volume) is history, not this row's state.
+        a.error = None;
         if a.state == "retiring" {
             a.hold = if a.owned { None } else { Some("review".into()) };
         }
@@ -1592,7 +2565,6 @@ impl Inventory {
         if state == "parked_failed" && a.owned {
             a.retention_seconds = u64::from(self.settings()?.failed_retention_days) * 86400;
             a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
-            a.eligible_seconds = 0;
         }
         let _coordinator = self.mutation_guard()?;
         self.check_payload_capture(&original)?;
@@ -1608,6 +2580,250 @@ impl Inventory {
     pub fn discover(&self, root: &Path, path: &Path, active: bool) -> Result<Artifact> {
         self.discover_record(root, path, active)
     }
+    /// Observe a script-selected result without associating it with a job or
+    /// granting ownership. Existing discoveries must still name the captured
+    /// directory and remain unowned and unassociated at this boundary.
+    pub fn observe_external_output(&self, root: &Path, path: &Path) -> Result<Artifact> {
+        let observed = self.discover(root, path, false)?;
+        if observed.owned || observed.job.is_some() {
+            return Err(Error::Conflict(
+                "external output is already owned or associated with a job".into(),
+            ));
+        }
+        self.verify(&observed)?;
+        let _guard = self.mutation_guard()?;
+        self.check_payload_capture(&observed)?;
+        let current = self.get(&observed.id)?;
+        if current.owned || current.job.is_some() {
+            return Err(Error::Conflict(
+                "external output ownership changed during observation".into(),
+            ));
+        }
+        Ok(current)
+    }
+    /// Whether a scan must leave `path` alone because it is Runner's own
+    /// publication still landing: an open per-file intent's target, an
+    /// unresolved relocation's destination, or a directory containing one
+    /// (a category directory under the root), and Runner's private staging
+    /// (`.runner-*`). Recording such a directory as foreign content is what
+    /// left Runner publications as `unknown`/Keep/review duplicates.
+    pub(super) fn publication_in_flight(&self, path: &Path) -> Result<bool> {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".runner-"))
+        {
+            return Ok(true);
+        }
+        let path = path.to_string_lossy();
+        let db = self.db.lock().unwrap();
+        let intent: bool = db.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM relocation_intents WHERE (target_dir=?1 OR substr(target_dir,1,length(?1)+1)=?1||'/') AND state IN {})",
+                intents::OPEN_STATES
+            ),
+            [&path],
+            |row| row.get(0),
+        )?;
+        if intent {
+            return Ok(true);
+        }
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE state NOT IN ('succeeded','cancelled','failed','transferred') AND json_extract(data,'$.kind')='relocate' AND (json_extract(json_extract(data,'$.request'),'$.destination')=?1 OR substr(json_extract(json_extract(data,'$.request'),'$.destination'),1,length(?1)+1)=?1||'/'))",
+            [&path],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Runner's own publications recorded as discovered foreign content are
+    /// folded back into Runner's custody record (contract §2.5: a directory
+    /// carrying a valid `.runner-manifest.json` is a Runner publication
+    /// handed to its consumer — custody transferred, never unknown, Keep or
+    /// review). Two cases, both idempotent:
+    ///
+    /// * Runner's own row names the same directory object (path and
+    ///   `same_object` identity; the scan walked the destination before the
+    ///   publication committed): the duplicate observation is closed
+    ///   (`deleted` — a record, no bytes touched) with an event pointing at
+    ///   Runner's row; its first-seen time, Keep and manifest stay on it.
+    /// * no row names it, but the directory's manifest verifies, lists
+    ///   exactly its files, and names a generation this installation
+    ///   recorded: the row becomes `transferred` (unowned, no Keep, no
+    ///   hold) — the consumer's; Runner never deletes it.
+    ///
+    /// Content without such a manifest stays foreign; each unknown row's
+    /// manifest is read once per revision, not on every scan. Returns how
+    /// many rows changed.
+    pub fn fold_rediscovered_publications(&self) -> Result<usize> {
+        let candidates = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT u.data, c.data FROM artifacts u JOIN artifacts c ON c.path=u.path AND c.id<>u.id \
+                 WHERE u.state='unknown' AND u.job IS NULL AND json_extract(u.data,'$.owned')=0 \
+                 AND c.state NOT IN ('unknown','deleted','source_gone') \
+                 AND (c.job IS NOT NULL OR json_extract(c.data,'$.owned')=1 OR c.state='transferred') \
+                 AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.artifact=u.id) \
+                 AND NOT EXISTS(SELECT 1 FROM recoveries r WHERE r.artifact=u.id)",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut changed = 0;
+        let mut folded = std::collections::HashSet::new();
+        for (duplicate, runner) in candidates {
+            let duplicate: Artifact = serde_json::from_str(&duplicate)?;
+            let runner: Artifact = serde_json::from_str(&runner)?;
+            if folded.contains(&duplicate.id) {
+                continue;
+            }
+            let same = match (&duplicate.identity, &runner.identity) {
+                (Some(a), Some(b)) => a.same_object(b),
+                _ => false,
+            };
+            if !same {
+                continue;
+            }
+            let _guard = self.mutation_guard()?;
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            let current: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM artifacts WHERE id=?1 AND state='unknown' AND job IS NULL",
+                    [&duplicate.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(current) = current else {
+                continue;
+            };
+            let mut current: Artifact = serde_json::from_str(&current)?;
+            if current.revision != duplicate.revision || current.owned {
+                continue;
+            }
+            current.state = "deleted".into();
+            current.hold = None;
+            current.revision += 1;
+            current.updated_at = now();
+            save_artifact(&tx, &current)?;
+            if tx.changes() != 1 {
+                continue;
+            }
+            event(
+                &tx,
+                &current.id,
+                "rediscovery_folded",
+                &format!("the same directory is Runner's publication {}; this observation is closed (no bytes touched)", runner.id),
+            )?;
+            event(
+                &tx,
+                &runner.id,
+                "rediscovery_folded",
+                &format!(
+                    "a scan had recorded this publication as unknown content ({}); folded",
+                    current.id
+                ),
+            )?;
+            tx.commit()?;
+            folded.insert(duplicate.id);
+            changed += 1;
+        }
+        let orphans = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT a.data FROM artifacts a WHERE a.state='unknown' AND a.job IS NULL AND json_extract(a.data,'$.owned')=0 \
+                 AND NOT EXISTS(SELECT 1 FROM meta m WHERE m.key='publication-fold-checked:'||a.id AND m.value=CAST(json_extract(a.data,'$.revision') AS TEXT))",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in orphans {
+            let candidate: Artifact = serde_json::from_str(&raw)?;
+            let checked = |inventory: &Self| -> Result<()> {
+                inventory.db.lock().unwrap().execute(
+                    "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    params![format!("publication-fold-checked:{}", candidate.id), candidate.revision.to_string()],
+                )?;
+                Ok(())
+            };
+            let Some(manifest) = fs::open_dir(&candidate.path).ok().and_then(|dir| {
+                intents::read_manifest(&dir)
+                    .ok()
+                    .flatten()
+                    .map(|m| (dir, m))
+            }) else {
+                checked(self)?;
+                continue;
+            };
+            let (dir, manifest) = manifest;
+            let Ok(files) = fs::manifest(&dir, 100_000) else {
+                continue;
+            };
+            let payload = files
+                .iter()
+                .filter(|entry| {
+                    !entry.identity.directory && entry.path != intents::RUNNER_MANIFEST_NAME
+                })
+                .collect::<Vec<_>>();
+            let matches = payload.len() == manifest.files.len()
+                && manifest.files.iter().all(|listed| {
+                    payload.iter().any(|entry| {
+                        entry.path == listed.path && entry.identity.bytes == listed.bytes
+                    })
+                });
+            // Installation check: the generation is one this inventory
+            // recorded (an artifact generation, a delivery, an intent).
+            let ours: bool = self.db.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE json_extract(data,'$.generation')=?1 AND id<>?2) \
+                 OR EXISTS(SELECT 1 FROM deliveries WHERE generation=?1) \
+                 OR EXISTS(SELECT 1 FROM relocation_intents WHERE generation=?1)",
+                params![manifest.generation, candidate.id],
+                |row| row.get(0),
+            )?;
+            if !matches || !ours {
+                checked(self)?;
+                continue;
+            }
+            let _guard = self.mutation_guard()?;
+            let mut current = self.get(&candidate.id)?;
+            if current.revision != candidate.revision || current.state != "unknown" {
+                continue;
+            }
+            current.state = "transferred".into();
+            current.owned = false;
+            current.keep = false;
+            current.keep_on_failure = false;
+            current.hold = None;
+            current.deadline = None;
+            current.automatic_cleanup_eligible = false;
+            current.files = files;
+            current.revision += 1;
+            current.updated_at = now();
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            save_artifact(&tx, &current)?;
+            event(
+                &tx,
+                &current.id,
+                "rediscovery_folded",
+                &format!(
+                    "Runner publication of job {} (generation {}); custody transferred to its consumer",
+                    manifest.job, manifest.generation
+                ),
+            )?;
+            tx.commit()?;
+            changed += 1;
+        }
+        if changed > 0 {
+            tracing::info!(
+                changed,
+                "rediscovered Runner publications folded into custody records"
+            );
+        }
+        Ok(changed)
+    }
+
     fn discover_unlocked(&self, root: &Path, path: &Path) -> Result<Artifact> {
         self.discover_record(root, path, false)
     }
@@ -1677,10 +2893,12 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 0,
             deadline: None,
-            eligible_seconds: 0,
             files: Vec::new(),
             error: None,
             inspected_at: None,
+            salvage: None,
+            failure_reason: None,
+            gone_reason: None,
         };
         save_artifact(&db, &a)?;
         Ok(a)
@@ -1835,7 +3053,6 @@ impl Inventory {
             }
             a.retention_seconds = seconds;
         }
-        a.eligible_seconds = 0;
         a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
         a.revision += 1;
         a.updated_at = now();
@@ -1851,7 +3068,9 @@ impl Inventory {
             for raw in ops {
                 let mut op: Operation = serde_json::from_str(&raw)?;
                 if op.kind == "delete"
-                    && matches!(serde_json::from_str::<DeleteRequest>(&op.request),Ok(DeleteRequest::ClusterCancellation((_,_,_,false,ref generation,false,ref receipt,_))) if generation==&a.generation && !receipt.is_empty())
+                    && (matches!(serde_json::from_str::<DeleteRequest>(&op.request), Ok(DeleteRequest::Consumer(ref request))
+                            if request.generation == a.generation && request.artifact == a.id)
+                        || matches!(serde_json::from_str::<DeleteRequest>(&op.request),Ok(DeleteRequest::ClusterCancellation((_,_,_,false,ref generation,false,ref receipt,_))) if generation==&a.generation && !receipt.is_empty()))
                 {
                     // The executor still rechecks its independent receipt and
                     // exact owned manifest after any Keep-only revision change.
@@ -1872,6 +3091,9 @@ impl Inventory {
                 "fresh retention period"
             },
         )?;
+        if !keep {
+            Self::wake_relocation_cleanup(&tx, &a.id, &a.generation)?;
+        }
         tx.commit()?;
         Ok(a)
     }
@@ -1909,14 +3131,36 @@ impl Inventory {
     /// consulted at the physical-delete boundary. Explicit artifact deletion
     /// remains a separate user action and is not blocked by this preference.
     pub fn set_keep_on_failure(&self, job: u32, keep: bool) -> Result<bool> {
-        let guard = self.mutation_guard()?;
-        let artifact = self.failure_keep_source(job)?;
-        let Some(artifact) = artifact else {
-            return Ok(false);
-        };
-        let result = self.set_failure_keep_artifact_locked(job, artifact, keep, false);
-        drop(guard);
-        result
+        loop {
+            // An operator's Keep serializes behind a maintenance pass's
+            // momentary reconciliation lease on the source rather than
+            // failing against it (the lease is released under the mutation
+            // guard, so the wait happens without it).
+            if let Some(artifact) = self.failure_keep_source(job)? {
+                self.wait_reconciliation_released(&artifact);
+            }
+            let guard = self.mutation_guard()?;
+            let Some(artifact) = self.failure_keep_source(job)? else {
+                return Ok(false);
+            };
+            if self.reconciliation_in_use(&artifact) {
+                drop(guard);
+                continue;
+            }
+            let result = self.set_failure_keep_artifact_locked(job, artifact, keep, false);
+            drop(guard);
+            return result;
+        }
+    }
+
+    /// Block until no reconciliation/namespace use holds `artifact`'s
+    /// current generation. Call without the mutation guard.
+    pub(super) fn wait_reconciliation_released(&self, artifact: &Artifact) {
+        let key = (artifact.id.clone(), artifact.generation.clone());
+        let mut uses = self.reconciliation_uses.lock().unwrap();
+        while uses.contains(&key) {
+            uses = self.reconciliation_released.wait(uses).unwrap();
+        }
     }
 
     fn set_failure_keep_artifact_locked(
@@ -2069,6 +3313,9 @@ impl Inventory {
             }
             save_artifact(&tx, &artifact)?;
             if !keep {
+                if !existing_only {
+                    Self::wake_relocation_cleanup(&tx, &artifact.id, &artifact.generation)?;
+                }
                 // Read the mutable cleanup columns directly. The serialized
                 // Delivery is the immutable receipt snapshot and may lag a
                 // worker's latest cleanup status.
@@ -2147,6 +3394,7 @@ impl Inventory {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
         save_artifact(&tx, &artifact)?;
+        Self::wake_relocation_cleanup(&tx, &artifact.id, &artifact.generation)?;
         event(&tx, artifact_id, "failure_assessment", disposition)?;
         tx.commit()?;
         Ok(artifact)
@@ -2187,10 +3435,10 @@ impl Inventory {
         }
         let mut a = self.get(key)?;
         a.hold = None;
-        a.eligible_seconds = 0;
         a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
         a.revision += 1;
         save_artifact(&self.db.lock().unwrap(), &a)?;
+        Self::wake_relocation_cleanup(&self.db.lock().unwrap(), &a.id, &a.generation)?;
         Ok(a)
     }
 
@@ -2248,6 +3496,32 @@ impl Inventory {
         failure_keep_guard: bool,
         cancellation_receipt: Option<&str>,
     ) -> Result<Operation> {
+        self.request_delete_with_disposition(
+            key,
+            revision,
+            request_id,
+            undo_seconds,
+            automatic,
+            authority,
+            failure_keep_guard,
+            cancellation_receipt,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_delete_with_disposition(
+        &self,
+        key: &str,
+        revision: u64,
+        request_id: &str,
+        undo_seconds: u64,
+        automatic: bool,
+        authority: Option<(&AttemptUse, &dyn Fn() -> std::io::Result<()>)>,
+        failure_keep_guard: bool,
+        cancellation_receipt: Option<&str>,
+        consumer_disposition: Option<&str>,
+    ) -> Result<Operation> {
         let _guard = self.mutation_guard()?;
         if let Some((_, checkpoint)) = authority {
             checkpoint()?;
@@ -2259,6 +3533,13 @@ impl Inventory {
             ));
         }
         let a = self.get(key)?;
+        if self.open_intent_for_artifact(&a.id)? {
+            // Contract §2.5: neither side of an open per-file move may be
+            // claimed until restart reconciliation finishes or unwinds it.
+            return Err(Error::Conflict(
+                "an open publication move owns this source; reconciliation must finish or unwind it first".into(),
+            ));
+        }
         let explicit_cancellation = cancellation_receipt
             .map(|receipt| self.cluster_cancellation_delete_accepted(&a.id, &a.generation, receipt))
             .transpose()?
@@ -2270,7 +3551,30 @@ impl Inventory {
                 "explicit cancellation lacks its exact durable receipt".into(),
             ));
         }
-        let request = if let Some(receipt) = cancellation_receipt {
+        let explicit_consumer = consumer_disposition
+            .map(|id| self.disposition_keep_override(id, &a))
+            .transpose()?
+            .unwrap_or(false);
+        if consumer_disposition.is_some()
+            && (!explicit_consumer
+                || cancellation_receipt.is_some()
+                || automatic
+                || failure_keep_guard
+                || undo_seconds != 0)
+        {
+            return Err(Error::Conflict(
+                "disposition lacks explicit authority for this kept source".into(),
+            ));
+        }
+        let request = if let Some(id) = consumer_disposition {
+            serde_json::to_string(&DeleteRequest::Consumer(ConsumerDeleteBinding {
+                artifact: key.into(),
+                generation: a.generation.clone(),
+                revision,
+                disposition_id: id.into(),
+                owned_selection: self.cluster_cancellation_delete_binding(&a)?,
+            }))?
+        } else if let Some(receipt) = cancellation_receipt {
             serde_json::to_string(&(
                 key,
                 revision,
@@ -2313,7 +3617,7 @@ impl Inventory {
         if a.revision != revision
             || (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
             || !a.owned
-            || (a.keep && !explicit_cancellation)
+            || (a.keep && !(explicit_cancellation || explicit_consumer))
             || a.hold.is_some()
             || !matches!(
                 a.state.as_str(),
@@ -2349,6 +3653,7 @@ impl Inventory {
         save_operation(&tx, &op)?;
         event(&tx, key, "delete_requested", request_id)?;
         tx.commit()?;
+        self.invalidate_source_writer_naming(&a.id, &a.generation);
         Ok(op)
     }
     pub fn cancel_delete(&self, key: &str) -> Result<Operation> {
@@ -2417,7 +3722,18 @@ impl Inventory {
         }
         let request: DeleteRequest = serde_json::from_str(&op.request)?;
         let (_, revision, _, automatic, generation) = request.fields();
-        let explicit_cancellation = if let DeleteRequest::ClusterCancellation((
+        let explicit_cancellation = if let DeleteRequest::Consumer(consumer) = &request {
+            if !self.disposition_keep_override(&consumer.disposition_id, &a)?
+                || self.cluster_cancellation_delete_binding(&a)? != consumer.owned_selection
+            {
+                op.state = "review".into();
+                op.error =
+                    Some("confirmed disposition no longer matches the exact owned source".into());
+                save_operation(&self.db.lock().unwrap(), &op)?;
+                return Ok(op);
+            }
+            true
+        } else if let DeleteRequest::ClusterCancellation((
             _,
             _,
             _,
@@ -2479,27 +3795,22 @@ impl Inventory {
         }
         if op.attempts == 0
             && ((a.revision != revision && !explicit_cancellation)
-                || (automatic
-                    && (!self.settings()?.enabled
-                        || !a.eligible()
-                        || a.eligible_seconds < a.retention_seconds
-                        || !a.deadline.is_some_and(|d| d <= now()))))
+                || (automatic && (!a.eligible() || !a.deadline.is_some_and(|d| d <= now()))))
         {
             op.state = "cancelled".into();
             op.error = Some("deletion authorization changed; a fresh request is required".into());
             save_operation(&self.db.lock().unwrap(), &op)?;
             return Ok(op);
         }
-        if (self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard))
-            || (a.keep && !explicit_cancellation)
-            || a.hold.is_some()
-            || !a.owned
-        {
+        if self.artifact_in_use(&a)? && !self.authorized_processing_use(&a, use_guard) {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+        }
+        if (a.keep && !explicit_cancellation) || a.hold.is_some() || !a.owned {
             return Err(Error::Conflict("payload acquired a hold".into()));
         }
         _lease = self
             .reserve_reconciliation_locked(std::slice::from_ref(&a), use_guard, &guard)?
-            .ok_or_else(|| Error::Conflict("deletion custody is already active".into()))?;
+            .ok_or_else(|| Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))?;
         op.state = "running".into();
         op.attempts += 1;
         a.state = "deleting".into();
@@ -2547,7 +3858,7 @@ impl Inventory {
                     a.hold = Some("review".into());
                 }
                 let delay = if a.automatic_cleanup_eligible {
-                    [30, 60, 120, 300][(op.attempts.saturating_sub(1) as usize).min(3)]
+                    retry_delay(op.attempts)
                 } else {
                     [60, 300, 1800, 21600][(op.attempts.saturating_sub(1) as usize).min(3)]
                 };
@@ -2575,7 +3886,10 @@ impl Inventory {
         let root = self.verify_root(a)?;
         if attempts > 1 {
             match std::fs::symlink_metadata(&a.path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::sync_directory(&root)?;
+                    return Ok(());
+                }
                 Err(e) => return Err(e.into()),
                 Ok(_) => (),
             }
@@ -2642,82 +3956,67 @@ impl Inventory {
             return Err(Error::Conflict("payload directory replaced".into()));
         }
         fs::unlink(&root, Path::new(a.path.file_name().unwrap()), true)?;
+        fs::sync_directory(&root)?;
         Ok(())
     }
 
-    /// Count only daemon monotonic uptime observed while eligible. Reset the
-    /// checkpoint before the transaction: a failed commit loses time safely.
+    /// Failed-payload expiry is a wall-clock deadline (W3): it survives
+    /// restarts and does not wait on daemon uptime or an opt-in toggle.
     pub fn tick(&self) -> Result<()> {
-        let enabled = self.settings()?.enabled;
-        let mut due = Vec::new();
-        {
-            let _guard = self.mutation_guard()?;
-            let mut db = self.db.lock().unwrap();
-            let tx = db.transaction()?;
-            let raws = {
-                let mut stmt =
-                    tx.prepare("SELECT data FROM artifacts WHERE state IN ('parked_failed','recovery_imported')")?;
-                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            let mut active_clocks = std::collections::HashSet::new();
-            for raw in raws {
-                let mut a: Artifact = serde_json::from_str(&raw)?;
-                active_clocks.insert(a.id.clone());
-                if enabled && a.eligible() {
-                    let elapsed = {
-                        let mut clocks = self.clocks.lock().unwrap();
-                        let point = clocks
-                            .entry(a.id.clone())
-                            .or_insert((a.revision, Instant::now()));
-                        let elapsed = if point.0 == a.revision {
-                            point.1.elapsed().as_secs()
-                        } else {
-                            0
-                        };
-                        *point = (a.revision, Instant::now());
-                        elapsed
-                    };
-                    a.eligible_seconds = a
-                        .eligible_seconds
-                        .saturating_add(elapsed)
-                        .min(a.retention_seconds);
-                    save_artifact(&tx, &a)?;
-                    if a.eligible_seconds >= a.retention_seconds
-                        && a.deadline.is_some_and(|d| d <= now())
-                    {
-                        due.push((a.id.clone(), a.revision));
-                    }
-                } else {
-                    self.clocks.lock().unwrap().remove(&a.id);
+        self.tick_with_history(None)
+    }
+
+    /// History is used only to repair missing receipts for confirmed queue
+    /// deletions. Normal ownership, generation and payload deletion checks stay
+    /// in the inventory journal, independent of history retention.
+    pub fn tick_with_history(&self, history: Option<&crate::history::HistoryDb>) -> Result<()> {
+        self.drain_writer_naming();
+        let due = {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db.prepare(
+                "SELECT data FROM artifacts WHERE state IN ('parked_failed','recovery_imported')",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut due = Vec::new();
+            for raw in rows {
+                let a: Artifact = serde_json::from_str(&raw?)?;
+                if a.eligible() && a.deadline.is_some_and(|d| d <= now()) {
+                    due.push((a.id, a.revision));
                 }
             }
-            self.clocks
-                .lock()
-                .unwrap()
-                .retain(|key, _| active_clocks.contains(key));
-            tx.commit()?;
-        }
+            due
+        };
         for (key, revision) in due {
-            if let Err(e) = self.request_delete_authorized(
-                &key,
-                revision,
-                &format!("retention-{key}-{revision}"),
-                0,
-                true,
-            ) {
+            // A request id is at most 128 bytes; Runner's own derived rows
+            // (`source-move-…`, `scratch-…`) have ids longer than that, and
+            // their retention was refused on every tick. Those get a digest.
+            let mut request = format!("retention-{key}-{revision}");
+            if request.len() > 128 {
+                use sha2::Digest as _;
+                request = format!("retention-{:x}", sha2::Sha256::digest(request.as_bytes()));
+            }
+            if let Err(e) = self.request_delete_authorized(&key, revision, &request, 0, true) {
                 tracing::warn!(artifact=%key,error=%e,"expiry changed before admission");
             }
         }
         self.run_due_deletes()?;
         self.reconcile_due_relocations()?;
-        self.reconcile_workspace_retirements()?;
+        self.reconcile_workspace_retirements_with_history(history)?;
         self.run_workspace_retirements()?;
         self.reconcile_recoveries()?;
+        if let Err(error) = self.exit_wedged_states(exits::HOLD_EXIT_SECONDS, true) {
+            tracing::warn!(%error, "automatic exits for review/retained states deferred");
+        }
         self.schedule_discovery()?;
         self.run_tasks()?;
         self.reconcile_missing()?;
         self.compact()?;
+        // Last, so it never delays the ordered retention, relocation and
+        // recovery steps above. Its failed-delete operations run on the next
+        // tick's run_due_deletes.
+        if let Err(error) = self.reconcile_empty_failed_sources() {
+            tracing::warn!(%error, "empty failed-source reconciliation did not complete");
+        }
         Ok(())
     }
     /// Execute every delete whose undo window has closed. Part of the
@@ -2844,10 +4143,12 @@ impl Inventory {
             updated_at: now(),
             retention_seconds: 86400,
             deadline: None,
-            eligible_seconds: 0,
             files: fs::manifest(&dir, 100_000)?,
             error: None,
             inspected_at: Some(now()),
+            salvage: None,
+            failure_reason: None,
+            gone_reason: None,
         };
         self.sidecar(&a)?;
         let _coordinator = self.mutation_guard()?;
@@ -2889,9 +4190,19 @@ impl Inventory {
         };
         for raw in raws {
             let mut a: Artifact = serde_json::from_str(&raw)?;
-            a.hold = Some("restored backup: review required".into());
+            // Finding 8: record the Keep the row had, so releasing the
+            // quarantine restores it instead of leaving Keep on everything.
+            // A row already quarantined keeps its first record.
+            if a.hold.as_deref() != Some(exits::RESTORE_HOLD) {
+                event(
+                    &tx,
+                    &a.id,
+                    "restore_quarantine",
+                    if a.keep { "keep=true" } else { "keep=false" },
+                )?;
+            }
+            a.hold = Some(exits::RESTORE_HOLD.into());
             a.keep = true;
-            a.eligible_seconds = 0;
             a.deadline = None;
             a.revision += 1;
             save_artifact(&tx, &a)?;
@@ -2942,6 +4253,38 @@ mod identity_preflight_tests {
                 (entry.file_name(), std::fs::read(entry.path()).unwrap())
             })
             .collect()
+    }
+
+    /// R3 / W5b: neither state database ever has a `-shm`; a truncated one
+    /// left by an older build (the nuc3 SIGBUS) is never mapped.
+    #[test]
+    fn state_databases_run_without_shm_even_over_a_truncated_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(tmp.path()).unwrap();
+        inventory
+            .configure_scan(serde_json::json!({"roots": []}))
+            .unwrap();
+        assert!(!tmp.path().join("artifacts.sqlite-shm").exists());
+        inventory.close().unwrap();
+        drop(inventory);
+        std::fs::write(tmp.path().join("artifacts.sqlite-shm"), b"abc").unwrap();
+        let history_path = tmp.path().join("history.sqlite");
+        let history = crate::history::HistoryDb::open(&history_path, None).unwrap();
+        drop(history);
+        std::fs::write(tmp.path().join("history.sqlite-shm"), b"abc").unwrap();
+        let inventory = Inventory::open(tmp.path()).unwrap();
+        inventory
+            .configure_scan(serde_json::json!({"roots": []}))
+            .unwrap();
+        let history = crate::history::HistoryDb::open(&history_path, None).unwrap();
+        assert_eq!(history.count_filtered(true).unwrap(), 0);
+        for shm in ["artifacts.sqlite-shm", "history.sqlite-shm"] {
+            assert_eq!(
+                std::fs::read(tmp.path().join(shm)).unwrap(),
+                b"abc",
+                "{shm} untouched"
+            );
+        }
     }
 
     #[test]

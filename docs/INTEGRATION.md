@@ -1,35 +1,59 @@
-# Integration — nzbd's seams with monarr and plurx, and how to prove they work
+# Integration — runner's seam with curator and cinema
 
-Companion to [INTEGRATION_PLAN.md](INTEGRATION_PLAN.md) (the event/cursor
-contract and how it was built) — this is *what each seam does, where you look
-at it, and the exact command that proves it*. For connecting the classic *arr
-apps over the NZBGet-compatible shim, see
-[USAGE.md](USAGE.md); for every config key, [CONFIGURATION.md](CONFIGURATION.md).
+**Status:** current for runner 0.6.0 (pipeline contract v2, M6b) · **Written
+from:** [PIPELINE_CONTRACT.md](PIPELINE_CONTRACT.md) and the shipped code
+(`crates/nzbd-api/src/lib.rs` `event_json`, the handlers named per section) ·
+**Updated:** 2026-11-08
 
-nzbd is the **first stage** of a three-application pipeline. It downloads and
-post-processes; it never decides what to download and never touches the
-library. Everything it knows about the other two applications, it learned by
-being called.
+This page is the reference for what runner (nzbd) promises the two
+applications downstream of it — curator (monarr) and cinema (plurx) — in wire
+terms, where you look at each seam, and the command that proves it. The
+contract is the design and its rationale; this page is what the build does.
+Every event name, field name and status string below was read from the code;
+`crates/nzbd-api/src/lib.rs` `integration_doc_names_every_sse_event` fails
+when the event tables here and `event_json` disagree.
+
+Since 0.6.0 (M6b) the event no longer carries `pp_status`/`final_dir`, the
+deliveries feed no longer takes `includeAccepted`, and the stored delivery
+row no longer carries the v1 `status`; a curator older than M2 is not
+supported. Fields still marked **deprecated** are sent until a later
+release removes them.
+
+For connecting the classic \*arr apps over the NZBGet-compatible shim, see
+[USAGE.md](USAGE.md); for every config key, [CONFIGURATION.md](CONFIGURATION.md);
+for retention, parking and recovery of bytes, [FILE_LIFECYCLE_OPERATIONS.md](FILE_LIFECYCLE_OPERATIONS.md).
+
+The contract in three sentences: **runner emits exactly one terminal fact per
+job, before it does anything else with the bytes**; curator drives its
+download row from runner's event stream and uses the poll only to catch what
+the stream missed; curator tells cinema what landed. Runner never calls
+curator or cinema.
 
 ## The pipeline
 
 ```
-   ┌───────────────┐     grab (params: monarr-transfer)     ┌──────────────┐
-   │               │  ────────────────────────────────────▶ │              │
-   │    monarr     │                                        │     nzbd     │
-   │  (decides)    │  ◀──────────────────────────────────── │ (downloads)  │
-   │               │   SSE /api/v1/events  ·  30s poll      │              │
-   └───────┬───────┘                                        └──────────────┘
-           │                                                  no outbound
-           │ POST /api/v1/scan (correlation_id = transfer)     HTTP. ever.
+   ┌───────────────┐   POST /api/v1/jobs (params: monarr-transfer)   ┌──────────────┐
+   │               │  ─────────────────────────────────────────────▶ │              │
+   │    curator    │                                                 │    runner    │
+   │  (decides)    │  ◀───────────────────────────────────────────── │ (downloads)  │
+   │               │   SSE /api/v1/events · /history · /deliveries   │              │
+   └───────┬───────┘                                                 └──────────────┘
+           │ reads <completed>/<publication>/.runner-manifest.json     no outbound
+           │ POST /api/v1/scan (correlation_id = transfer)             HTTP. ever.
            ▼
    ┌───────────────┐
-   │     plurx     │        nzbd and plurx never speak.
-   │   (plays it)  │        There is no seam between them, by design.
+   │    cinema     │        runner and cinema never speak.
+   │   (plays it)  │
    └───────────────┘
 ```
 
-Default ports: **nzbd 6789** · monarr 7676 · plurx 32400.
+Default ports: **runner 6789** · curator 7676 · cinema 32400.
+
+| Path | Owner | Exit |
+|---|---|---|
+| `/processing/<job>` | runner | a publication, or a terminal failure → disposal (§5), after any salvage obligation settles |
+| `/processing/failed/<job>` (`[post] failed_dir`) | runner | retention (`failed_retention_days`) or explicit delete; never gates curator |
+| `<completed>/<publication>` | curator, from the moment `.runner-manifest.json` exists | per file, by curator; runner never deletes under `<completed>` |
 
 ## Wiring the three together in Docker
 
@@ -56,7 +80,7 @@ networks:
     external: true                   # created above; compose must not own it
 ```
 
-`docker compose up -d` in each directory. Monarr's nzbd client then points at
+`docker compose up -d` in each directory. Curator's nzbd client then points at
 host `nzbd`, port `6789` — no `host.docker.internal`, no published-port
 arithmetic.
 
@@ -97,197 +121,586 @@ does nothing for anyone else. That setting belongs on the *caller*, which is
 why the shared network is the cleaner answer: it is one fact configured once
 instead of the same fact configured per-container and easy to get half-right.
 
-## The seams nzbd has
+## The seams runner has
 
-| # | Seam | Direction | Transport | Who starts it |
-|---|---|---|---|---|
-| 1 | Native job API | inbound | HTTP `/api/v1/*` | monarr |
-| 2 | Event stream | inbound (held open) | SSE `/api/v1/events` | monarr |
-| 3 | Transfer-id passthrough | inbound → echoed back | job `params` | monarr |
-| 4 | Status / capacity | inbound | HTTP `/api/v1/status` | monarr |
-| 5 | Client registry | observation | HTTP `/api/v1/clients` | you |
-| 6 | Handoff column | observation | HTTP `/api/v1/history` | you |
-| 7 | NZBGet compat shim | inbound | JSON-RPC / XML-RPC | Sonarr/Radarr/Lidarr |
+| § | Seam | Direction | Transport |
+|---|---|---|---|
+| 1 | Native job API — submit, control, admission lookup | curator → runner | HTTP `/api/v1/jobs`, `/api/v1/request-admissions/{token}` |
+| 2 | Event stream — terminals, status, salvage | runner → curator (held open by curator) | SSE `/api/v1/events` |
+| 3 | History cursor — the terminal reconciliation feed | curator reads | HTTP `/api/v1/history` |
+| 4 | Publication, manifest, reconciliation feed | runner writes on disk, curator reads | `.runner-manifest.json`, HTTP `/api/v1/deliveries` |
+| 5 | Failure disposal and the artifact inventory | observation | HTTP `/api/v1/artifacts` |
+| 6 | Transfer-id passthrough | curator → runner → curator | job `params` |
+| 7 | Status / capacity | curator reads | HTTP `/api/v1/status` |
+| 8 | Client registry | observation | HTTP `/api/v1/clients` |
+| 9 | Handoff column | observation | HTTP `/api/v1/history` |
+| 10 | NZBGet compat shim | Sonarr/Radarr/Lidarr → runner | JSON-RPC / XML-RPC |
 
-**nzbd makes no outbound HTTP calls to monarr or plurx, and gains none.**
-That is a standing guardrail, not an omission. A downloader that reaches out
-to its consumers is a downloader that can hang on their outages, and nzbd's
-job is to keep the disk moving. Everything below is either something done
-*to* nzbd, or something nzbd wrote down while it was being done.
+**Runner makes no outbound HTTP calls to curator or cinema, and gains none.**
+A downloader that reaches out to its consumers can hang on their outages;
+everything below is something done *to* runner, or something runner wrote
+down while it was being done.
 
----
-
-## 1. Native job API — "download this, and let me manage it"
-
-**What it does.** monarr's `nzbd (native)` download client drives the queue
-over nzbd's own REST API rather than the NZBGet-compatible shim. Same
-downloads, richer surface: job params (§3), a real event stream (§2), and a
-status endpoint monarr reads for capacity (§4).
-
-**Wire.** Base URL is the client's configured URL, trailing slash trimmed.
-
-| Purpose | Method | Path |
-|---|---|---|
-| Add | `POST` | `/api/v1/jobs?url=…&category=…&params=…` |
-| Queue | `GET` | `/api/v1/jobs` |
-| History | `GET` | `/api/v1/history?limit=100` |
-| Remove from queue | `POST` | `/api/v1/jobs/{id}/actions/delete`, `…/delete-files` |
-| Remove from history | `POST` | `/api/v1/history/{id}/actions/delete`, `…/delete-files` |
-| Status | `GET` | `/api/v1/status` |
-
-**Auth.** One `Authorization` header, two shapes. A bearer token
-(`Authorization: Bearer <api.token>`) when monarr's client has a password and
-no username; HTTP Basic otherwise. Auth is enforced **only** when `api.token`
-or `api.password` is set in `nzbd.toml` — with neither, every endpoint is
-open. `/healthz` is always exempt; **`/metrics` is not.**
-
-**Identity.** Every call carries `X-Nzbd-Client: monarr/<version>`. nzbd
-prefers that header over the User-Agent when naming a client (§5), which is
-why monarr shows up by name rather than as `Go-http-client/1.1`.
-
-**Where you see it.**
-
-- **nzbd → History tab → the client strip** above the table. A working monarr
-  is a chip reading `monarr/<version> · polling · 12s ago`, or
-  `· subscribed · 3s ago` when push is on.
-- **monarr → Settings → Download clients**, per-row **Test** button →
-  `✓ reachable` or `✕ <message>`.
-- **monarr → System → Connections**, row kind `download client`, state
-  `polling` or `live`.
-
-**How to verify.**
+**Auth.** One `Authorization` header: `Bearer <api.token>`, or HTTP Basic
+with `api.password`. Enforced only when `api.token` or `api.password` is set
+in `nzbd.toml`. `/healthz` is always exempt; `/metrics` is not. Every curator
+call carries `X-Nzbd-Client: monarr/<version>`, which names it in the client
+registry (§8).
 
 ```bash
 NZBD=http://127.0.0.1:6789
-TOK=<api.token from nzbd.toml>          # or use  -u nzbd:<api.password>
-
-curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/status"   # the probe monarr runs
-curl -sS "$NZBD/healthz"                                          # -> the literal: ok
+TOK=<api.token from nzbd.toml>
 ```
-
-> **Extractors lie, and one of them shipped in this image.** `unrar-free` —
-> the GPL clone Debian installs for `unrar` — cannot handle multi-volume
-> archives and does not say so: given volume 1 of a five-volume set with every
-> volume present, it extracts volume 1, prints `All OK`, and exits 0. Nearly
-> every release above a few hundred megabytes is multi-volume, so the result
-> was a 48 GiB film delivered as its first 500 MiB and reported as a completed
-> download. Fixed 2026-07: the image no longer installs it, the RAR path falls
-> back to 7-Zip when the configured extractor under-delivers, and the unpack
-> is checked against the volume set's own size before anything is committed.
-> If you built an older image, `docker compose up -d --build` is the fix.
-
-**How to read it.** `/api/v1/status` answering with a `version` field is the
-whole of "nzbd is really there" — monarr treats a 200 with no `version` as a
-hard failure (`nzbd: … answered, but not like nzbd`), because a reverse proxy
-serving an index page will otherwise pass a naive reachability test. A 401
-means the token is wrong; a connection refused means the URL or port is.
 
 ---
 
-## 2. Event stream — the reason an import is instant instead of 30s late
+## 1. Native job API
 
-**What it does.** `GET /api/v1/events` is a Server-Sent Events stream. monarr
-holds it open when the client's **Live updates** checkbox is on
-(`download_clients.mode = 'push'`), and imports the moment post-processing
-finishes instead of on the next poll.
+| Purpose | Method | Path |
+|---|---|---|
+| Add (NZB body, or `?url=`) | `POST` | `/api/v1/jobs?url=…&name=…&category=…&priority=…&paused=…&dupe_key=…&dupe_score=…&params=…` |
+| Queue | `GET` | `/api/v1/jobs` |
+| One job | `GET` | `/api/v1/jobs/{id}` |
+| Action (`pause`, `resume`, `delete`, `delete-files`, …) | `POST` | `/api/v1/jobs/{id}/actions/{action}` |
+| Retry now (a hold, or an NZB fetch waiting on its backoff) | `POST` | `/api/v1/jobs/{id}/retry` |
+| Keep the source if it fails | `GET`/`PUT` | `/api/v1/jobs/{id}/failure-keep` (`{"keep": true}`) |
+| Stop and dispose an exact admitted job | `POST` | `/api/v1/jobs/{id}/disposition` |
+| Admission lookup by transfer | `GET` | `/api/v1/request-admissions/{token}` |
+| Status | `GET` | `/api/v1/status` |
 
-**Wire.** Each engine frame carries `id: <boot>-<seq>`; a reconnect sends
-`Last-Event-ID: <boot>-<seq>` and nzbd replays from the `RING = 1024` buffer,
-or answers `reset` if the boot id changed or the cursor fell out of the ring.
+**`params`** is a URL-encoded JSON object of string → string. The keys
+curator uses:
 
-Event names nzbd emits: `job_added` · `job_finished` · `job_deleted` ·
-`file_finished` · `segment_exhausted` · `server_blocked` ·
-`queue_pause_changed` · `speed_limit_changed` · `job_assigned` ·
-`job_pp_stage` · `job_pp_finished`, plus the stream-level frames `reset` ·
-`lagged` · `tick` · `hb` · `log`.
+| Param | Meaning |
+|---|---|
+| `monarr-transfer` | the transfer token — opaque, compared by exact equality; also the request token that makes `POST /api/v1/jobs?url=` idempotent and keys `/request-admissions/{token}` |
+| `monarr-delivery` | `1`: the job is published for curator (a publication + manifest + feed row) |
+| `monarr-manual-additional` | `1`: an operator's extra grab; carried through, not interpreted |
 
-monarr acts on exactly six: `job_pp_stage` (step trace), `job_pp_finished`
-(completed or failed, carrying `final_dir`), `job_deleted` (failed, "removed
-in nzbd"), `reset` and `lagged` (both → full queue refresh), and `tick` (one
-progress update per job). **`job_finished` is deliberately ignored** — it
-fires when the download ends, before post-processing, and importing then would
-import an unrepaired, unextracted directory.
+Keys starting with `*` are runner's own and are refused.
 
-For NZB and URL jobs, the queue's `status: "completed"` establishes only
-**article download complete**. The row keeps that status after post-processing,
-so the status alone never establishes payload readiness. `ready` is the
-authoritative boundary. A native consumer may import only after `ready: true`,
-using `final_dir` from `job_pp_finished` or the durable history row; a queue row
-does not carry an import path. Failed post-processing is terminal (`pp_done:
-true`) but never ready; its history row may still name a parked directory, which
-is evidence for recovery, not an importable payload.
+**Queue rows** (`GET /api/v1/jobs`) carry `status` (the persisted status:
+`queued` · `fetching` · `downloading` · `paused` · `held` · `post_queued` ·
+`post_processing` · `completed` · `failed` · `deleted`; `paused` is a
+person's pause, `held` an environmental hold — §2.3), `status_projected`
+(the same value since 0.6.0; kept for consumers that read it), `transfer`,
+`control` (§2.3) and `ready`. `completed` alone means the
+articles finished downloading, not that a payload is importable: import on
+`job_pp_finished{outcome: completed}` (§2.1) or the history row, never on the
+queue status.
 
-**Where you see it.**
+**`GET /api/v1/request-admissions/{token}`** answers the durable receipt of a
+token-scoped admission (it outlives the queue and history rows). Its two
+jobs: "did my `POST /jobs` with this token land, and as which job id", and
+"what happened to this transfer" after a history continuity loss (§3). It is
+never consulted to settle a terminal in normal operation.
 
-- **nzbd → History tab → client strip**: the chip reads `subscribed` (or
-  `subscribed ×N`) and gets the `live` class. Its tooltip ends
-  `· receiving events live`.
-- **monarr → System → Connections**: state `live`, tooltip *"A push stream is
-  open — completions arrive the moment they happen"*. If push is configured
-  but the stream is down, the state falls back to `polling` with the detail
-  `push is configured but the stream is not connected`.
-- **monarr → Settings → Download clients**: the per-row `live` / `poll` pill.
-  That pill is an **echo of stored config**, not a probe — it says what you
-  asked for, Connections says what you got.
-
-**How to verify.**
+| Receipt field | Meaning |
+|---|---|
+| `protocolVersion`, `requestToken`, `jobId`, `generation`, `runnerInstanceId`, `submissionSha256` | identity of the admission |
+| `outcome` | the admission's outcome (the continuity-loss lookup): the job's queue status while it is queued — `fetching` · `queued` · `downloading` · `paused` · `held` (since 0.6.0; a hold read `paused` before) · `post_queued` · `post_processing` · `completed` · `failed` — then `completed`, `failed` or `deleted` once it leaves the queue |
+| `terminalOutcome`, `failureStage`, `failureCause` | the terminal's history status string and failure detail |
+| `failureReason`, `fetchCause`, `blamesRelease`, `salvage` | the typed terminal (§2.2), from the `Failure:Reason` / `Failure:FetchCause` / `Failure:BlamesRelease` / `Failure:Salvage` params |
+| `publicationPath`, `sourceArtifactId`, `sourceGeneration`, `keepSourceOnFailure` | where the bytes went |
+| `custodyState`, `sourceCleanupStatus` | **deprecated** (OpenAPI `deprecated: true`) — runner never holds bytes for curator, and source cleanup gates nothing; still sent (their removal takes the receipt custody tracking with it and is not in 0.6.0) |
 
 ```bash
-curl -sSN -H "Authorization: Bearer $TOK" \
-     -H "Accept: text/event-stream" \
-     -H "X-Nzbd-Client: curl/manual" \
-     "$NZBD/api/v1/events"
-# then, in the UI, pause/resume the queue — you should see queue_pause_changed
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/status"        # the probe curator runs
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/request-admissions/<transfer>"
+curl -sS "$NZBD/healthz"                                               # -> the literal: ok
 ```
 
-Your `curl/manual` chip will appear in the client strip as `subscribed` within
-a second, which also proves the registry (§5) is live.
+`/api/v1/status` answering with a `version` field is the whole of "runner is
+really there"; curator treats a 200 without `version` as a hard failure.
 
-**How to read it.** The stream is **never load-bearing**. The 30 s
-`queue.refresh` poll runs in push mode too, so a dead stream costs you latency
-and nothing else. monarr reconnects forever with `1s → 60s` jittered backoff
-and injects a synthetic reset on every reconnect, because a gap in the stream
-is a gap in knowledge regardless of why it happened. `live` going to `polling`
-is a performance regression, not an outage.
+### Dispose a job by admission
+
+When `GET /api/v1/status` includes `job-disposition-v1`, use the admission
+receipt to bind a confirmed Delete to a Runner instance, transfer and job
+generation. The endpoint uses the native job API's authentication. The
+request ID belongs to this Delete and must survive retries and restarts.
+
+```http
+POST /api/v1/jobs/42/disposition
+Content-Type: application/json
+Authorization: Bearer <token>
+
+{
+  "requestId": "delete-6ed8cac3-147e-4263-8099-b87bff4d3543",
+  "action": "delete",
+  "transfer": "t-42-7d94",
+  "runnerInstanceId": "runner-storage-instance",
+  "generation": "admission-generation",
+  "sourceArtifactId": "owned-source",
+  "sourceGeneration": "source-generation"
+}
+```
+
+Send both source fields when the admission receipt supplies them. Leave both
+out before a source is known. Runner compares the job, transfer, instance,
+admission and source in its write path. A new source requires its own
+admission-bound evidence, even if it occupies the same numeric job ID.
+
+Replay the identical request to reconcile the disposition. Each reply carries
+`requestId`, `jobId` (as a string), `transfer`, `runnerInstanceId`,
+`generation`, `state`, and optional `reason` and `operationId`.
+
+| HTTP | State or error | Client behavior |
+|---|---|---|
+| 202 | `pending` | Runner saved the request. Continue polling while writers or file operations settle. |
+| 200 | `blocked` | Keep the request visible with its reason. Replay after the reported prerequisite changes. |
+| 200 | `verified` | The transfer has stopped and its recorded Runner-owned disposal obligations have settled. |
+| 409 | Conflicting identity or reused request ID | Stop the destructive request and reconcile the admitted generation. |
+| 429 | `pending` while the owner is busy before this reply can confirm admission | Retry the same request with backoff. |
+| 503 | Authority or storage is temporarily unavailable | Replay the same request to learn whether it committed. |
+
+The delete receipt is separate from a job terminal. Runner records cancellation
+for stopped live work and preserves an existing failed or completed terminal
+and its history. Runner leaves consumer publications and independent native
+torrent seed jobs with their owners. The existing artifact executor checks
+the exact source, mount and manifest and retains sources whose evidence or
+recovery custody still needs review. The ordinary numeric actions remain
+available for their existing queue and History semantics. Clients must require
+the new capability for the confirmed disposition flow.
 
 ---
 
-## 3. Transfer-id passthrough — one id from grab to playable
+## 2. Event stream
 
-**What it does.** monarr mints `t-<downloadID>-<6 hex>` at grab time and hands
-it to nzbd as a job parameter. nzbd stores it, returns it on history entries
-and in the `job_pp_finished` payload, and **re-attaches it when a history
-entry is requeued** — the id that names a transfer has to survive an undo.
+`GET /api/v1/events` is a Server-Sent Events stream. Each engine fact carries
+`id: <boot>-<seq>`; a reconnect sends `Last-Event-ID: <boot>-<seq>` and runner
+replays from its ring (`RING = 1024` frames), or answers `reset` when the
+boot id changed or the cursor fell out of the ring. The stream is never the
+only path: the history cursor (§3) and the deliveries feed (§4) recover
+everything it can miss, and curator's cursor is owned by the history reader,
+never advanced by an SSE frame.
 
-**Wire.** `POST /api/v1/jobs?…&params={"monarr-transfer":"t-42-a3f9c1"}` —
-a URL-encoded JSON object of string→string. `parse_add_params` rejects
-`*`-prefixed keys; that namespace is nzbd's own (`*URL`). The value lands in
-`HistoryEntry.params`.
+### Event reference
 
-The same id continues past nzbd: monarr writes it to `downloads.transfer` and
-sends it to plurx as `correlation_id` on `POST /api/v1/scan`. One grep across
-three applications reconstructs a transfer.
+Engine facts — exactly the names `event_json` emits, each with an `id:`
+(checked by `integration_doc_names_every_sse_event`):
 
-**Where you see it.** nzbd's UI does not render `params`. Read it from the
-API, or from monarr's **Activity** page, where the handoff detail shows the
-step trace and the id.
+| Event | Payload | Meaning |
+|---|---|---|
+| `job_pp_finished` | §2.1 | **the terminal** — once per job, after it is durable, before anything touches the bytes |
+| `job_status_changed` | `{job, transfer, status, stage, control}` | every status transition, including into and out of `held` (§2.4) |
+| `job_publication_ready` | `{job, transfer, publication}` | a salvage publication of a failed job (§2.2); not a terminal |
+| `job_control_changed` | `{job, control}` | every write of the job's hold/control record (§2.3) |
+| `job_added` | `{job, name}` | a job entered the queue |
+| `job_finished` | `{job, name, status, health}` | the download phase ended; post-processing may follow. **Advisory** — never import on it |
+| `job_deleted` | `{job}` | the queue row is gone. **Advisory** — the cancel terminal is `job_pp_finished{outcome: cancelled}` |
+| `job_pp_stage` | `{job, name, stage}` | a post-processing stage started (`stage` is a `PostStage` name, below) |
+| `job_assigned` | `{job, node}` | cluster: a job was leased to a node |
+| `url_fetch_resolved` | `{job}` | a URL job's NZB was fetched and the job resolved |
+| `file_finished` | `{job, file, filename, ok}` | one file of a job finished |
+| `segment_exhausted` | `{job, file, segment}` | an article ran out of servers |
+| `server_blocked` | `{server, seconds}` | a news server was blocked for `seconds` |
+| `queue_pause_changed` | `{paused, source}` | downloading was paused or resumed |
+| `post_pause_changed` | `{paused, source}` | post-processing was paused or resumed (independent of downloads) |
+| `speed_limit_changed` | `{bytes_per_sec}` | the speed limit changed |
+| `max_active_downloads_changed` | `{n}` | the concurrency limit changed |
 
-**How to verify.**
+Stream frames — local to one connection, no `id:`, never replayed:
+
+| Frame | Payload | Meaning |
+|---|---|---|
+| `tick` | `{status, jobs}` | 1 Hz progress snapshot, sent only when it changed |
+| `hb` | `{now_unix}` | heartbeat when an idle stream sent nothing for a while |
+| `storage_io` | `{storage: [{path, io}]}` | per-filesystem read/write throughput, 1 Hz when changed; `io.source` is `block` (device-wide), `nfs` (this host's traffic), `runner` (Runner's own I/O where the kernel keeps no counters) or `stale`; only with `?storage_io=1`, and not counted as stream activity (an idle stream still gets `hb`). `tick` omits `io` from its storage rows; `/api/v1/status` carries it |
+| `log` | `{entries, dropped}` | new log lines |
+| `reset` | `{reason}` | the resume cursor could not be honoured; reconcile from §3 |
+| `lagged` | `{skipped}` | this connection fell behind; frames were skipped |
+
+`stage` values (`PostStage`): `par_rename` · `par_verify` · `par_repair` ·
+`rar_rename` · `unpack` · `cleanup` · `move` · `post_unpack_rename` ·
+`script` · `publication_verify`.
+
+### 2.1 The terminal — `job_pp_finished`
+
+Every job ends in exactly one terminal, and it is durable before it is
+announced: runner writes one `job_terminals` row (with any salvage obligation
+on the artifact, in the same transaction), appends the history row, stamps
+the queue row, and only then emits the event. A crash anywhere in that chain
+is replayed at boot and every 30 s, so a consumer sees the event at least
+once and every copy carries the same `history_seq`. If the terminal or
+history write fails, the job is held `storage_unavailable` on stage
+`persistence` and the event goes out when the write lands.
+
+Three producers: the owner at the end of the download (`health`, `io`), the
+URL fetcher (`fetch`), the post-processor (the PP reasons and `completed`);
+plus the operator delete path, which records `outcome: cancelled` with the
+transfer from the same record as its `DELETED` history row.
+
+In a cluster, the download executor's Failed completion is provisional: it
+carries the producer's typed reason through the sealed completion outbox,
+without local terminal history or a post-completion stamp. The authority
+assigns an unstamped failure a normal post-processing lease. Verification and
+salvage preserve the download failure reason; only the accepted Post result
+records authoritative terminal/history. Consumers continue using the terminal
+event, never the provisional download completion.
+
+| Field | Meaning |
+|---|---|
+| `job`, `name`, `category` | the job |
+| `transfer` | `params["monarr-transfer"]`, or null for a job curator did not add |
+| `outcome` | `completed` · `failed` · `cancelled` |
+| `reason` | `failed` only: `health` · `fetch` · `par` · `unpack` · `script` · `publish` · `io` · `identity` · `hold_expired` (§2.2) |
+| `fetch_cause` | `fetch` only: `gone` · `indexer_unavailable` |
+| `stage` | `failed` only: a `PostStage` name, or `download` · `health` · `fetch` |
+| `message` | `failed` only: human text, at most 2048 characters |
+| `blames_release` | whether the consumer should blocklist the release (§2.2) |
+| `salvage` | `pending` when runner will assess the failed job's bytes and may publish the usable part (`job_publication_ready`); otherwise `none` |
+| `keep_on_failure` | the job's own Keep flag, echoed; it changes what happens to the bytes, never whether the failure is reported |
+| `fetched` | `{success_articles, total_articles, bytes}` |
+| `publication` | `completed` only: `{path, generation, manifest_digest, files, cross_volume}` (§4); null otherwise |
+| `history_seq`, `history_incarnation` | the durable history row; never 0. The history cursor is the pair (§3) |
+| `params` | the job's params (including `*Control:v1`) |
+| `size_bytes`, `health` | the job's size and download health (per mille) |
+
+```json
+{"job": 2333, "name": "Dry.Wind.2020…", "category": "movies",
+ "transfer": "t-591-a3f9c1…", "outcome": "failed", "reason": "unpack",
+ "fetch_cause": null, "stage": "unpack", "message": "…", "blames_release": true,
+ "salvage": "pending", "keep_on_failure": false,
+ "fetched": {"success_articles": 1204, "total_articles": 1204, "bytes": 8123456789},
+ "publication": null,
+ "size_bytes": 8123456789, "health": 1000, "params": [["monarr-transfer", "t-591-a3f9c1…"]],
+ "history_seq": 4412, "history_incarnation": "7f3a…"}
+```
+
+### 2.2 Failure reasons
+
+| `reason` | `stage` | Set when (by) | `blames_release` | `salvage` may be `pending` | Bytes after (§5) |
+|---|---|---|---|---|---|
+| `health` | `health` | articles missing below critical (owner) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `fetch` | `fetch` | NZB/URL fetch failed (URL fetcher); `fetch_cause` `gone` (the indexer answered 404/410/403 or another non-retried status for this item) or `indexer_unavailable` (retries exhausted on 429/503, timeouts, transport) | only for `gone` | no | nothing to dispose |
+| `par` | `par_verify`/`par_repair` | repair impossible (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `unpack` | `unpack` | the extractor failed on the bytes (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `script` | `script` | post script exited non-zero (PP) | no | yes | `keep_failed_downloads` |
+| `publish` | `move`/`publication_verify` | nothing passes selection (PP) | no | yes | `keep_failed_downloads`, after salvage settles |
+| `io` | any | a write or filesystem step failed in a way retrying cannot fix (owner or PP) | no | yes | `keep_failed_downloads`, after salvage settles |
+| `identity` | any | the release's evidence contradicts itself (PP) | yes | no | `keep_failed_downloads`, after salvage settles |
+| `hold_expired` | the hold's stage | an environmental hold passed its deadline (§2.3) | no | yes | `keep_failed_downloads`, after salvage settles |
+
+History status strings, per reason: `FAILURE/HEALTH` · `FAILURE/FETCH` ·
+`PAR_FAILURE` · `UNPACK_FAILURE` · `SCRIPT_FAILURE` · `FAILURE/PUBLISH` ·
+`FAILURE/IO` · `FAILURE/IDENTITY` · `FAILURE/HOLD_EXPIRED`; success is
+`SUCCESS…`, an operator delete `DELETED`.
+
+**Which failures hold instead.** An error is an environmental hold, not a
+failure, only when its errno says the environment will heal: `ENOSPC` →
+`capacity`, `EDQUOT` → `quota`, a dropped volume (`EIO`, `ENXIO`, `EAGAIN`,
+`ENODEV`, `ENOLINK`, `ECONNABORTED`, `ECONNRESET`, `ENOTCONN`, `ETIMEDOUT`,
+`ECONNREFUSED`, `EHOSTDOWN`, `EHOSTUNREACH`, `ENETDOWN`, `ENETUNREACH`,
+`ESTALE`, `EREMOTEIO`, or SQLite `SQLITE_IOERR`) or a volume that turned
+read-only (`EROFS` — ext4 `errors=remount-ro`, an export flipped read-only;
+both heal on remount) → `storage_unavailable` (SQLite `SQLITE_FULL` →
+`capacity`); a missing tool → `missing_tool`; an unavailable engine →
+`engine_unavailable`; a wrong or missing archive password →
+`password_required`; a replaced or absent mount → `mount_unavailable`. The
+errno is read from the `io::Error` (`raw_os_error()`, or the error it wraps)
+wherever one exists, and from its kind when only the kind survived; only a
+subprocess's stderr is read as text (`nzbd_engine::stderr_hold_cause`).
+Everything else is the job's terminal failure — `failed/io`, subject to the retention preference, for a
+filesystem error. That deliberately includes `EACCES`/`EPERM`/`ENOENT` (a
+retry repeats them) and `EMFILE`/`ENFILE`/`ENOMEM`: those are a fault in the
+daemon or the host, not the volume, and a hold would hide it.
+
+**Salvage** is a second fact, not part of the terminal: with `salvage:
+pending`, runner assesses the failed job's bytes after the terminal and
+announces a usable partial with `job_publication_ready {job, transfer,
+publication}` (also a `/api/v1/deliveries` row with `kind: "salvage"`), or
+settles the obligation as nothing usable. The job stays failed for re-grab
+purposes.
+
+### 2.3 Holds
+
+A held job is waiting on something environmental: `storage_unavailable` ·
+`capacity` · `quota` · `allocation` · `mount_unavailable` · `missing_tool` ·
+`engine_unavailable` · `password_required`. It is visible as
+`status: "held"` (and `status_projected: "held"`) on `/api/v1/jobs` and
+`status: "held"` on `job_status_changed`, with `control.lifecycle == "held"`.
+Since 0.6.0 `held` is the persisted status: a job is `held` exactly while
+its control holds. 0.5.0 stored a hold as `paused` + a held control; 0.6.0
+loads such a row as `held`, and 0.5.0 reads a 0.6.0 `held` as `paused`. A
+person's pause is `paused` and is never a hold — force priority overrides a
+pause, never a hold. The NZBGet-compat shim shows both as `PAUSED`.
+
+`control` (`*Control:v1`): `version`, `revision`, `lifecycle`, `cause`,
+`stage`, `retry_policy` (`scheduled_retry` · `resume_same_job` ·
+`reobserve_mount`), `message`, `instance`, `previous_status`,
+`manual_pause`, `retry_attempt`, `next_retry_at_unix`, `blocked_since_unix`,
+`released_at_unix`, `deadline_in_s`, `deadline_unix`, and optional
+`expiry_pending` (false/missing on older nodes). A selected worker expiry
+freezes that exact control revision; it cannot be resumed by a late recovery
+probe. The authenticated cluster expiry decision binds the grant, job revision,
+source generation and control episode before recording `hold_expired`.
+Terminal history/event publication does not wait on the payload mount.
+
+The source owner independently joins actual writers/processes before source
+cleanup. An unknown or abandoned assessment does not prove bytes unusable,
+but does not force Park either: disposal follows `keep_failed_downloads` and
+per-download Keep after salvage and cleanup custody settle. Unresolved remote
+custody or unproven stop remains Pending with an error and durable retry
+outbox; reboot, a timeout or a missing receipt never proves completion.
+Generation-bound Delivery retirement, legacy enrollment and ordinary
+retention validators still apply.
+
+- **One retry clock.** Non-storage timed holds use 30 s, 1 m, 2 m, then
+  every 5 m (`HOLD_RETRY_DELAYS_SECONDS`, jittered). Storage holds use
+  the shorter delays described below. The owner schedules held work.
+- **A deadline runner enforces.** `[post] hold_deadline_secs` (default
+  `86400`; `password_hold_deadline_secs`, default `604800`) after the episode
+  began, runner ends the job `failed/hold_expired`; bytes follow the retention
+  preference. Curator
+  never authors that terminal. `deadline_in_s` is the time remaining as of
+  the control's last write (hosts share no clock); `deadline_unix` is for
+  display.
+- **The newest cause wins**: a new hold on a held job replaces the control
+  (revision + 1).
+- **`manual_pause`**: an operator who pauses a held job suspends its
+  automatic recovery until they resume it; the deadline keeps running. The
+  status stays `held`. A job a person paused before it was held keeps the
+  pause: when its storage comes back it returns to `paused`, not `queued`.
+
+**Storage retry.** Clear space and let automatic probes retry eligible work;
+storage delays are capped at 30–60 seconds and persisted long storage holds
+are shortened. `POST /api/v1/queue/actions/retry-storage` (web **retry storage
+now**) requests probes, including idle post failures. It changes neither
+manual lane pause; it does not blindly clear the evidence latch. Successful
+probes release eligible work; writer-stop, custody and manual-pause gates
+still apply.
+
+### 2.4 Status and progress
+
+`job_status_changed {job, transfer, status, stage, control}` fires on every
+transition of the projected status, including each `PostStage`; `tick` is
+the 1 Hz progress snapshot. A consumer does not need to diff ticks to find
+transitions.
+
+```bash
+curl -sSN -H "Authorization: Bearer $TOK" -H "Accept: text/event-stream" \
+     -H "X-Nzbd-Client: curl/manual" "$NZBD/api/v1/events"
+# pause and resume downloads in the UI: queue_pause_changed appears
+# (the Post-processing toggle emits post_pause_changed)
+```
+
+---
+
+## 3. History cursor — the terminal reconciliation feed
+
+`GET /api/v1/history?since_seq=<n>&limit=<n>` (default `limit` 200, at most
+10000; or `?limit=&offset=` for the page view) answers:
+
+| Key | Meaning |
+|---|---|
+| `entries` | history rows, ascending by `id` on the cursor shape |
+| `total`, `offset`, `limit`, `sync` | paging and portable-log sync state |
+| `incarnation` | the history index's identity, minted whenever the index is rebuilt from the portable log (which reassigns ids) |
+| `head_seq` | the newest row id |
+| `retained_min_seq` | the oldest row id still kept |
+
+The cursor is **`(incarnation, seq)`**. A consumer whose stored incarnation
+differs, or whose cursor is below `retained_min_seq` or above `head_seq`, has
+lost continuity: it reconciles every outstanding transfer through
+`/api/v1/request-admissions/{token}` (§1), then resumes from
+`retained_min_seq`. Ids have gaps; advance to the last id of a committed
+page.
+
+---
+
+## 4. Publication, manifest and the reconciliation feed
+
+A publication is a directory `<completed>/<name>.job-<id>.runner-<gen>/`
+holding **only the selected files** and `.runner-manifest.json`. The
+manifest is written **last** and is the commit marker: a directory without
+it is not a publication — curator ignores it and runner's restart
+reconciliation finishes or unwinds it. From the moment the manifest exists
+the directory is curator's; runner never deletes anything under
+`<completed>`.
+
+**How the files get there.** Before the first file moves, runner journals
+the move intent — generation, target directory, and for every selected file
+its source path, destination, inode/device/size/mtime identity and its
+digest if one is already journaled — in the `relocation_intents` table, in
+the same transaction as the relocation operation. Then, file by file:
+
+- **Same volume:** `renameat2(RENAME_NOREPLACE)`, falling back to
+  `linkat` + `unlink` on mounts that refuse it (NFS, FUSE — the PR #247
+  chain). A file without a journaled digest gets exactly one read pass, to
+  compute it. Nothing is copied.
+- **Different volume:** one streaming copy per file into `<dst>.part` that
+  computes the SHA-256 as it writes, `fsync`, then an exclusive rename.
+- One exception: a selected file that is still an input of a PAR set needed
+  to repair the rest of the source (`repairDependency` in its file outcome)
+  is *linked* into the publication on the same volume instead of renamed, so
+  its source name stays and the set remains repairable after curator removes
+  the publication.
+- Each file is marked moved in the journal as it lands. Then
+  `.runner-manifest.json` is written (`.part`, `fsync`, exclusive rename).
+
+The processing directory keeps only the unselected siblings (PAR sets,
+samples, consumed archives, NFOs); runner disposes of it once the delivery
+row exists. The delivery record reuses the journaled digests — the old
+private staging tree and its four-to-five hash passes are gone.
+
+In a cluster, the leader lands the worker's sealed payload in its own
+publication directory and writes the manifest there last, through the same
+writer; its `generation` is the cluster result id, `cross_volume` is `true`
+(the payload was copied) and its digest is the cluster delivery row's
+`manifestDigest`.
+
+**`.runner-manifest.json`:**
+
+```json
+{
+  "generation": "5f0c6b1e9a2d4c8e8b7a6d5c4b3a2918",
+  "job": 2333,
+  "transfer": "t-2333-00112233445566778899aabbccddeeff",
+  "created_at": 1794076138,
+  "cross_volume": false,
+  "files": [{"path": "Movie.2020.mkv", "bytes": 8123456789, "sha256": "…"}],
+  "digest": "<bare lowercase hex>"
+}
+```
+
+`files` is in bytewise path order. `digest` is the deployed
+`runner-manifest-v1` algorithm, unchanged: SHA-256 over
+`runner-manifest-v1\n` and then, per file, `<len(path)>:<path>\n<bytes>\n<sha256>\n`
+— the same value as `Delivery:ManifestDigest`, the delivery row's
+`manifestDigest` and `job_pp_finished.publication.manifest_digest`.
+`crates/nzbd-state/tests/fixtures/runner_manifest_v1.json` holds a manifest
+and the digest curator's own `ports.ManifestDigest` computes for it; the test
+`manifest_digest_matches_curator_fixture` keeps the two languages equal.
+Curator re-verifies the digest once, at import, only when `cross_volume` is
+true.
+
+**Crash safety.** On every start (and on each 30 s tick, and before a
+post-processing retry) runner reconciles each intent that is still open:
+
+- the manifest exists → the publication committed; record it;
+- every selected file is accounted for, unchanged, either in the target
+  (same object, or same size and digest across volumes) or in the source
+  (same identity, and same digest when one was journaled) → **finish**:
+  move the rest, write the manifest;
+- any file missing from both sides, or changed → **unwind**: move the moved
+  files back by identity, remove the target directory, and fail the job
+  `failed/io` (no blame; retention preference applies) on its next publication attempt.
+
+Exactly one of finish or unwind runs, and the decision is logged with the
+per-file evidence. A restart that had already decided to finish and stopped
+again re-locates every file the journal does not yet record as moved (a
+rename can land before its journal update), so finishing is idempotent too.
+While an intent is open, neither the source nor the target can be disposed
+of, deleted or retired.
+
+**What identity proves.** A file with a journaled digest is checked by its
+bytes. A same-volume file the journal has no digest for yet (the crash came
+before its one read pass) is matched by **inode, device, size, mtime and
+ctime only** — the same check a rename preserves. That detects replacement
+and ordinary writes (both change ctime) but not bit rot under unchanged
+metadata; such a file's digest is computed as it is published, and curator
+re-verifies only cross-volume publications. Legacy records without a ctime
+are matched on inode, size and mtime.
+
+**An unwind never deletes the only copy.** A cross-volume copy is removed
+only while the source still holds the journaled original, and a linked PAR
+repair input loses its publication name only while the source name is the
+same inode. Otherwise the unwind stops for review (the operation's error is
+mirrored onto the artifact, so Files and Attention show it).
+
+**Operator exit.** A move stuck in review or on its retry ladder can be
+abandoned from the Files detail (*Abandon move and retain original*), i.e.
+`POST /api/v1/artifact-operations/<op>/abandon-relocation` with the
+artifact's `revision` and `generation`. Runner unwinds the move — the source
+is complete and stays runner's — and the job's next publication attempt fails
+`failed/io`, with source disposal governed by the retention preference. If the move cannot be put back safely,
+abandoning closes it without deleting anything: the files stay where they are
+and the publication directory (no manifest, so never curator's) is registered
+in the inventory for an explicit disposition.
+
+**The reconciliation feed.** `GET /api/v1/deliveries?after=<cursor>&limit=<1..100>`
+(default 50) is a read-only feed of immutable publication rows in sequence
+order: `{protocolVersion, deliveries, nextCursor, cursorRule}`. Each row
+carries `sequence`, `jobId`, `requestToken` (the transfer),
+`publicationPath`, `publicationGeneration`, `manifestDigest`, `readyAt`,
+`kind` (`completed` | `salvage`), `terminalOutcome`, `failureStage`,
+`failureCause`, `keepSourceOnFailure`, `fileOutcomes`, `sourceCleanup`
+(runner's own retirement of its processing source — informational, it gates
+nothing), and the manifest body:
+`files`, plus `manifest` (the `.runner-manifest.json` as written, for
+publications since 0.4.0). `GET /api/v1/deliveries/{id}` answers one row.
+Curator reads the feed on the poll to catch a `completed` or
+`job_publication_ready` it missed; every row is returned.
+
+There is no acceptance: `POST /api/v1/deliveries/{id}/accept` answers
+`410 Gone`, the `includeAccepted` query parameter is gone (a request that
+still sends it is answered), and since 0.6.0 the local `deliveries` table has
+no `accepted_at` / `consumer_receipt_id` columns (dropped on open). The
+replicated `cluster_deliveries.accepted_at` column remains, always NULL.
+
+```bash
+# no open intents after a restart (post-deploy check)
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/artifacts?filter=live&limit=200" \
+  | python3 -m json.tool | grep -c '"state": "transitioning"'
+# nothing waits on a person
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/artifacts?filter=attention" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["counts"]["attention"])'
+# a publication's manifest and its feed row agree
+jq -r .digest "<completed>/<publication>/.runner-manifest.json"
+curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/deliveries?after=0&limit=100" \
+  | jq -r '.deliveries[] | [.publicationPath, .manifestDigest, .kind] | @tsv'
+```
+
+---
+
+## 5. Failure disposal and the artifact inventory
+
+After the terminal, runner disposes of a failed job's processing source per
+`[post] keep_failed_downloads` (false by default: Delete; true: Park),
+overridden by the job's Keep flag, and only after salvage and cleanup custody
+settle. Legacy `failure_action`/`health_action` values do not govern runtime
+retention; reason and recoverability do not force Park.
+Authority retention and per-download Keep policy also reach expiry and cluster
+copy owners. Missing policy from an older authority preserves bytes safely. Disposal is owned by
+the artifact record
+and gated by the `job_terminals` row, not the queue row; it runs on the
+artifact operation's own retry ladder (`Operation.next_retry`: 30 s, 1 m,
+2 m, then every 5 m) and, in a cluster, under the operation's lease, so one
+node disposes. **Nothing downstream waits on it.**
+
+`GET /api/v1/artifacts` (and `/api/v1/artifacts/{id}`) rows for a failed
+source carry `failure_reason` (the same wire string as
+`job_pp_finished.reason`), `salvage` (`pending` · `published` ·
+`settled_none`) and the operation's error; the queue row's
+`failed_cleanup.attempts` counts disposal attempts. Parked sources follow
+`failed_retention_days`; a disposal that cannot complete retries on a bounded
+ladder and then settles with what remains retained (its outcome is on the
+history row). Details
+in [FILE_LIFECYCLE_OPERATIONS.md](FILE_LIFECYCLE_OPERATIONS.md).
+
+---
+
+## 6. Transfer-id passthrough — one id from grab to playable
+
+Curator mints the transfer token at grab time and passes it as the
+`monarr-transfer` job param. It is **opaque**: runner compares it by exact
+equality and never parses it. Runner stores it on the job, echoes it as
+`transfer` on every fact (`job_pp_finished`, `job_status_changed`,
+`job_publication_ready`, the queue row), writes it into the manifest
+(`transfer`) and the feed row (`requestToken`), keys the admission receipt by
+it, and re-attaches it when a history entry is requeued. Curator sends the
+same value to cinema as `correlation_id`. A fact whose transfer does not
+match curator's row is dropped by curator.
 
 ```bash
 curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/history?limit=5" \
   | grep -o 'monarr-transfer[^]]*'
 ```
 
-**How to read it.** An empty `params` on a monarr-grabbed job means monarr
-fell back to the untagged `Add` path — the id exists in monarr's database but
-does not follow the job through nzbd, so a failure mid-pipeline is harder to
-join up. It is a diagnostic loss, not a functional one; the download still
-completes and still imports.
-
 ---
 
-## 4. Status / capacity — "up" is not the same as "working"
+## 7. Status / capacity — "up" is not the same as "working"
 
 **What it does.** monarr's health check reads `/api/v1/status` on its own
 timer and turns four booleans into plain-language problems. A downloader that
@@ -317,14 +730,14 @@ curl -sS -H "Authorization: Bearer $TOK" "$NZBD/api/v1/status" \
 ```
 
 **How to read it.** `health_abort` is reported by nzbd and **deliberately not
-surfaced by monarr**. It reflects `[post] health_action` being `park` or
-`delete` — an operator policy that is on by default and correct to leave on.
+surfaced by monarr**. It reports the always-armed below-critical health cancellation, independent
+of `[post] keep_failed_downloads` or legacy retention values.
 Surfacing it produced a red badge that could never be cleared, which trains
 you to ignore the panel. A signal that is always on is not a signal.
 
 ---
 
-## 5. Client registry — who is talking to nzbd right now
+## 8. Client registry — who is talking to nzbd right now
 
 **What it does.** nzbd keeps an in-memory registry of every API caller: name,
 first seen, last seen, call count, last method, which API (native vs
@@ -369,7 +782,7 @@ after a restart is not evidence of anything.
 
 ---
 
-## 6. Handoff column — did the consumer actually take the files?
+## 9. Handoff column — did the consumer actually take the files?
 
 **What it does.** nzbd records, per history entry, whether a client has seen
 it and whether it removed it after importing. This closes the loop from the
@@ -415,10 +828,10 @@ never that the files were used.
 
 ---
 
-## 6a. Release probe — "what is inside this, before I grab it?"
+## 9a. Release probe — "what is inside this, before I grab it?"
 
 Curator ranks Dolby Vision and HDR releases by what they measure, not by
-what their names claim (Curator ADR 0026). The facts that matter (DV
+what their names claim (Curator ADR 0031). The facts that matter (DV
 profile, FEL or MEL, CM version, HDR10+) live in the first frame of the main
 file, so Curator asks nzbd for those bytes before it grabs:
 
@@ -441,7 +854,7 @@ closes it when done. The capability is advertised as `release-probe-v1` in
 `/api/v1/status`, and the UI's Probes tab lists recent probes (without their
 URLs, which carry indexer API keys).
 
-## 7. NZBGet compat shim — the other consumers
+## 10. NZBGet compat shim — the other consumers
 
 **What it does.** Sonarr, Radarr and Lidarr connect to nzbd as an "NZBGet"
 download client with no changes: JSON-RPC 1.1 (`append`, `history`,
@@ -449,14 +862,14 @@ download client with no changes: JSON-RPC 1.1 (`append`, `history`,
 NZBGet's extension-script protocol byte-for-byte. Full guide in
 [USAGE.md](USAGE.md).
 
-**Where you see it.** Same client strip as §5 — the tooltip reads
+**Where you see it.** Same client strip as §8 — the tooltip reads
 `· nzbget-compat API` instead of `· native API`, which is how you tell at a
 glance whether a consumer is on the rich path or the compatibility path.
 
 **How to read it.** Compat clients get no event stream, no job params and no
 capacity reporting. If a consumer shows `nzbget-compat API` when you expected
 `native API`, it is configured as an NZBGet client rather than an nzbd one,
-and the transfer id (§3) is not flowing.
+and the transfer id (§6) is not flowing.
 
 ---
 
@@ -467,31 +880,52 @@ relevant names:
 
 | Metric | Type | Reads |
 |---|---|---|
-| `nzbd_events_emitted_total{event="…"}` | counter | events published, by name |
-| `nzbd_sse_clients` | gauge | streams open right now |
+| `nzbd_events_emitted_total{event="…"}` | counter | engine events published, by name (§2) |
+| `nzbd_sse_clients` | gauge | event streams open right now |
 
-`nzbd_sse_clients` at 0 while monarr is configured for push means the stream
-is not established — check §5 before anything else. There is no per-client
-metric; the registry is JSON-only.
+`nzbd_sse_clients` at 0 while curator is configured for push means the
+stream is not established — check §8 first.
 
 ---
 
-## What nzbd deliberately does not do
+## Compatibility
 
-- **No outbound HTTP.** nzbd never calls monarr, plurx, or anything else. It
-  cannot be blocked by their outages and cannot leak into them.
-- **No knowledge of libraries, media items, or metadata.** A job param is an
-  opaque string to nzbd; it stores and returns it without ever interpreting it.
-- **No push to plurx.** nzbd and plurx have no seam. plurx learns about new
-  files from monarr, after the import, when the files are actually in place —
-  telling it earlier would only announce files that are not there yet.
-- **No connection test button.** nzbd tests nothing; it observes. Everything in
-  §5 and §6 is a record of what was done to it, which cannot go stale in the
-  way a cached probe result can.
+| Runner | Curator | Works because |
+|---|---|---|
+| this build | curator M2+ | the contract |
+| this build | curator before M2 | **not supported**: the event has no `pp_status`/`final_dir` |
+| this build | a runner node before 0.5.0 (cluster) | **not supported**: it cannot decode a persisted `held`. 0.6.0 deploys only after every curator runs M2+ and every runner node runs 0.5.0 (which is itself ≥ M3/0.4.0) |
+| this build | a runner node on 0.5.0 (cluster) | rolling upgrade: 0.5.0 reads `held` as `paused` (the control carries the hold); this build loads 0.5.0's `paused` + held control as `held` |
+
+## What runner deliberately does not do
+
+- **No outbound HTTP.** Runner never calls curator, cinema, or anything else.
+- **No deletion under `<completed>`.** Runner publishes there and never
+  removes anything there; disposal and source retirement operate on
+  `/processing` only.
+- **No acknowledgement.** A publication is curator's the moment its manifest
+  exists.
+- **No knowledge of libraries or titles.** A job param is an opaque string;
+  no seam matches titles.
 
 ## Keeping this honest
 
-Every literal string in this document — event names, chip text, problem
-strings, config keys — was read out of the code on the branch that ships it.
-When a seam changes, this file changes in the same commit; a doc that is
-confidently wrong about a wire format costs more than no doc at all.
+Every literal in this document — event names, field names, status strings,
+config keys — was read from the code on the branch that ships it, and the
+event tables are checked against `event_json` by a test. When a seam changes,
+this file changes in the same commit.
+
+## Inventory source-presence reconciliation
+
+A transferred row remains live while its source directory exists or custody is
+unverified. Maintenance can append `source_gone` only after two observations at
+least 600 seconds apart under the recorded, readable root identity, using a
+pinned directory descriptor and a final leaf/root recheck. Busy sources, open
+operations/intents, replaced roots and non-ENOENT errors remain visible. This
+never deletes a payload, manifest, delivery, operation or history row. Use All
+or Cleared to inspect settled source-presence audit.
+
+Pending salvage owns a durable source-bound `salvage` operation. Each attempt
+reserves its next retry before work: 30, 60, 120, then 300 seconds (capped).
+Scans, duplicate terminal events, Retry now and restarts respect the same clock.
+Storage errors retain the pending obligation and block failed-source disposal.

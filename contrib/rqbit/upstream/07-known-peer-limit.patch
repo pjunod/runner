@@ -1,4 +1,4 @@
-From 3d86ddf65c667e0e2bc65bd19011a48ba8c651b4 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Paul Junod <donujp@gmail.com>
 Date: Tue, 27 Oct 2026 13:55:51 -0400
 Subject: [PATCH] feat(session): bound the number of retained peer records

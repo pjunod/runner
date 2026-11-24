@@ -12,14 +12,10 @@ throughput, direct-to-disk writing, and drop-in compatibility with the
 Sonarr/Radarr ecosystem and NZBGet's post-processing script protocol.
 Optionally runs as a **multi-node cluster** over a shared work volume.
 
-Follow [file lifecycle progress](docs/FILE_LIFECYCLE_STATUS.md) for the
-[ownership and recovery plan](docs/FILE_LIFECYCLE_PLAN.md) and its
-[design review](docs/FILE_LIFECYCLE_REVIEW.md).
 See [file lifecycle operations](docs/FILE_LIFECYCLE_OPERATIONS.md) for retention,
-recovery mounts, cancellation and backup/restore.
-The draft [Curator delivery protocol](docs/CURATOR_DELIVERY.md) describes the
-restart-safe ready manifest and independent acceptance receipt; it is not yet
-validated for deployment.
+recovery mounts, cancellation and backup/restore, and
+[INTEGRATION.md](docs/INTEGRATION.md) for the seam with curator and cinema
+(pipeline contract v2).
 
 ## Highlights
 
@@ -121,41 +117,21 @@ NZBGet configuration and prints a mapping report.
 
 ## Documentation
 
-[PAR repair build status](docs/PAR_REPAIR_PROGRESS_STATUS.md) tracks the storage,
-workspace retirement, repair, and qualification work specified by the
-[repair plan](docs/PAR_REPAIR_PROGRESS_PLAN.md).
+Every document is indexed in [docs/README.md](docs/README.md); the ones most
+people need:
 
 | Doc | What it covers |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | Release binaries, Docker, Homebrew, building from source, musl static builds |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | The complete annotated `nzbd.toml` reference |
 | [docs/USAGE.md](docs/USAGE.md) | CLI, web UI, connecting the *arr apps, RSS feeds + filter language, extension scripts, deobfuscation |
-| [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to runner, and its exact control/security boundaries |
-| [docs/MOBILE_QUEUE_PARITY_PLAN.md](docs/MOBILE_QUEUE_PARITY_PLAN.md) | Reviewed mobile torrent grouping and controls implementation plan |
-| [docs/MOBILE_QUEUE_PARITY_REVIEW.md](docs/MOBILE_QUEUE_PARITY_REVIEW.md) | Fable's source review and required corrections |
-| [docs/MOBILE_QUEUE_PARITY_STATUS.md](docs/MOBILE_QUEUE_PARITY_STATUS.md) | Implementation, review, validation, and delivery progress |
-| [docs/MOBILE_REVIEW.md](docs/MOBILE_REVIEW.md) | Independent review of the mobile app (2026-08): code, performance, UI, release readiness, and the Google TV / Apple TV gap |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | systemd, Docker Compose, Kubernetes, multi-node cluster deployment |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase |
-| [docs/BITTORRENT_PROPOSAL.md](docs/BITTORRENT_PROPOSAL.md) | First-class BitTorrent backend: engine choice, queue/storage contracts, *arr compatibility, security, rollout, and review decisions |
-| [docs/BITTORRENT_M0_REPORT.md](docs/BITTORRENT_M0_REPORT.md) | BitTorrent engine spike: passing data-path evidence, measurements, and the API gaps blocking daemon integration |
-| [docs/BITTORRENT_GATE9_REVIEW.md](docs/BITTORRENT_GATE9_REVIEW.md) | Reviewer decision brief for the BitTorrent resource, dependency, license, and three constrained advisory exceptions |
-| [docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_RELEASE_REVIEW.md) | Pre-release operations review: current no-go, public traffic, ports, paths, seeding, deletion, evidence, and sign-off conditions |
-| [docs/BITTORRENT_M1B_REPORT.md](docs/BITTORRENT_M1B_REPORT.md) | Dormant protocol-neutral queue/backend seam: schema 3, shared scheduling, coalesced progress, and the production-networking guard |
-| [docs/INTEGRATION.md](docs/INTEGRATION.md) | Every seam with monarr and plurx: what each does, where you watch it, and the command that proves it |
-| [docs/INTEGRATION_PLAN.md](docs/INTEGRATION_PLAN.md) | The event/cursor contract consumers build against, and how it was built |
-| [docs/DEFECT_HISTORY_DELETE.md](docs/DEFECT_HISTORY_DELETE.md) | Resolved defect: why history rows resurrected, why forget now means everywhere, and how portable tombstones converge |
-| [docs/STARTUP_RECOVERY_REVIEW.md](docs/STARTUP_RECOVERY_REVIEW.md) | Review of the 2026-09-25 startup delay: pending magnet retries held the API offline, plus fix and rollout checks |
-| [docs/STARTUP_VERIFICATION_STATUS.md](docs/STARTUP_VERIFICATION_STATUS.md) | Owner, implementation progress, validation and merge status for startup runtime recovery |
-| [docs/STARTUP_VERIFICATION_PLAN.md](docs/STARTUP_VERIFICATION_PLAN.md) | Startup incident evidence and reviewed runtime recovery contract |
-| [docs/STARTUP_VERIFICATION_REVIEW.md](docs/STARTUP_VERIFICATION_REVIEW.md) | Astra and Opus review findings and disposition |
-| [docs/HISTORY_LOADING_PLAN.md](docs/HISTORY_LOADING_PLAN.md) | History loading: measured root cause, implemented first release, operator controls, and remaining deployment validation |
-| [docs/HISTORY_LOADING_STATUS.md](docs/HISTORY_LOADING_STATUS.md) | History performance delivery status, review, final checks, and merge evidence |
-| [docs/HISTORY_INCREMENTAL.md](docs/HISTORY_INCREMENTAL.md) | Incremental history ingestion: delivery status, merge equivalence, recovery, and resource checks |
+| [docs/MOBILE.md](docs/MOBILE.md) | Building the iPhone/iPad/Android app, connecting it to runner, and its exact control/security boundaries |
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | The seam with curator and cinema: job API, events, history cursor, publications, disposal |
+| [docs/FILE_LIFECYCLE_OPERATIONS.md](docs/FILE_LIFECYCLE_OPERATIONS.md) | What happens to payload bytes: retention, parking, recovery |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design: the whole system, phase by phase, and the ADR summary |
 | [docs/CLUSTERING.md](docs/CLUSTERING.md) | Cluster design (ADR-13…16), failure matrix, operations |
-| [docs/CLUSTERING_COMPLETION_PLAN.md](docs/CLUSTERING_COMPLETION_PLAN.md) | Current plurx comparison, recommended authority changes, and the finite C3 implementation/CI plan |
-| [docs/CLUSTERING_STATUS.md](docs/CLUSTERING_STATUS.md) | Cluster completion progress, review, validation, and remaining external evidence |
-| [docs/TORRENT_QUEUE_STATUS.md](docs/TORRENT_QUEUE_STATUS.md) | Torrent queue lifecycle, review, validation, and merge progress |
+| [docs/BITTORRENT_RELEASE_REVIEW.md](docs/BITTORRENT_RELEASE_REVIEW.md) | BitTorrent pre-release operations review: current no-go and the sign-off conditions |
 | [STATUS.md](STATUS.md) | What's done, what's next, with commit evidence |
 
 Deployable examples live under [`examples/`](examples/):
@@ -165,15 +141,23 @@ config), [`kubernetes/`](examples/kubernetes/) (full manifest set) and
 
 ## Development
 
-Three GitHub Actions workflows gate every push/PR — **Tests** (unit +
-engine e2e + multi-node cluster tests + the whole-daemon test, plus an
-MSRV 1.95 check), **Lint** (`cargo fmt --check`, `clippy -D warnings`),
-and **Coverage** (`cargo llvm-cov`, self-hosted badges). Coverage runs every
-workspace test target even after a failure, then fails the job before reports
-or badges can be published unless the whole instrumented suite passed. It also
-rejects line-coverage regressions below the single `MINIMUM_LINE_COVERAGE`
-constant in [`.github/workflows/coverage.yml`](.github/workflows/coverage.yml);
-raise that value only after a complete `main` run proves the new floor.
+Every pull request runs **Main fast lane** (Rust compile, formatting,
+Clippy, recovery/cluster regressions, and mobile type/unit checks), **Tests**
+(the complete workspace suite, MSRV 1.95, and Android signing guards),
+**Supply chain** (dependency policy and RustSec), and **CodeQL** (Rust and
+JavaScript/TypeScript). Metadata and build-number changes use the same real
+Rust and mobile checks. CI uses fresh GitHub-hosted runners; Linux jobs use
+Ubuntu 24.04. Main requires up-to-date branches, resolved conversations,
+and verified CI publishers, including for administrators. Solo-owner
+maintenance requires zero approving reviews; this does not provide an
+independent review or erase historical Scorecard evidence.
+
+**Lint** and **Coverage** remain manually dispatched. Coverage rejects a
+failed test suite before publishing reports or badges and enforces
+`MINIMUM_LINE_COVERAGE` in
+[`.github/workflows/coverage.yml`](.github/workflows/coverage.yml). Raise that
+floor only after a complete main run proves it. Release jobs run only on
+version tags; pull-request validation never publishes production artifacts.
 
 The `Makefile` wraps the whole workflow — `make` (or `make help`) lists
 every target:

@@ -13,20 +13,25 @@ concurrency:
   group: main-fast-lane-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   scope:
     name: Select affected validation
     if: github.event.pull_request.draft == false
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       mobile: ${{ steps.scope.outputs.mobile }}
       torrent: ${{ steps.scope.outputs.torrent }}
+      docs: ${{ steps.scope.outputs.docs }}
       docs_only: ${{ steps.scope.outputs.docs_only }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       - id: scope
         env:
@@ -36,33 +41,36 @@ jobs:
   preflight:
     name: Static contracts
     needs: scope
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
       - run: scripts/check-fast-lane-contract
       - name: Exercise the embedded application JavaScript
         run: make ui-test
-      - name: Documentation-only lane
-        if: needs.scope.outputs.docs_only == 'true'
-        run: echo "Documentation-only diff; compiler jobs are skipped."
 
   rust:
     name: Rust merge candidate
     needs: [scope, preflight]
     if: needs.scope.outputs.rust == 'true'
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    # Cold native-code dependency builds plus every selected regression lane
+    # exceeded 20 minutes while tests were still completing (PR #301).
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97.1"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install bounded post-processing dependencies
         if: runner.environment == 'github-hosted'
         run: sudo apt-get update && sudo apt-get install -y par2 p7zip-full
@@ -74,6 +82,9 @@ jobs:
       - name: Torrent transfer and recovery regressions
         if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') && needs.scope.outputs.torrent == 'true' }}
         run: make fast-check-torrent
+      - name: Documentation contract tests
+        if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') }}
+        run: make fast-check-docs
       - name: Startup recovery and enrollment regressions
         if: ${{ !cancelled() && (steps.rust_checks.outcome == 'success' || steps.rust_checks.outcome == 'failure') }}
         run: make fast-check-startup
@@ -82,14 +93,16 @@ jobs:
     name: Mobile compile and unit lane
     needs: [scope, preflight]
     if: needs.scope.outputs.mobile == 'true'
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     defaults:
       run:
         working-directory: mobile
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
@@ -97,12 +110,14 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Audit installed mobile dependencies
+        run: npm audit --audit-level=low
 
   gate:
     name: Main promotion gate
     if: always() && github.event.pull_request.draft == false
     needs: [scope, preflight, rust, mobile]
-    runs-on: ${{ fromJSON((vars.CI_RUNNER_MODE == 'github' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '["ubuntu-24.04"]' || '["self-hosted","Linux","X64","lab","general"]') }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Require every selected lane
@@ -114,7 +129,7 @@ jobs:
         run: |
           for result in "$SCOPE" "$PREFLIGHT" "$RUST" "$MOBILE"; do
             case "$result" in
-              success|skipped) ;;
+              success) ;;
               *) echo "Selected lane ended with: $result"; exit 1 ;;
             esac
           done

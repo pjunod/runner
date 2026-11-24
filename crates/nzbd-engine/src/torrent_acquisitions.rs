@@ -168,10 +168,16 @@ impl crate::EngineHandle {
         result.await.map_err(|_| crate::EngineError::Closed)
     }
 
+    /// End a native torrent acquisition as a typed failed terminal
+    /// (contract §2.1/§2.2): its `job_terminals` row, history and
+    /// `job_pp_finished` come from the same chain as every other terminal.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fail_native_torrent(
         &self,
         job: JobId,
         donor: Option<JobId>,
+        reason: nzbd_types::FailureReason,
+        fetch_cause: Option<nzbd_types::FetchCause>,
         stage: String,
         message: String,
         cleanup_complete: bool,
@@ -179,6 +185,8 @@ impl crate::EngineHandle {
         self.roundtrip_bool(|reply| crate::owner::QueueCommand::FailNativeTorrent {
             job,
             donor,
+            reason,
+            fetch_cause,
             stage,
             message,
             cleanup_complete,
@@ -659,11 +667,13 @@ impl crate::EngineHandle {
                         operation.state
                     )
                 });
-                let cause = if operation.state == "retry" {
-                    crate::io_hold_cause(&message)
-                } else {
-                    nzbd_types::HoldCause::Io
-                };
+                // Seed retirement is a lifecycle after the job's terminal; it
+                // never ends the job. Anything that is not space is retried
+                // as storage (seed-retirement holds carry no deadline).
+                // The operation's error is persisted text with no errno
+                // attached; the stderr rule reads it.
+                let cause = crate::stderr_hold_cause(&message)
+                    .unwrap_or(nzbd_types::HoldCause::StorageUnavailable);
                 self.hold_job_until(
                     id,
                     cause,
@@ -679,7 +689,8 @@ impl crate::EngineHandle {
                 let cause = if error.kind() == std::io::ErrorKind::WouldBlock {
                     nzbd_types::HoldCause::StorageUnavailable
                 } else {
-                    crate::io_hold_cause(&error.to_string())
+                    crate::io_error_hold_cause(&error)
+                        .unwrap_or(nzbd_types::HoldCause::StorageUnavailable)
                 };
                 self.hold_job(id, cause, "torrent_seed_retire", &error.to_string())
                     .await?;
@@ -698,7 +709,7 @@ impl crate::EngineHandle {
             Ok(Err(error)) => {
                 self.hold_job(
                     id,
-                    nzbd_types::HoldCause::IdentityConflict,
+                    nzbd_types::HoldCause::StorageUnavailable,
                     "torrent_seed_retire",
                     &error.to_string(),
                 )

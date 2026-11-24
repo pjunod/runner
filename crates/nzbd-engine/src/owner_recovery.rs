@@ -145,13 +145,26 @@ struct VerificationFailure {
     reason: String,
     checked_bytes: u64,
     review_required: bool,
+    /// The owner verified against an allocation snapshot that a committed
+    /// inventory transition (e.g. a publication move reconciled at startup)
+    /// has since replaced: reload the allocation and verify again.
+    stale_allocation: bool,
 }
 impl VerificationFailure {
+    fn stale(reason: impl ToString, checked_bytes: u64) -> Self {
+        Self {
+            reason: reason.to_string(),
+            checked_bytes,
+            review_required: false,
+            stale_allocation: true,
+        }
+    }
     fn unavailable(reason: impl ToString, checked_bytes: u64) -> Self {
         Self {
             reason: reason.to_string(),
             checked_bytes,
             review_required: false,
+            stale_allocation: false,
         }
     }
     fn conflict(reason: impl ToString, checked_bytes: u64) -> Self {
@@ -159,6 +172,7 @@ impl VerificationFailure {
             reason: reason.to_string(),
             checked_bytes,
             review_required: true,
+            stale_allocation: false,
         }
     }
 }
@@ -368,7 +382,7 @@ impl Owner {
                             set_owner_param(&mut record.params,"*Recovery:publication-repair-intent",Some(raw));
                             // Restore only this helper's own release revision.
                             if record.control().is_some_and(|current|current.lifecycle=="running" && current.revision.parse::<u64>().ok()==control.revision.parse::<u64>().ok().and_then(|revision|revision.checked_add(1))) {
-                                record.set_control(&control);record.status=JobStatus::Paused;
+                                record.set_control(&control);record.status=JobStatus::Held;
                             }
                         }
                         owner.block_verification(job,VerificationFailure::conflict("repair namespace is safe but its completion checkpoint is not durable; retry is idempotent",0));
@@ -384,10 +398,12 @@ impl Owner {
     }
 
     pub(super) fn queue_verification(&mut self, job: JobId) {
+        self.artifacts.invalidate_writer_naming(job.0);
         let Some(current) = self.state.job(job) else {
             return;
         };
-        if current.torrent.is_some() {
+        if verification_inert(current) {
+            // A terminal job downloads nothing more: there is nothing to prove.
             return;
         }
         let total_bytes = done_bytes(current);
@@ -444,7 +460,74 @@ impl Owner {
         }
     }
 
+    /// A boot verification waits for its payload root; if the job's
+    /// `completed` terminal is stamped meanwhile (the terminal replay of a
+    /// crash after the history write), its payload is the publication's and
+    /// nothing is left to prove — yet nothing would ever run or clear that
+    /// verification, and a job under verification can be neither exported
+    /// nor admitted. Drop exactly those waiting verifications.
+    ///
+    /// Any stamped terminal qualifies, failed ones included (0.9.0): a
+    /// terminal job never downloads again, so its `Done` bits fence nothing.
+    /// A failed job's verification used to stay — and a file deleted from its
+    /// retained source then held it in a review-required verification that
+    /// refused the export and admission its salvage and disposal need,
+    /// forever. Salvage proves what it publishes from transform/CRC evidence
+    /// and the journaled digests; disposal needs no proof. Failed-cleanup
+    /// rows keep their own path.
+    pub(super) fn drop_unneeded_verifications(&mut self) {
+        let stale = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.torrent.is_none()
+                    && !super::transitions::failed_cleanup_only(job)
+                    && job
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+            })
+            .filter(|job| {
+                self.verification
+                    .get(&job.id)
+                    .is_some_and(|state| !state.running)
+            })
+            .map(|job| job.id)
+            .collect::<Vec<_>>();
+        if stale.is_empty() {
+            return;
+        }
+        for job in stale {
+            self.verification.remove(&job);
+            if let Some(current) = self.state.job_mut(job) {
+                set_owner_param(&mut current.params, PENDING, None);
+                set_owner_param(&mut current.params, REASON, None);
+            }
+        }
+        // The fence lifted: callers the owner deferred (export, admission)
+        // wait for this queue change.
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
+    }
+
+    /// Re-read the job's allocation and queue its verification again. Not a
+    /// retry ladder: it runs once per observed inventory transition.
+    fn reload_stale_allocation(&mut self, job: JobId) {
+        if let Some(state) = self.verification.get_mut(&job) {
+            state.running = false;
+            state.phase = "loading".into();
+            state.partial = None;
+        }
+        self.queue_payload_recovery(job);
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
+    }
+
     pub(super) fn start_verifications(&mut self) {
+        self.drop_unneeded_verifications();
         if self.cancel.is_cancelled() || self.verification_roots.len() >= MAX_VERIFICATION_WORKERS {
             return;
         }
@@ -457,6 +540,7 @@ impl Owner {
             .filter_map(|(position, job)| {
                 let state = self.verification.get(&job.id)?;
                 (!state.running
+                    && !super::transitions::failed_cleanup_only(job)
                     && state.phase != "saving"
                     && state.phase != "loading"
                     && !state.review_required
@@ -476,7 +560,7 @@ impl Owner {
                         .iter()
                         .any(|file| self.writers.contains_key(&file.id)))
                 .then_some((
-                    job.status == JobStatus::Paused || job.held(),
+                    matches!(job.status, JobStatus::Paused | JobStatus::Held) || job.held(),
                     std::cmp::Reverse(job.priority),
                     state.turn,
                     position,
@@ -516,6 +600,7 @@ impl Owner {
             state.phase = "checking".into();
             state.reason = None;
             let cancellation = state.cancel.clone();
+            let stamp_legacy = self.boot_jobs.contains(&job);
             let inventory = self.artifacts.clone();
             let root = allocation.root.clone();
             self.verification_roots.insert(root.clone());
@@ -534,6 +619,7 @@ impl Owner {
                             generation,
                             partial,
                             true,
+                            stamp_legacy,
                         )
                     }))
                     .unwrap_or_else(|_| {
@@ -675,6 +761,10 @@ impl Owner {
         }
         let verified = match result.outcome {
             Ok(verified) => verified,
+            Err(failure) if failure.stale_allocation => {
+                self.reload_stale_allocation(job);
+                return;
+            }
             Err(failure) => {
                 self.block_verification(job, failure);
                 self.dirty = true;
@@ -689,16 +779,9 @@ impl Owner {
                 && cached.path == verified.allocation.path
                 && cached.root == verified.allocation.root
         }) {
-            self.block_verification(
-                job,
-                VerificationFailure::conflict(
-                    "allocation generation changed while verifying",
-                    verified.checked_bytes,
-                ),
-            );
-            self.dirty = true;
-            self.publish_now();
-            self.bump_epoch();
+            // The worker read the current allocation; the owner's cached
+            // snapshot is the stale one.
+            self.reload_stale_allocation(job);
             return;
         }
         if !verified.complete {
@@ -711,6 +794,9 @@ impl Owner {
             }
             self.publish_now();
             self.bump_epoch();
+            // The reader has joined and released its root. Refill immediately;
+            // a bounded batch is a fairness boundary, not a one-second throttle.
+            self.start_verifications();
             return;
         }
         let original = self.state.job(job).unwrap().clone();
@@ -799,7 +885,13 @@ impl Owner {
         let needs_download = !verified.transformed
             && (!verified.invalid.is_empty() || !verified.reopen_finalize.is_empty());
         accepted_hold_rewrite(current, verified.post_retry_validated, needs_download);
-        if needs_download && !current.held() && current.status != JobStatus::Paused {
+        // A job whose terminal is recorded never re-enters the download
+        // queue (contract §2.1: the terminal is emitted once, never revised).
+        let terminal = current
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM);
+        if needs_download && !terminal && !current.held() && current.status != JobStatus::Paused {
             current.status = JobStatus::Queued;
         }
         recompute_job_totals(current);
@@ -851,7 +943,11 @@ impl Owner {
             }
             owner.allocation_cache.insert(job,verified.allocation);
             if verified.publication_repair {
-                owner.hold_job(job,nzbd_types::HoldCause::IdentityConflict,"finalize","legacy publication has proven invalid ranges; Retry restores download-owned partial for repair");
+                // The retained partial is repairable by runner itself: the
+                // retry restores the download-owned partial for repair. It is
+                // retried on the ladder and bounded by the hold deadline
+                // (contract §2.3); it is not a terminal.
+                owner.hold_job(job,nzbd_types::HoldCause::StorageUnavailable,"finalize","legacy publication has proven invalid ranges; retry restores download-owned partial for repair");
                 owner.block_verification(job,VerificationFailure::conflict("corrupt download publication requires an explicit generation-safe repair transition",verified.checked_bytes));
                 owner.dirty=true;owner.publish_now();owner.bump_epoch();return;
             }
@@ -862,6 +958,10 @@ impl Owner {
                 for file in finalize{owner.send_finalize(job,file);}
                 owner.check_job_complete(job);
             }
+            // The reader has joined and its evidence is durably acknowledged.
+            // Fill its freed root slot now; waiting for the one-second owner
+            // tick adds a second per queued job after authority adoption.
+            owner.start_verifications();
         });
     }
 }
@@ -1012,9 +1112,13 @@ fn verify_job(
     cancel: &CancellationToken,
     ticket: u64,
 ) -> Result<VerifiedJob, VerificationFailure> {
-    verify_job_batch(job, allocation, inventory, cancel, ticket, None, false)
+    verify_job_batch(
+        job, allocation, inventory, cancel, ticket, None, false, false,
+    )
 }
 
+// One verification pass's inputs; each is a distinct fence or policy.
+#[allow(clippy::too_many_arguments)]
 fn verify_job_batch(
     job: &Job,
     allocation: Artifact,
@@ -1023,6 +1127,7 @@ fn verify_job_batch(
     ticket: u64,
     partial: Option<VerifiedJob>,
     bounded: bool,
+    stamp_legacy: bool,
 ) -> Result<VerifiedJob, VerificationFailure> {
     let mut checked = partial.as_ref().map_or(0, |partial| partial.checked_bytes);
     let batch_started = std::time::Instant::now();
@@ -1049,7 +1154,7 @@ fn verify_job_batch(
         || current.path != allocation.path
         || current.root != allocation.root
     {
-        return Err(VerificationFailure::conflict(
+        return Err(VerificationFailure::stale(
             "allocation authority changed before verification",
             checked,
         ));
@@ -1069,8 +1174,11 @@ fn verify_job_batch(
             .validate_post_retry(job.id.0)
             .map_err(|error| VerificationFailure::conflict(error, checked))?;
     }
+    // Review #283-1: a restart's reconciliation pass on this source (an open
+    // publication move being finished) holds it momentarily; verification
+    // serializes behind it instead of failing against it and backing off.
     let custody = inventory
-        .acquire_terminal_use(job.id.0, &check)
+        .acquire_terminal_use_after_reconciliation(job.id.0, &check)
         .map_err(|error| VerificationFailure::unavailable(error, checked))?
         .ok_or_else(|| {
             VerificationFailure::conflict("allocation custody is unavailable", checked)
@@ -1145,8 +1253,15 @@ fn verify_job_batch(
         let file_generation = parameter(job, &format!("*File:generation:{}", file.id.0))
             .map(str::to_owned)
             .unwrap_or_else(|| format!("verification-{ticket}-{}", file.id.0));
-        let proof = parameter(job, &format!("*File:proof:{}", file.id.0))
-            .and_then(|raw| serde_json::from_str::<DurableFileProof>(raw).ok());
+        let proof_param = parameter(job, &format!("*File:proof:{}", file.id.0));
+        // No-wedge item 5 (Paul, 2026-11-11; overrides
+        // STARTUP_VERIFICATION_PLAN §3.1/§3.4/§4): a legacy `Done` range —
+        // no writer proof of any kind, on a job this installation's own
+        // snapshot carried at boot — is stamped at first open from the
+        // file's stat, without reading it. PAR verification in
+        // post-processing is the backstop for its bytes.
+        let stamp = stamp_legacy && proof_param.is_none();
+        let proof = proof_param.and_then(|raw| serde_json::from_str::<DurableFileProof>(raw).ok());
         let publication = parameter(job, &format!("*File:publication:{}", file.id.0))
             .or_else(|| {
                 proof
@@ -1163,8 +1278,8 @@ fn verify_job_batch(
                 format!("file {} has conflicting payload identities", file.id.0),
                 checked,
             ),
-            recovery::ResolveError::Unavailable(reason) => {
-                VerificationFailure::unavailable(reason, checked)
+            recovery::ResolveError::Unavailable { message, .. } => {
+                VerificationFailure::unavailable(message, checked)
             }
         })?;
         let Some(resolved) = resolved else {
@@ -1249,9 +1364,9 @@ fn verify_job_batch(
                     .map(|(_, number)| *number),
             )
             .collect();
-        let mut read_payload = false;
-        let mut descriptor = nzbd_state::fileops::open(&resolved.path)
-            .map_err(|error| VerificationFailure::unavailable(error, checked))?;
+        // A range the writer's durable proof covers is not re-read, and a
+        // file whose every range it covers is not even opened.
+        let mut descriptor: Option<std::fs::File> = None;
         for range in &done {
             if accepted.contains(&range.seg_number) {
                 continue;
@@ -1271,7 +1386,29 @@ fn verify_job_batch(
                 batch_ranges += 1;
                 continue;
             }
-            read_payload = true;
+            if stamp {
+                // A successful stat is the only evidence taken: a range past
+                // the end of the file is absent, every other one is stamped.
+                if range
+                    .end()
+                    .is_some_and(|end| end <= resolved.identity.bytes)
+                {
+                    valid.push(range.clone());
+                } else {
+                    verified.invalid.push((file.id, range.seg_number));
+                }
+                accepted.insert(range.seg_number);
+                batch_ranges += 1;
+                continue;
+            }
+            if descriptor.is_none() {
+                #[cfg(test)]
+                recovery::probe::opened(&resolved.path);
+                descriptor = Some(
+                    nzbd_state::fileops::open(&resolved.path)
+                        .map_err(|error| VerificationFailure::unavailable(error, checked))?,
+                );
+            }
             let cursor = verified.partial_range.get_or_insert_with(|| PartialRange {
                 file: file.id,
                 range: range.clone(),
@@ -1289,8 +1426,14 @@ fn verify_job_batch(
             } else {
                 u64::MAX
             };
-            let (outcome, bytes, complete) =
-                read_piece(&mut descriptor, &resolved.identity, cursor, budget);
+            let (outcome, bytes, complete) = read_piece(
+                descriptor.as_mut().expect("opened above"),
+                &resolved.identity,
+                cursor,
+                budget,
+            );
+            #[cfg(test)]
+            recovery::probe::read(&resolved.path, bytes);
             checked = checked.saturating_add(bytes);
             batch_bytes = batch_bytes.saturating_add(bytes);
             if !complete {
@@ -1327,31 +1470,38 @@ fn verify_job_batch(
             .iter()
             .all(|range| accepted.contains(&range.seg_number));
         // Stamp legacy verification only after a sync of the same opened object;
-        // validate current identity both before and after that sync.
-        let before = recovery::capture_identity(&descriptor)
-            .map_err(|error| VerificationFailure::unavailable(error, checked))?;
-        if before != resolved.identity {
-            return Err(VerificationFailure::conflict(
-                "file changed before verification checkpoint",
-                checked,
-            ));
-        }
-        if read_payload {
+        // validate current identity both before and after that sync. A file
+        // proven entirely by its durable writer proof was never opened: its
+        // resolved identity is the one the proof matched.
+        let identity = if let Some(descriptor) = &descriptor {
+            let before = recovery::capture_identity(descriptor)
+                .map_err(|error| VerificationFailure::unavailable(error, checked))?;
+            if before != resolved.identity {
+                return Err(VerificationFailure::conflict(
+                    "file changed before verification checkpoint",
+                    checked,
+                ));
+            }
             descriptor
                 .sync_data()
                 .map_err(|error| VerificationFailure::unavailable(error, checked))?;
-        }
-        let identity = recovery::capture_identity(&descriptor)
-            .map_err(|error| VerificationFailure::unavailable(error, checked))?;
-        if identity != before {
-            return Err(VerificationFailure::conflict(
-                "file changed during verification checkpoint",
-                checked,
-            ));
-        }
+            let identity = recovery::capture_identity(descriptor)
+                .map_err(|error| VerificationFailure::unavailable(error, checked))?;
+            if identity != before {
+                return Err(VerificationFailure::conflict(
+                    "file changed during verification checkpoint",
+                    checked,
+                ));
+            }
+            identity
+        } else {
+            resolved.identity.clone()
+        };
         let final_path = verified.allocation.path.join(publication);
         let published = match std::fs::symlink_metadata(&final_path) {
             Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                #[cfg(test)]
+                recovery::probe::opened(&final_path);
                 let target = nzbd_state::fileops::open(&final_path)
                     .map_err(|error| VerificationFailure::unavailable(error, checked))?;
                 let target_identity = recovery::capture_identity(&target)
@@ -1463,20 +1613,260 @@ fn verify_job_batch(
     Ok(verified)
 }
 
+/// A pre-v2 hold whose bytes startup verification re-checks and releases
+/// when they prove out (not a terminal: the boot conversion leaves it).
+fn legacy_coverage_hold(control: &nzbd_types::JobControl) -> bool {
+    // `identity_conflict` is how a pre-v2 build wrote it.
+    matches!(
+        control.cause.as_str(),
+        "identity_conflict" | "storage_unavailable"
+    ) && control.stage == "finalize"
+        && control.message == super::COVERAGE_UNVERIFIED
+}
+
+fn legacy_rar_order_hold(control: &nzbd_types::JobControl) -> bool {
+    matches!(control.cause.as_str(), "unknown" | "post_failure")
+        && control.stage == "rar_rename"
+        && control.message
+            == "subprocess failed: RAR set lacks checked order/membership evidence; filenames preserved"
+}
+
+/// What a file's recorded `Done` ranges rest on, decided from metadata
+/// alone (no payload is opened).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileEvidence {
+    /// No `Done` range, or a writer proof of this allocation generation
+    /// covers every one: the writer acknowledged each range only after its
+    /// write, `sync_data` and `fstat` succeeded.
+    Covered,
+    /// `Done` ranges with no proof of any kind (a pre-proof build).
+    Legacy,
+    /// A proof exists but does not bind or cover the recorded ranges.
+    Unproven,
+}
+
+pub(super) fn file_evidence(
+    job: &Job,
+    file: &nzbd_types::FileEntry,
+    allocation_generation: &str,
+    installation: &str,
+) -> FileEvidence {
+    let done = ranges(file);
+    if done.is_empty() {
+        return FileEvidence::Covered;
+    }
+    // A job admitted to post-processing keeps its download proof as the
+    // publication proof; it is the same writer evidence.
+    let raw = parameter(job, &format!("*File:proof:{}", file.id.0))
+        .or_else(|| parameter(job, &format!("*File:publication-proof:{}", file.id.0)));
+    let Some(raw) = raw else {
+        return FileEvidence::Legacy;
+    };
+    let Ok(proof) = serde_json::from_str::<DurableFileProof>(raw) else {
+        return FileEvidence::Unproven;
+    };
+    let generation = parameter(job, &format!("*File:generation:{}", file.id.0)).unwrap_or("");
+    if proof.covers(
+        generation,
+        allocation_generation,
+        installation,
+        &proof.identity,
+        &done,
+    ) {
+        FileEvidence::Covered
+    } else {
+        FileEvidence::Unproven
+    }
+}
+
+/// What one stat per file found at post-processing admission (finding 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AdmissionStat {
+    /// Every proven file is the proof's object and large enough.
+    Fits,
+    /// A file is gone, replaced, or shorter than its highest proven range:
+    /// its ranges are not on disk.
+    Short(String),
+    /// The storage did not answer; retried later, never proof of loss.
+    Unavailable(String),
+}
+
+/// The files of a job whose recorded ranges a proof vouches for, as
+/// `(file, publication name, proof object, highest proven end)`.
+/// Verification can do nothing for this job: a torrent, a failed job kept
+/// only for cleanup, or one whose post-processing already ended downloads
+/// nothing more, so `queue_verification` makes no ticket for it.
+/// Anything that would wait on a verification of such a job must not.
+pub(super) fn verification_inert(job: &Job) -> bool {
+    job.torrent.is_some()
+        || super::transitions::failed_cleanup_only(job)
+        || job
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+}
+
+pub(super) fn proven_files(job: &Job) -> Vec<(nzbd_types::FileId, String, Identity, u64)> {
+    job.files
+        .iter()
+        .filter_map(|file| {
+            let done = ranges(file);
+            let end = done.iter().filter_map(ProvenRange::end).max()?;
+            let raw = parameter(job, &format!("*File:proof:{}", file.id.0))
+                .or_else(|| parameter(job, &format!("*File:publication-proof:{}", file.id.0)))?;
+            let proof = serde_json::from_str::<DurableFileProof>(raw).ok()?;
+            let name = proof
+                .publication_name
+                .clone()
+                .unwrap_or_else(|| file.filename.clone());
+            Some((file.id, name, proof.identity, end))
+        })
+        .collect()
+}
+
+/// One stat per proven file, through the writer's own resolver: same
+/// object as the proof and size at least the highest proven range end.
+pub(super) fn stat_proven_files(
+    dir: &std::path::Path,
+    files: &[(nzbd_types::FileId, String, Identity, u64)],
+) -> AdmissionStat {
+    for (file, name, identity, end) in files {
+        match recovery::resolve_payload(dir, *file, name) {
+            Ok(Some(payload)) => {
+                if !payload.identity.same_object(identity) {
+                    return AdmissionStat::Short(format!("file {} was replaced", file.0));
+                }
+                if payload.identity.bytes < *end {
+                    return AdmissionStat::Short(format!(
+                        "file {} is {} bytes, shorter than its proven {end}",
+                        file.0, payload.identity.bytes
+                    ));
+                }
+            }
+            Ok(None) => return AdmissionStat::Short(format!("file {} is missing", file.0)),
+            Err(recovery::ResolveError::IdentityConflict) => {
+                return AdmissionStat::Short(format!("file {} has conflicting aliases", file.0))
+            }
+            Err(recovery::ResolveError::Unavailable { message, .. }) => {
+                return AdmissionStat::Unavailable(message)
+            }
+        }
+    }
+    AdmissionStat::Fits
+}
+
+impl Owner {
+    /// Whether every recorded range of the job rests on evidence that needs
+    /// no verification pass before its writer or post-processing admission.
+    /// A legacy range of a boot job counts: it is stamped at first open.
+    pub(super) fn payload_evidence_sufficient(&self, job: &Job) -> bool {
+        if !job.files.iter().any(|file| file.has_any_done()) {
+            return true;
+        }
+        let Some(allocation) = self.allocation_cache.get(&job.id) else {
+            return false;
+        };
+        job.files.iter().all(|file| {
+            match file_evidence(
+                job,
+                file,
+                &allocation.generation,
+                &self.artifacts.installation,
+            ) {
+                FileEvidence::Covered => true,
+                FileEvidence::Legacy | FileEvidence::Unproven => false,
+            }
+        })
+    }
+
+    /// Startup classification (no-wedge item 3): only a job that genuinely
+    /// needs a check before it can move gets a verification ticket. Proven
+    /// jobs, paused jobs and legacy boot jobs get none; their check, if any,
+    /// happens lazily at writer spawn or post-processing admission.
+    pub(super) fn startup_ticket_needed(&self, job: &Job) -> bool {
+        if self.startup_intent_jobs.contains(&job.id)
+            || job
+                .params
+                .iter()
+                .any(|(key, _)| key == "*Recovery:publication-repair")
+        {
+            return true;
+        }
+        // Pre-v2 holds that only a verification pass releases.
+        if job.held()
+            && job.control().is_some_and(|control| {
+                legacy_coverage_hold(&control) || legacy_rar_order_hold(&control)
+            })
+        {
+            return true;
+        }
+        if job.status == JobStatus::Paused {
+            return false;
+        }
+        let Some(allocation) = self.allocation_cache.get(&job.id) else {
+            // Completion evidence without an allocation needs recovery
+            // before any writer may resolve a path for it.
+            return job.files.iter().any(|file| file.has_any_done());
+        };
+        let boot = self.boot_jobs.contains(&job.id);
+        job.files.iter().any(|file| {
+            match file_evidence(
+                job,
+                file,
+                &allocation.generation,
+                &self.artifacts.installation,
+            ) {
+                FileEvidence::Covered => false,
+                FileEvidence::Legacy => !boot,
+                FileEvidence::Unproven => true,
+            }
+        })
+    }
+
+    /// Release a startup "loading" ticket the classification found
+    /// unnecessary, and do what verification's acceptance would have done.
+    pub(super) fn release_startup_ticket(&mut self, job: JobId) {
+        if self
+            .verification
+            .get(&job)
+            .is_none_or(|state| state.running || state.phase != "loading")
+        {
+            return;
+        }
+        self.verification.remove(&job);
+        if let Some(current) = self.state.job_mut(job) {
+            set_owner_param(&mut current.params, PENDING, None);
+            set_owner_param(&mut current.params, REASON, None);
+        }
+        self.dirty = true;
+        if self.state.job(job).is_some_and(|job| {
+            !job.held() && matches!(job.status, JobStatus::Queued | JobStatus::Downloading)
+        }) {
+            let finalize = self
+                .state
+                .job(job)
+                .unwrap()
+                .files
+                .iter()
+                .filter(|file| file.is_terminal() && file.has_any_done() && !file.finalized)
+                .map(|file| file.id)
+                .collect::<Vec<_>>();
+            for file in finalize {
+                self.send_finalize(job, file);
+            }
+            self.check_job_complete(job);
+        }
+    }
+}
+
 fn accepted_hold_rewrite(job: &mut Job, post_retry_validated: bool, needs_download: bool) {
     let Some(mut control) = job.control().filter(|control| {
         control.version == 1 && control.lifecycle == "held" && !control.manual_pause
     }) else {
         return;
     };
-    let finalize = control.cause == "identity_conflict"
-        && control.stage == "finalize"
-        && control.message == "file coverage or expected size is unverified; partial retained";
-    let rar = post_retry_validated
-        && matches!(control.cause.as_str(), "unknown" | "post_failure")
-        && control.stage == "rar_rename"
-        && control.message
-            == "subprocess failed: RAR set lacks checked order/membership evidence; filenames preserved";
+    let finalize = legacy_coverage_hold(&control);
+    let rar = post_retry_validated && legacy_rar_order_hold(&control);
     if !finalize && !rar {
         return;
     }
@@ -1619,6 +2009,7 @@ mod tests {
             11,
             None,
             true,
+            false,
         )
         .unwrap();
         assert!(!first.complete);
@@ -1637,6 +2028,7 @@ mod tests {
                 11,
                 Some(result),
                 true,
+                false,
             )
             .unwrap();
         }
@@ -1671,13 +2063,23 @@ mod tests {
             11,
             None,
             true,
+            false,
         )
         .unwrap();
         assert!(!first.complete);
         assert_eq!(first.checked_bytes, BATCH_BYTES);
         assert_eq!(first.partial_range.as_ref().unwrap().read, BATCH_BYTES);
-        let second =
-            verify_job_batch(&job, allocation, &inventory, &cancel, 11, Some(first), true).unwrap();
+        let second = verify_job_batch(
+            &job,
+            allocation,
+            &inventory,
+            &cancel,
+            11,
+            Some(first),
+            true,
+            false,
+        )
+        .unwrap();
         assert!(second.complete);
         assert_eq!(second.checked_bytes, bytes.len() as u64);
         assert!(second.invalid.is_empty());
@@ -1706,13 +2108,22 @@ mod tests {
             11,
             None,
             true,
+            false,
         )
         .unwrap();
         std::fs::rename(&path, path.with_extension("old")).unwrap();
         std::fs::write(&path, &bytes).unwrap();
-        let failure =
-            verify_job_batch(&job, allocation, &inventory, &cancel, 11, Some(first), true)
-                .unwrap_err();
+        let failure = verify_job_batch(
+            &job,
+            allocation,
+            &inventory,
+            &cancel,
+            11,
+            Some(first),
+            true,
+            false,
+        )
+        .unwrap_err();
         assert!(failure.review_required);
         assert!(failure.reason.contains("identity"));
     }
@@ -1915,5 +2326,47 @@ mod tests {
         assert_eq!(std::fs::read(&publication).unwrap(), b"abcdef");
         assert!(!allocation.path.join(".runner-file-1.part").exists());
         drop(held);
+    }
+}
+
+#[cfg(test)]
+mod admission_stat_tests {
+    use super::*;
+
+    /// Finding 7: post-processing admission stats each proven file once: a
+    /// same-inode file truncated below its highest proven end, a replaced
+    /// one and a missing one all fail; the intact one fits.
+    #[test]
+    fn admission_stat_requires_the_proof_object_and_its_proven_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.bin");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let identity =
+            recovery::capture_identity(&nzbd_state::fileops::open(&path).unwrap()).unwrap();
+        let files = vec![(nzbd_types::FileId(2), "out.bin".to_string(), identity, 8)];
+        assert_eq!(stat_proven_files(dir.path(), &files), AdmissionStat::Fits);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+        assert!(matches!(
+            stat_proven_files(dir.path(), &files),
+            AdmissionStat::Short(why) if why.contains("shorter")
+        ));
+        // A new object at the name (created before the old one goes, so its
+        // inode differs).
+        std::fs::write(dir.path().join("new.bin"), b"abcdefgh").unwrap();
+        std::fs::rename(dir.path().join("new.bin"), &path).unwrap();
+        assert!(matches!(
+            stat_proven_files(dir.path(), &files),
+            AdmissionStat::Short(why) if why.contains("replaced")
+        ));
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            stat_proven_files(dir.path(), &files),
+            AdmissionStat::Short(why) if why.contains("missing")
+        ));
     }
 }

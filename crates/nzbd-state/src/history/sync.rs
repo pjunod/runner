@@ -227,6 +227,10 @@ impl HistoryDb {
             ));
         }
         if self.sync.mode == HistoryMode::LocalOnly && !self.sync.dirty.load(Ordering::SeqCst) {
+            // A successful local writer can clear the transient dirty flag after
+            // interrupting replay. No repair remains, so retire the old failure
+            // without claiming that another reconciliation actually ran.
+            self.sync.progress.lock().unwrap().last_error = None;
             return Ok(());
         }
         if self
@@ -692,6 +696,42 @@ fn index_marker(dir: &Path, tag: Option<&str>) -> PathBuf {
     )
 }
 
+/// The active index a marker names. A relative marker is relative to the
+/// state directory. An absolute one (written by older builds) is taken as
+/// is when it exists; when it does not — the state directory was moved — the
+/// same index under this state directory is found by its trailing path
+/// (shortest tail first: `history.sqlite`, then `<dir>/history.sqlite`, …),
+/// so a moved state directory opens without editing the marker. Only the
+/// configured index (`target`) is accepted that way: an absolute marker
+/// naming an index elsewhere (`history.index_dir` on a mount that is down)
+/// is never swapped for a different file. Otherwise the recorded path
+/// stands and the caller reports it missing.
+fn resolve_index_marker(raw: &str, state: &Path, target: &Path) -> PathBuf {
+    let recorded = PathBuf::from(raw.trim_end_matches(['\n', '\r']));
+    if recorded.is_relative() {
+        return state.join(recorded);
+    }
+    if recorded.exists() {
+        return recorded;
+    }
+    let parts = recorded
+        .components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for start in (0..parts.len()).rev() {
+        let candidate = parts[start..]
+            .iter()
+            .fold(state.to_path_buf(), |path, part| path.join(part));
+        if candidate == target && candidate.exists() {
+            return candidate;
+        }
+    }
+    recorded
+}
+
 /// Startup holds the portable writer lock, so a new location cannot race an
 /// already running daemon using the same history authority. VACUUM INTO reads
 /// committed WAL state and preserves rowids and sqlite_sequence.
@@ -705,10 +745,23 @@ pub(super) fn prepare_index(
         return Ok(());
     };
     let marker = index_marker(logs, tag);
-    let source = match fsx::read_to_string(&marker) {
-        Ok(path) => PathBuf::from(path),
-        Err(e) if e.is_not_found() => state.join("history.sqlite"),
+    // The state-relative marker (written beside the absolute one) moves with
+    // the state directory and is authoritative when present.
+    let relative = match fsx::read_to_string(&relative_marker(&marker)) {
+        Ok(path) if !path.trim().is_empty() => {
+            Some(state.join(path.trim_end_matches(['\n', '\r'])))
+        }
+        Ok(_) => None,
+        Err(e) if e.is_not_found() => None,
         Err(e) => return Err(e),
+    };
+    let source = match relative {
+        Some(source) => source,
+        None => match fsx::read_to_string(&marker) {
+            Ok(path) => resolve_index_marker(&path, state, target),
+            Err(e) if e.is_not_found() => state.join("history.sqlite"),
+            Err(e) => return Err(e),
+        },
     };
     if fsx::exists(&marker)? && !fsx::exists(&source)? {
         return Err(StateError::Corrupt(format!(
@@ -742,9 +795,25 @@ pub(super) fn prepare_index(
     if fsx::exists(&tmp)? {
         fsx::remove_file(&tmp)?;
     }
+    // W5b / finding 9: an ordinary READ_ONLY open of a WAL database maps a
+    // `-shm` file (which a network filesystem cannot share). Open it like
+    // `Inventory::validate_expected`: read-write so byte-range EXCLUSIVE
+    // locking is possible (in-memory WAL index, no -shm) and no checkpoint
+    // on close so it is left as found. Not `query_only`: SQLite refuses
+    // `VACUUM INTO` under it, and the only statement run here writes the
+    // copy, never this file.
     let source_conn =
-        Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        Connection::open_with_flags(&source, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(sql_error)?;
+    source_conn
+        .set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .map_err(sql_error)?;
+    source_conn
+        .pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .map_err(sql_error)?;
     source_conn
         .execute("VACUUM INTO ?1", [tmp.to_string_lossy().as_ref()])
         .map_err(sql_error)?;
@@ -767,12 +836,41 @@ pub(super) fn record_index_path(
     };
     let path = index_marker(logs, tag);
     let target = fsx::canonicalize(target)?;
+    // Two forms: the absolute marker every build reads (so a rollback to an
+    // older build still opens the index), and, for an index inside the
+    // state directory, a relative one that moves with the directory, which
+    // this build prefers. `history.index_dir` elsewhere gets no relative
+    // form.
+    write_marker(&path, &target.to_string_lossy())?;
+    let state = spool
+        .and_then(Path::parent)
+        .and_then(|state| fsx::canonicalize(state).ok());
+    let relative = state
+        .as_deref()
+        .and_then(|state| target.strip_prefix(state).ok())
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(Path::to_path_buf);
+    let rel_path = relative_marker(&path);
+    match relative {
+        Some(relative) => write_marker(&rel_path, &relative.to_string_lossy()),
+        None if fsx::exists(&rel_path)? => fsx::remove_file(&rel_path),
+        None => Ok(()),
+    }
+}
+
+fn relative_marker(marker: &Path) -> PathBuf {
+    let mut name = marker.file_name().unwrap_or_default().to_os_string();
+    name.push(".rel");
+    marker.with_file_name(name)
+}
+
+fn write_marker(path: &Path, value: &str) -> Result<(), StateError> {
     let tmp = path.with_extension("tmp");
     let mut f = fsx::create(&tmp)?;
-    fsx::write_whole(&mut f, target.to_string_lossy().as_bytes(), &tmp)?;
+    fsx::write_whole(&mut f, value.as_bytes(), &tmp)?;
     fsx::sync_data(&f, &tmp)?;
-    fsx::rename(&tmp, &path)?;
-    fsx::sync_parent(&path)
+    fsx::rename(&tmp, path)?;
+    fsx::sync_parent(path)
 }
 
 #[cfg(test)]
@@ -828,6 +926,11 @@ mod tests {
         db.conn.lock().unwrap().execute_batch("CREATE TRIGGER fail_insert BEFORE INSERT ON history BEGIN SELECT RAISE(FAIL,'injected'); END;").unwrap();
         assert!(db.record_seq_durable(&entry(2, 200)).is_err());
         assert!(db.sync_status().repair_pending);
+        due(&db);
+        assert!(db.refresh().is_err());
+        assert_eq!(db.sync_status().state, "failed");
+        assert!(db.sync_status().last_error.is_some());
+        assert!(db.sync_status().repair_pending);
         db.conn
             .lock()
             .unwrap()
@@ -839,7 +942,36 @@ mod tests {
         assert!(!db.sync_status().repair_pending);
         due(&db);
         db.refresh().unwrap();
-        assert_eq!(db.sync_status().passes, 2);
+        assert_eq!(
+            db.sync_status().passes,
+            3,
+            "startup, failed repair, successful repair"
+        );
+    }
+
+    #[test]
+    fn clean_local_history_retires_interrupted_replay_without_claiming_a_scan() {
+        let t = tempfile::tempdir().unwrap();
+        let db = local(t.path(), t.path());
+        let last_success = db.sync.progress.lock().unwrap().last_success;
+        let passes = db.sync_status().passes;
+        let generation = db.sync.generation.load(Ordering::SeqCst);
+        db.record(&entry(1, 100)).unwrap();
+        let conflict = db.replay_checkpoint(true, generation).unwrap_err();
+        // The worker stores this result after the successful local writer has
+        // already cleared its transient dirty flag.
+        db.sync.progress.lock().unwrap().last_error = Some(conflict.to_string());
+        assert_eq!(db.sync_status().state, "failed");
+        assert!(!db.sync_status().repair_pending);
+
+        db.refresh().unwrap();
+
+        let status = db.sync_status();
+        assert_eq!(status.state, "idle");
+        assert!(status.last_error.is_none());
+        assert_eq!(status.passes, passes);
+        assert_eq!(db.sync.progress.lock().unwrap().last_success, last_success);
+        assert_eq!(db.count_filtered(true).unwrap(), 1);
     }
 
     #[test]
@@ -1003,18 +1135,19 @@ mod tests {
     }
 
     #[test]
-    fn readers_do_not_wait_for_the_reconciliation_gate_or_writer_connection() {
+    fn readers_do_not_wait_for_the_reconciliation_gate() {
+        // W5b: reads share the one EXCLUSIVE connection, so they serialize
+        // behind a bounded replay batch, never behind the reconciliation
+        // gate that spans a whole refresh.
         let t = tempfile::tempdir().unwrap();
         let db = Arc::new(local(t.path(), t.path()));
         db.record(&entry(1, 100)).unwrap();
         let gate = db.sync.gate.lock().unwrap();
-        let writer = db.conn.lock().unwrap();
         let (send, recv) = std::sync::mpsc::channel();
         let other = db.clone();
         let task =
             std::thread::spawn(move || send.send(other.read_page(20, 0, None).unwrap().1).unwrap());
         let result = recv.recv_timeout(Duration::from_secs(2));
-        drop(writer);
         drop(gate);
         task.join().unwrap();
         assert_eq!(result.unwrap(), 1);
@@ -1097,8 +1230,9 @@ mod tests {
             .unwrap();
         db.mark_seen(&[crate::JobId(1)], Some("consumer"), 201)
             .unwrap();
-        assert_eq!(db.list_filtered(1, true).unwrap()[0].seen_count, 0);
         drop(writer);
+        // Reads share the writer connection (W5b): look once it is free.
+        assert_eq!(db.list_filtered(1, true).unwrap()[0].seen_count, 0);
         db.flush_seen().unwrap();
         let row = db.list_filtered(1, true).unwrap().remove(0);
         assert_eq!(row.seen_count, 2);
@@ -1139,29 +1273,23 @@ mod tests {
     }
 
     #[test]
-    fn migration_reads_committed_wal_instead_of_copying_only_main_file() {
+    fn migration_copies_committed_state_and_neither_index_has_shm() {
         let t = tempfile::tempdir().unwrap();
         let state = t.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
         let db =
             HistoryDb::open(&state.join("history.sqlite"), Some(&state.join("history"))).unwrap();
         db.record(&entry(1, 100)).unwrap();
-        let pinned = Connection::open(state.join("history.sqlite")).unwrap();
-        pinned
-            .execute_batch("BEGIN; SELECT * FROM history;")
-            .unwrap();
         let seq = db.record_seq(&entry(2, 200)).unwrap();
+        // W5b: an EXCLUSIVE-mode index has no `-shm`, ever.
+        assert!(!state.join("history.sqlite-shm").exists());
         drop(db);
-        assert!(
-            std::fs::metadata(state.join("history.sqlite-wal"))
-                .unwrap()
-                .len()
-                > 0
-        );
         let migrated = local(&state, &t.path().join("local"));
         assert_eq!(migrated.count_filtered(true).unwrap(), 2);
         assert_eq!(migrated.list_filtered(1, true).unwrap()[0].seq, seq);
-        drop(pinned);
+        assert!(!t.path().join("local/history.sqlite-shm").exists());
+        // Finding 9: reading the old index for the copy maps no `-shm` either.
+        assert!(!state.join("history.sqlite-shm").exists());
     }
 
     #[test]
@@ -1175,6 +1303,79 @@ mod tests {
         assert!(db.start_worker().is_err());
         worker.stop();
         assert!(db.refresh().is_err());
+    }
+
+    /// Moving the whole state directory (here `queue` → `state`) opens the
+    /// same index without editing the marker: it is recorded relative to the
+    /// state directory, and an older build's absolute marker naming the old
+    /// location resolves to the same index under the new one.
+    #[test]
+    fn moving_the_state_directory_needs_no_marker_edit() {
+        let t = tempfile::tempdir().unwrap();
+        let old = t.path().join("queue");
+        {
+            let db = local(&old, &old);
+            db.record(&entry(1, 100)).unwrap();
+        }
+        let marker = |state: &Path| state.join("history/.history-index-path");
+        assert_eq!(
+            std::fs::read_to_string(old.join("history/.history-index-path.rel")).unwrap(),
+            "history.sqlite",
+            "recorded relative to the state directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker(&old)).unwrap(),
+            std::fs::canonicalize(old.join("history.sqlite"))
+                .unwrap()
+                .to_string_lossy(),
+            "and absolute, for an older build"
+        );
+        let new = t.path().join("state");
+        std::fs::rename(&old, &new).unwrap();
+        {
+            let db = local(&new, &new);
+            assert_eq!(db.count_filtered(true).unwrap(), 1);
+            db.record(&entry(2, 200)).unwrap();
+        }
+        // The pre-fix marker alone: the absolute path of the old location.
+        std::fs::remove_file(new.join("history/.history-index-path.rel")).unwrap();
+        std::fs::write(
+            marker(&new),
+            old.join("history.sqlite").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        let db = local(&new, &new);
+        assert_eq!(db.count_filtered(true).unwrap(), 2);
+        drop(db);
+        // A copy-style move with this build's markers: the old copy still
+        // exists, and the relative marker names the copy under the state
+        // directory, which is the active one.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::copy(new.join("history.sqlite"), old.join("history.sqlite")).unwrap();
+        let db = local(&new, &new);
+        assert_eq!(db.count_filtered(true).unwrap(), 2);
+        drop(db);
+        std::fs::remove_dir_all(&old).unwrap();
+        // A missing index whose path does not end in the configured one is
+        // never swapped for a different file.
+        std::fs::remove_file(new.join("history/.history-index-path.rel")).unwrap();
+        std::fs::write(
+            marker(&new),
+            t.path()
+                .join("elsewhere/other.sqlite")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(HistoryDb::open_configured(
+            &new.join("history.sqlite"),
+            Some(&new.join("history")),
+            None,
+            HistoryMode::LocalOnly,
+            Some(&new.join("nzbs"))
+        )
+        .is_err());
     }
 
     #[test]
@@ -1240,7 +1441,7 @@ mod tests {
     fn query_plan_uses_history_ordering_index() {
         let t = tempfile::tempdir().unwrap();
         let db = local(t.path(), t.path());
-        let c = db.reader.lock().unwrap();
+        let c = db.conn.lock().unwrap();
         let mut q=c.prepare("EXPLAIN QUERY PLAN SELECT * FROM history ORDER BY completed_at DESC,id DESC LIMIT 20 OFFSET 500").unwrap();
         let plan = q
             .query_map([], |r| r.get::<_, String>(3))

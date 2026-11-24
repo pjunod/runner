@@ -1,6 +1,6 @@
 import * as DocumentPicker from 'expo-document-picker';
 import { File } from 'expo-file-system';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   Alert,
   Modal,
@@ -52,10 +52,16 @@ import { useCollapsedSections } from '../storage/queuePreferences';
 import { SeedPolicyEditor } from '../components/SeedPolicyEditor';
 import { controlPendingLabel, controlPendingText } from '../controlPending';
 import { acquisitionStatus, torrentDisplayPhase, torrentStatus, torrentPrimaryAction, seedPolicyText, seedStopText, isTorrentAcquisition, isSeedTorrent } from '../torrentPresentation';
-import { urlFetchDetail, useNow } from '../urlFetchPresentation';
+import { canRetryFetchNow, urlFetchDetail, useNow } from '../urlFetchPresentation';
 import { HistoryView } from './HistoryView';
 import { LogsView } from './LogsView';
 import { holdAction } from '../holdAction';
+import { holdDeadlineText, holdHeadline } from '../holdPresentation';
+import { QUEUE_LANES, QueueLane, laneNotice, lanePaused, laneToggleAction, laneToggleLabel, pausedIndicator } from '../queueLanes';
+import { StorageIoState, StorageIoStore, createStorageIoStore, storageIoBars, storageIoText, storageKey } from '../storageIo';
+
+/** For a hook (or test double) that supplies no I/O store. */
+const noStorageIo = createStorageIoStore();
 
 type AppSection = 'queue' | 'history' | 'logs';
 
@@ -87,6 +93,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     error,
     busyKey,
     lastUpdated,
+    storageIo,
     refresh,
     queueAction,
     jobAction,
@@ -113,12 +120,14 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
       | 'move-top'
       | 'move-up'
       | 'move-down'
-      | 'move-bottom',
+      | 'move-bottom'
+      | 'retry-fetch',
   ) => {
     try {
       const result = await jobAction(job.id, action);
       if (activeConfig.current !== config) return;
       if (result.message) setNotice(result.message);
+      if (action === 'retry-fetch') setNotice(`Retrying the NZB fetch for ${job.name}.`);
       if (result.seedOptions != null) {
         setExpanded(result.seedOptions); setSeedExplanation(result.message ?? null); setSeedEditor(result.seedOptions);
       }
@@ -162,12 +171,12 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
     }
   };
 
-  const toggleQueue = async () => {
+  const toggleLane = async (lane: QueueLane) => {
     if (!status) return;
-    const action = status.download_paused ? 'resume' : 'pause';
+    const action = laneToggleAction(lane, lanePaused(status, lane));
     try {
       await queueAction(action);
-      setNotice(action === 'pause' ? 'Queue paused.' : 'Queue resumed.');
+      setNotice(laneNotice(action));
     } catch {
       // The hook owns the visible error banner.
     }
@@ -256,13 +265,21 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
         <View style={styles.headerActions}>
           <ThemeSwitcher compact />
           {activeSection === 'queue' ? (
-            <ActionButton
-              compact
-              disabled={!status || busyKey !== null}
-              label={status?.download_paused ? 'Resume' : 'Pause'}
-              loading={busyKey?.startsWith('queue:')}
-              onPress={() => void toggleQueue()}
-            />
+            QUEUE_LANES.map(({ lane, name }) => {
+              const paused = !!status && lanePaused(status, lane);
+              return (
+                <ActionButton
+                  accessibilityLabel={laneToggleLabel(lane, paused)}
+                  compact
+                  disabled={!status || busyKey !== null}
+                  key={lane}
+                  label={`${paused ? '\u25B6' : '\u23F8'} ${name}`}
+                  loading={busyKey === `queue:${laneToggleAction(lane, paused)}`}
+                  onPress={() => void toggleLane(lane)}
+                  variant={paused ? 'latched' : 'secondary'}
+                />
+              );
+            })
           ) : null}
           <ActionButton compact label="Add" onPress={() => setAddOpen(true)} variant="primary" />
           <ActionButton compact label="Server" onPress={onEditConnection} variant="ghost" />
@@ -297,7 +314,7 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
       {activeSection === 'queue' && status ? (
         <View style={styles.overviewDock}>
-          <Overview status={status} styles={styles} wide={wide} />
+          <Overview status={status} storageIo={storageIo ?? noStorageIo} styles={styles} wide={wide} />
         </View>
       ) : null}
 
@@ -425,18 +442,23 @@ export function DashboardScreen({ config, onEditConnection }: Props) {
 
 function Overview({
   status,
+  storageIo: storageIoStore,
   styles,
   wide,
 }: {
   status: StatusDto;
+  storageIo: StorageIoStore;
   styles: ReturnType<typeof makeStyles>;
   wide: boolean;
 }) {
+  const pausedText = pausedIndicator(status);
   const eta = status.download_paused
     ? 'paused'
     : status.download_rate_bps > 0
       ? formatDuration(status.remaining_bytes / status.download_rate_bps)
       : '—';
+  // Subscribed here so the once-a-second graph update re-renders only this block.
+  const storageIo = useSyncExternalStore(storageIoStore.subscribe, storageIoStore.get);
   const volumes = status.storage ?? [];
   const critical = criticalStorage(volumes);
   const criticalUsage = critical ? storageUsage(critical) : null;
@@ -444,6 +466,7 @@ function Overview({
     <View style={styles.overviewBlocks}>
       <View style={styles.queueSummaryBlock}>
         <Text style={styles.overviewBlockTitle}>Queue</Text>
+        {pausedText ? <Text style={styles.queuePausedText}>{pausedText}</Text> : null}
         <View style={[styles.queueSummaryGrid, wide && styles.queueSummaryGridWide]}>
           <SummaryMetric
             label="Speed"
@@ -470,8 +493,14 @@ function Overview({
       <View style={styles.storageBlock}>
         <View style={styles.storageBlockHeading}>
           <Text style={styles.overviewBlockTitle}>Storage volumes</Text>
+          <View style={styles.storageLegend}>
+            <View style={[styles.storageLegendSwatch, styles.storageLegendWrite]} />
+            <Text style={styles.storageLegendText}>write</Text>
+            <View style={[styles.storageLegendSwatch, styles.storageLegendRead]} />
+            <Text style={styles.storageLegendText}>read</Text>
+          </View>
           <Text numberOfLines={1} style={styles.storageCritical}>
-            {criticalUsage && critical ? `critical: ${critical.label}` : 'measuring volumes…'}
+            {criticalUsage && critical ? `critical: ${critical.name || critical.label}` : 'measuring volumes…'}
           </Text>
         </View>
         {volumes.length > 0 ? (
@@ -479,6 +508,8 @@ function Overview({
             {volumes.map((volume, index) => (
               <StorageVolume
                 critical={criticalUsage !== null && volume === critical}
+                io={storageIo.latest[storageKey(volume, index)]}
+                ioSeries={storageIo.history[storageKey(volume, index)]}
                 key={`${volume.path}:${index}`}
                 storage={volume}
                 styles={styles}
@@ -518,11 +549,15 @@ function SummaryMetric({
 function StorageVolume({
   storage,
   critical,
+  io,
+  ioSeries,
   styles,
   wide,
 }: {
   storage: StoragePath;
   critical: boolean;
+  io: StorageIoState['latest'][string];
+  ioSeries: StorageIoState['history'][string] | undefined;
   styles: ReturnType<typeof makeStyles>;
   wide: boolean;
 }) {
@@ -539,16 +574,22 @@ function StorageVolume({
   const capacity = usage
     ? `${formatBytes(usage.usedBytes)} used / ${formatBytes(usage.totalBytes)} total`
     : 'capacity unavailable';
+  // A phone row shares its width with the graph; the percent above already
+  // says used, so the short form is enough there.
+  const capacityShort = usage
+    ? `${formatBytes(usage.usedBytes)} / ${formatBytes(usage.totalBytes)}`
+    : 'capacity unavailable';
 
   return (
     <View
-      accessibilityLabel={`${storage.label}, ${storage.path}, ${percent === null ? 'capacity unavailable' : `${percent} percent used, ${capacity}`}`}
+      accessibilityLabel={`${storageEvidenceLabel(storage)}, ${storage.path}, ${percent === null ? 'capacity unavailable' : `${percent} percent used, ${capacity}`}`}
       style={[
         styles.storageRow,
         wide ? styles.storageRowWide : styles.storageRowPhone,
         critical && styles.storageRowCritical,
       ]}
     >
+      <View style={styles.storageCap}>
       <View style={styles.storageTop}>
         <Text numberOfLines={1} style={styles.storageLabel}>
           {storageEvidenceLabel(storage)}
@@ -581,8 +622,60 @@ function StorageVolume({
         />
       </View>
       <Text numberOfLines={1} style={styles.storageCapacity}>
-        {capacity}
+        {wide ? capacity : capacityShort}
       </Text>
+      </View>
+      <StorageIoGraph io={io} series={ioSeries} styles={styles} wide={wide} />
+    </View>
+  );
+}
+
+/** The last three minutes of writes (filled bars) and reads (marks), with the current rates beside it. */
+function StorageIoGraph({
+  io,
+  series,
+  styles,
+  wide,
+}: {
+  io: StorageIoState['latest'][string];
+  series: StorageIoState['history'][string] | undefined;
+  styles: ReturnType<typeof makeStyles>;
+  wide: boolean;
+}) {
+  const text = storageIoText(io);
+  const { bars, peak } = storageIoBars(series);
+  return (
+    <View
+      accessibilityLabel={`I/O, last 3 minutes. ${text.quiet ? text.write : `${text.write}, ${text.read}`}. ${text.describe}`}
+      style={[styles.storageIo, wide ? styles.storageIoBelow : styles.storageIoBeside]}
+    >
+      <View style={styles.storageIoPlot}>
+        {peak !== null ? (
+          <>
+            {bars.map((bar, index) => (
+              <View key={index} style={styles.storageIoColumn}>
+                {bar.write !== null ? (
+                  <View style={[styles.storageIoWrite, { height: `${Math.max(bar.write * 100, bar.write > 0 ? 4 : 0)}%` }]} />
+                ) : null}
+                {bar.read !== null && bar.read > 0 ? (
+                  <View style={[styles.storageIoRead, { bottom: `${Math.min(bar.read * 100, 96)}%` }]} />
+                ) : null}
+              </View>
+            ))}
+            <Text numberOfLines={1} style={styles.storageIoScale}>{peak > 0 ? formatBytes(peak, '/s') : 'idle'}</Text>
+          </>
+        ) : null}
+      </View>
+      <View style={[styles.storageIoRates, !wide && styles.storageIoRatesBeside, text.quiet && styles.storageIoRatesQuiet]}>
+        {wide ? (
+          <>
+            <Text numberOfLines={1} style={styles.storageIoRate}>{text.write}</Text>
+            {text.quiet ? null : <Text numberOfLines={1} style={styles.storageIoRate}>{text.read}</Text>}
+          </>
+        ) : (
+          <Text numberOfLines={1} style={styles.storageIoRate}>{text.compact}</Text>
+        )}
+      </View>
     </View>
   );
 }
@@ -613,7 +706,7 @@ export function JobCard({
   busy: boolean;
   onToggle: () => void;
   onAction: (
-    action: 'pause' | 'resume' | 'move-top' | 'move-up' | 'move-down' | 'move-bottom',
+    action: 'pause' | 'resume' | 'move-top' | 'move-up' | 'move-down' | 'move-bottom' | 'retry-fetch',
   ) => void;
   onDelete: () => void;
   onPriorityChange: (priority: number) => void;
@@ -642,7 +735,7 @@ export function JobCard({
   // says why it is waiting instead (urlFetchDetail).
   const fetchingNzb = statusKey === 'fetching' && !phase && !acquisition;
   const fetchingAcquisition = statusKey === 'fetching' && acquisition;
-  const now = useNow(30_000, fetchingNzb && !hold);
+  const now = useNow(30_000, fetchingNzb || !!hold);
   const showProgress = !fetchingNzb && !fetchingAcquisition && !postProcessing && !seed && !['fetching_source', 'fetching_metadata', 'failed', 'missing_files'].includes(phase ?? '');
   return (
     <View
@@ -681,7 +774,8 @@ export function JobCard({
             </Text>
           ) : null}
           {pendingLabel ? <Text style={job.controlPending?.state === 'review_required' ? styles.statusFailed : styles.metaText}>{controlPendingText(job)}</Text> : null}
-          {hold ? <Text style={styles.statusFailed}>{hold.message}</Text> : null}
+          {hold ? <Text style={styles.statusFailed}>{holdHeadline(hold)}{hold.manual_pause ? ' · retries paused' : ''}</Text> : null}
+          {hold && holdDeadlineText(hold, now) ? <Text style={styles.metaText}>{holdDeadlineText(hold, now)}</Text> : null}
           {job.verification ? (
             <Text style={styles.metaText}>
               Recovery verification: {job.verification.state}
@@ -769,6 +863,9 @@ export function JobCard({
             ) : null}
             {!phase && canResume ? (
               <ActionButton compact disabled={busy} label="Resume" onPress={() => onAction('resume')} />
+            ) : null}
+            {fetchingNzb && !hold && canRetryFetchNow(job, now) ? (
+              <ActionButton compact disabled={busy} label="Retry now" onPress={() => onAction('retry-fetch')} />
             ) : null}
             {!phase && heldAction ? (
               <ActionButton compact disabled={busy} label={heldAction.label} onPress={() => onAction(heldAction.action)} />
@@ -1216,7 +1313,19 @@ export const makeStyles = (theme: Theme) =>
     connectionRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
     connectionDot: { width: 7, height: 7, borderRadius: 4 },
     serverName: { color: theme.textMuted, fontSize: 10, flexShrink: 1 },
-    headerActions: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+    // Shrinks to the header's width so its buttons wrap instead of running
+    // off a phone screen (the two lane toggles made the row too wide).
+    headerActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      flexWrap: 'wrap',
+      justifyContent: 'flex-end',
+      gap: 5,
+      flexShrink: 1,
+      minWidth: 0,
+      maxWidth: '100%',
+    },
+    queuePausedText: { color: theme.warning, fontSize: 12, fontWeight: '700' },
     errorBanner: {
       paddingHorizontal: 18,
       paddingVertical: 10,
@@ -1380,7 +1489,10 @@ export const makeStyles = (theme: Theme) =>
       borderColor: 'transparent',
       backgroundColor: theme.panelAlt,
     },
-    storageRowPhone: { width: '100%' },
+    // On a phone the graph sits beside capacity, as on the web, so the
+    // pinned overview does not grow; wide cards have room for it below.
+    storageRowPhone: { width: '100%', flexDirection: 'row', alignItems: 'stretch', gap: 8 },
+    storageCap: { flex: 1, minWidth: 0 },
     storageRowWide: { minWidth: 150, flexBasis: 170, flexGrow: 1 },
     storageRowCritical: { borderColor: theme.accent },
     storageTop: { flexDirection: 'row', alignItems: 'center', gap: 5 },
@@ -1419,6 +1531,48 @@ export const makeStyles = (theme: Theme) =>
       fontVariant: ['tabular-nums'],
     },
     storageEmpty: { color: theme.textMuted, fontSize: 9, lineHeight: 12 },
+    storageLegend: { flexDirection: 'row', alignItems: 'center', marginLeft: 'auto' },
+    storageLegendSwatch: { width: 5, height: 5, borderRadius: 1.5, marginLeft: 5, marginRight: 2 },
+    storageLegendWrite: { backgroundColor: theme.accent },
+    storageLegendRead: { backgroundColor: theme.textMuted },
+    storageLegendText: { color: theme.textMuted, fontSize: 7 },
+    storageIo: { flexDirection: 'row', alignItems: 'stretch', gap: 6 },
+    storageIoBelow: { marginTop: 4, height: 24 },
+    // Beside capacity on a phone: the plot takes the full width and the
+    // rates sit on one line under it, so the graph is not squeezed.
+    storageIoBeside: {
+      flex: 1.15,
+      minWidth: 0,
+      flexDirection: 'column',
+      gap: 2,
+      paddingLeft: 8,
+      borderLeftWidth: StyleSheet.hairlineWidth,
+      borderLeftColor: theme.border,
+    },
+    storageIoPlot: {
+      flex: 1,
+      minWidth: 0,
+      flexDirection: 'row',
+      alignItems: 'flex-end',
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: theme.border,
+    },
+    storageIoColumn: { flex: 1, height: '100%', justifyContent: 'flex-end' },
+    storageIoWrite: { backgroundColor: theme.accent, opacity: 0.55 },
+    storageIoRead: { position: 'absolute', left: 0, right: 0, height: 1.5, backgroundColor: theme.textMuted },
+    storageIoScale: {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      paddingRight: 2,
+      color: theme.textMuted,
+      backgroundColor: theme.panelAlt,
+      fontSize: 7,
+    },
+    storageIoRates: { width: 66, justifyContent: 'space-between' },
+    storageIoRatesQuiet: { justifyContent: 'center' },
+    storageIoRatesBeside: { width: 'auto', flexDirection: 'row', justifyContent: 'space-between', gap: 6 },
+    storageIoRate: { color: theme.textMuted, fontSize: 8, textAlign: 'right', fontVariant: ['tabular-nums'] },
     sectionHeading: {
       flexDirection: 'row',
       alignItems: 'flex-end',

@@ -8,7 +8,7 @@
 //! whole-file CRC is exactly what the engine computed from segment CRCs at
 //! finalize time.
 
-use crate::{DownloadEvidence, PostError, VerifyResult};
+use crate::{DownloadEvidence, FsContext, PostError, VerifyResult};
 use nzbd_yenc::crc32_combine;
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
@@ -130,11 +130,11 @@ fn discover(
         Vec<(PathBuf, std::sync::Arc<nzbd_par2::Scan>)>,
     > = Default::default();
     let mut rejected = Vec::new();
-    for path in crate::namespace::files(dir)? {
-        checkpoint()?;
+    for path in crate::namespace::files(dir).at("read directory", dir)? {
+        checkpoint().map_err(PostError::Io)?;
         let parsed = (|| -> Result<Option<std::sync::Arc<nzbd_par2::Scan>>, PostError> {
             let mut input = nzbd_state::fileops::open(&path).map_err(PostError::from)?;
-            let before = crate::fingerprint::FileStamp::of(&input.metadata()?);
+            let before = crate::fingerprint::FileStamp::of(&input.metadata().at("stat", &path)?);
             if let Some((stamp, scan)) = cache.files.get(&path) {
                 if *stamp == before {
                     return Ok(Some(scan.clone()));
@@ -151,19 +151,25 @@ fn discover(
                     Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                         return Ok(None)
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        return Err(PostError::Fs {
+                            op: "read",
+                            path: path.clone(),
+                            source: error,
+                        })
+                    }
                 }
                 use std::io::Seek;
-                input.rewind()?;
+                input.rewind().at("seek", &path)?;
             }
             let mut input = crate::fingerprint::ProgressReader(input);
-            let scan = nzbd_par2::scan_reader(&mut input, checkpoint)?;
+            let scan = nzbd_par2::scan_reader(&mut input, checkpoint).at("read", &path)?;
             if scan.invalid || scan.set_id.is_none() {
                 return Err(PostError::Subprocess(
                     "invalid PAR packet digest, magic or mixed set".into(),
                 ));
             }
-            if before != crate::fingerprint::FileStamp::of(&input.0.metadata()?)
+            if before != crate::fingerprint::FileStamp::of(&input.0.metadata().at("stat", &path)?)
                 || crate::fingerprint::stamp(&path)? != before
             {
                 return Err(PostError::Io(std::io::Error::other(
@@ -198,11 +204,12 @@ fn discover(
             }
             Ok(None) => {}
             Err(error) => {
-                checkpoint()?;
+                checkpoint().map_err(PostError::Io)?;
                 if !tolerate_invalid
+                    || error.io().is_some()
                     || matches!(
                         error,
-                        PostError::Io(_) | PostError::Artifact(nzbd_state::artifacts::Error::Io(_))
+                        PostError::Artifact(nzbd_state::artifacts::Error::Io(_))
                     )
                 {
                     return Err(error);
@@ -278,7 +285,7 @@ fn load_one(
     for (path, scan) in &par_files {
         if scan.slice_size > 0 {
             if slice_size != 0 && slice_size != scan.slice_size {
-                return Err(PostError::Subprocess("inconsistent PAR slice size".into()));
+                return Err(PostError::Identity("inconsistent PAR slice size".into()));
             }
             slice_size = scan.slice_size;
         }
@@ -287,7 +294,7 @@ fn load_one(
             let description = (d.name.clone(), d.length, d.md5_16k, d.md5_full);
             if let Some(previous) = descs.get(&d.id) {
                 if *previous != description {
-                    return Err(PostError::Subprocess(
+                    return Err(PostError::Identity(
                         "conflicting PAR file descriptions".into(),
                     ));
                 }
@@ -299,9 +306,7 @@ fn load_one(
         for (id, v) in &scan.crcs {
             if let Some(previous) = crcs.get(id) {
                 if previous != v {
-                    return Err(PostError::Subprocess(
-                        "conflicting PAR slice evidence".into(),
-                    ));
+                    return Err(PostError::Identity("conflicting PAR slice evidence".into()));
                 }
             } else {
                 crcs.insert(*id, v.clone());
@@ -309,8 +314,8 @@ fn load_one(
         }
         exponents.extend(&scan.exponents);
         // The main file is conventionally the smallest one with FileDesc packets.
-        if has_descs && std::fs::metadata(path)?.len() <= main_size {
-            main_size = std::fs::metadata(path)?.len();
+        if has_descs && std::fs::metadata(path).at("stat", path)?.len() <= main_size {
+            main_size = std::fs::metadata(path).at("stat", path)?.len();
             main_path = Some(path.clone());
         }
     }

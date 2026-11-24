@@ -41,6 +41,7 @@ fn digest_file(root: &File, path: &str, expected: &Identity) -> Result<String> {
     let mut buffer = [0; 64 * 1024];
     loop {
         let n = file.read(&mut buffer)?;
+        crate::fileops::payload_read(n);
         if n == 0 {
             break;
         }
@@ -88,9 +89,9 @@ fn manifest_identity_matches(root: &File, captured: &[FileEntry]) -> Result<bool
 }
 
 fn manifest_matches_capture<'a>(
-    inventory: &'a Inventory,
-    guard: &mut Option<MutationGuard<'a>>,
-    root: &File,
+    _inventory: &'a Inventory,
+    _guard: &mut Option<MutationGuard<'a>>,
+    _root: &File,
     observed: &[FileEntry],
     captured: &[FileEntry],
     linked: bool,
@@ -116,13 +117,7 @@ fn manifest_matches_capture<'a>(
             if !identity_matches {
                 return Ok(false);
             }
-            if let Some(expected_digest) = expected.digest.as_deref() {
-                if inventory.digest_file_yielding(guard, root, &actual.path, &actual.identity)?
-                    != expected_digest
-                {
-                    return Ok(false);
-                }
-            } else if linked {
+            if expected.digest.is_none() && linked {
                 // Older hardlink journals cannot prove the ctime transition.
                 return Ok(false);
             }
@@ -186,7 +181,7 @@ fn mkdir_at(_: &File, _: &Path) -> Result<File> {
 #[cfg(unix)]
 fn link_file<'a>(
     inventory: &'a Inventory,
-    guard: &mut Option<MutationGuard<'a>>,
+    _guard: &mut Option<MutationGuard<'a>>,
     operation_id: &str,
     source: &File,
     target: &File,
@@ -198,14 +193,7 @@ fn link_file<'a>(
     let (dst, _) = parent(target, &entry.path)?;
     let input = fs::open_at(&src, &name, false)?;
     let input_identity = fs::identity_for_file(&input)?;
-    if !controlled_link_matches(&entry.identity, &input_identity)
-        || entry.digest.as_deref()
-            != Some(
-                inventory
-                    .digest_file_yielding(guard, &src, &name.to_string_lossy(), &input_identity)?
-                    .as_str(),
-            )
-    {
+    if !controlled_link_matches(&entry.identity, &input_identity) || entry.digest.is_none() {
         return Err(Error::Conflict("publication source file changed".into()));
     }
     checkpoint()?;
@@ -232,12 +220,7 @@ fn link_file<'a>(
     let output = fs::open_at(&dst, &name, false)?;
     let observed = fs::identity_for_file(&output)?;
     if !controlled_link_matches(&entry.identity, &observed)
-        || entry.digest.as_deref()
-            != Some(
-                inventory
-                    .digest_file_yielding(guard, &dst, &name.to_string_lossy(), &observed)?
-                    .as_str(),
-            )
+        || !input_identity.same_object(&observed)
     {
         return Err(Error::Conflict(
             "publication target file conflicts with source".into(),
@@ -310,6 +293,14 @@ fn verified_target<'a>(
             return Err(Error::Conflict("publication entry identity changed".into()));
         }
     }
+    let rebound = fs::open_dir(&p.target)?;
+    if !identity.same_object(&fs::identity_for_file(&rebound)?)
+        || fs::manifest(&rebound, 100_000)? != files
+    {
+        return Err(Error::Conflict(
+            "publication manifest changed during verification".into(),
+        ));
+    }
     Ok(PublishedDirectory {
         identity,
         files,
@@ -321,6 +312,8 @@ fn verified_target<'a>(
 thread_local! { pub(super) static RETIRE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 thread_local! { static DIGEST_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+thread_local! { pub(super) static FORCE_LINK_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 type DigestGate = Option<(
     Identity,
@@ -429,6 +422,24 @@ impl Inventory {
         key: &str,
         checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> Result<PublishedDirectory> {
+        self.publish_directory_with_copy_digests_checked(
+            guard, source, target, artifact, key, checkpoint, None,
+        )
+    }
+
+    /// Expected copy digests come only from this live relocation's source
+    /// stream. They are checked against the final destination before success.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn publish_directory_with_copy_digests_checked<'a>(
+        &'a self,
+        guard: &mut Option<MutationGuard<'a>>,
+        source: &Path,
+        target: &Path,
+        artifact: &str,
+        key: &str,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+        expected: Option<&[FileEntry]>,
+    ) -> Result<PublishedDirectory> {
         checkpoint()?;
         let key = format!("publish-{key}");
         if !self.publication_active.lock().unwrap().insert(key.clone()) {
@@ -461,7 +472,22 @@ impl Inventory {
                         .parent()
                         .ok_or_else(|| Error::Conflict("missing target parent".into()))?,
                 )?;
-                let files = fs::manifest(&dir, 100_000)?;
+                let mut files = fs::manifest(&dir, 100_000)?;
+                if let Some(expected) = expected {
+                    if files.len() != expected.len()
+                        || files
+                            .iter()
+                            .zip(expected)
+                            .any(|(a, b)| a.path != b.path || a.identity != b.identity)
+                    {
+                        return Err(Error::Conflict(
+                            "copy manifest changed before publication".into(),
+                        ));
+                    }
+                    for (file, proof) in files.iter_mut().zip(expected) {
+                        file.digest.clone_from(&proof.digest);
+                    }
+                }
                 let owner_generation = match self.get(artifact) {
                     Ok(owner) => Some(owner.generation),
                     Err(Error::NotFound) => None,
@@ -501,6 +527,34 @@ impl Inventory {
         }
         let baseline_request = op.request.clone();
         let mut hashes_added = false;
+        if let Some(expected) = expected {
+            if p.files.len() != expected.len() {
+                return Err(Error::Conflict("resumed copy manifest changed".into()));
+            }
+            for (file, proof) in p.files.iter_mut().zip(expected) {
+                let identity_matches = if p.linked {
+                    controlled_link_matches(&file.identity, &proof.identity)
+                } else {
+                    file.identity == proof.identity
+                };
+                if file.path != proof.path
+                    || !identity_matches
+                    || (!file.identity.directory && proof.digest.is_none())
+                    || file
+                        .digest
+                        .as_ref()
+                        .is_some_and(|digest| Some(digest) != proof.digest.as_ref())
+                {
+                    return Err(Error::Conflict(
+                        "resumed publication disagrees with source copy digest".into(),
+                    ));
+                }
+                if file.digest.is_none() && proof.digest.is_some() {
+                    file.digest.clone_from(&proof.digest);
+                    hashes_added = true;
+                }
+            }
+        }
         if p.files
             .iter()
             .any(|entry| !entry.identity.directory && entry.digest.is_none())
@@ -598,7 +652,15 @@ impl Inventory {
                 }
                 checkpoint()?;
                 self.ensure_publication_active(&op.id)?;
-                match fs::rename_exclusive(source, target) {
+                #[cfg(test)]
+                let rename = if FORCE_LINK_PUBLICATION.with(|force| force.replace(false)) {
+                    Err(Error::Io(std::io::Error::from_raw_os_error(libc::EINVAL)))
+                } else {
+                    fs::rename_exclusive(source, target)
+                };
+                #[cfg(not(test))]
+                let rename = fs::rename_exclusive(source, target);
+                match rename {
                     Ok(()) => p.published = Some(verified_target(self, guard, &p)?),
                     Err(Error::Io(e))
                         if matches!(
@@ -768,6 +830,15 @@ impl Inventory {
             } else {
                 if !controlled_link_matches(&expected.identity, &entry.identity) {
                     false
+                } else if p.published.as_ref().is_some_and(|published| {
+                    published
+                        .files
+                        .iter()
+                        .any(|file| file.path == entry.path && file.identity == entry.identity)
+                }) {
+                    // No change since the final, digest-verified publication.
+                    // Removing this alias cannot remove the published inode.
+                    true
                 } else if let Some(expected_digest) = expected.digest.as_deref() {
                     self.digest_file_yielding(guard, &dir, &entry.path, &entry.identity)?
                         == expected_digest
@@ -877,6 +948,13 @@ mod tests {
         let (_temp, inventory, source, target) = fixture();
         fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EINVAL)));
         publish(&inventory, &source, &target).unwrap();
+        // An unchanged final stamp now needs no second hash. Force an
+        // ambiguous ctime transition to exercise conservative revalidation.
+        std::fs::hard_link(
+            source.join("nested/media.mkv"),
+            _temp.path().join("extra-alias"),
+        )
+        .unwrap();
         let inventory = Arc::new(inventory);
         let gate = Arc::new((Barrier::new(2), Barrier::new(2)));
         arm_digest_gate(&source, "nested/media.mkv", gate.clone());

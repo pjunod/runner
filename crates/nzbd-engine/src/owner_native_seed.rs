@@ -78,7 +78,7 @@ impl Owner {
             Some(serde_json::to_string(&marker).unwrap()),
         );
         if marker.keep_blocked_control_revision.is_none() && !self.prepare_hold_job_until(
-            id,nzbd_types::HoldCause::Io,"torrent_seed_retire",
+            id,nzbd_types::HoldCause::StorageUnavailable,"torrent_seed_retire",
             "Current Keep retains this seed source; clearing Keep will requeue eligible cleanup",None,
         ) { *self.state.job_mut(id).unwrap()=before;callback(self,false);return; }
         self.native_commit_then(vec![before], callback);

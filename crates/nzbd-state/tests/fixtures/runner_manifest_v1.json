@@ -1,0 +1,34 @@
+{
+  "_comment": "Plan M3 (b): a .runner-manifest.json as runner writes it, and the digest curator's ports.ManifestDigest (internal/ports/pipeline.go, branch claude/pipeline-v2-m2-curator) computes over its files. curatorDigest was produced by running that Go function verbatim on this manifest (go1.24, 2026-11-07).",
+  "manifest": {
+    "generation": "5f0c6b1e9a2d4c8e8b7a6d5c4b3a2918",
+    "job": 2333,
+    "transfer": "t-2333-00112233445566778899aabbccddeeff",
+    "created_at": 1794076138,
+    "cross_volume": true,
+    "files": [
+      {
+        "path": "Bonus/Ünïcode – ✓.mkv",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "Season 1/Show.S01E01.mkv",
+        "bytes": 7000000000,
+        "sha256": "60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752"
+      },
+      {
+        "path": "Season 1/Show.S01E02.mkv",
+        "bytes": 8123456789,
+        "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+      },
+      {
+        "path": "a.mkv",
+        "bytes": 42,
+        "sha256": "fd61a03af4f77d870fc21e05e7e80678095c92d808cfb3b5c279ee04c74aca13"
+      }
+    ],
+    "digest": "2a156e2dbfa7ffbb78d58285312f5e9cd716d49617d482c25b59c2d61204a36d"
+  },
+  "curatorDigest": "2a156e2dbfa7ffbb78d58285312f5e9cd716d49617d482c25b59c2d61204a36d"
+}

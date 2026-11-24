@@ -393,6 +393,7 @@ impl Controller {
             }
         };
         listener.set_nonblocking(true)?;
+        nzbd_engine::startup_phases::mark_listener_bound();
         let address = listener.local_addr()?;
         let probe_address = SocketAddr::new(
             if address.ip().is_unspecified() {

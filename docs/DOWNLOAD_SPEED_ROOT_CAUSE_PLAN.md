@@ -1,0 +1,842 @@
+# Download speed regression — measured causes and proposed correction
+
+**Status:** index correction implemented; Fable review requirements covered.
+Validation and merge status are recorded in the PR; live throughput comparison
+remains pending and production configuration is unchanged.
+**Written:** 2026-11-07 (America/New_York). **Source baseline:**
+`b5ef661292d61b65477926d0966ed6515aa1d969`. **Branch:**
+`codex/download-inventory-performance`.
+
+Companion to [the I/O audit](IO_EFFICIENCY_AUDIT.md) and
+[publication performance](archive/PUBLICATION_PERFORMANCE_PLAN.md). This plan addresses
+slow active Usenet downloads on nuc3. Review the evidence and scope before
+implementing the milestones. If an optimization requires weakening durability,
+identity, generation, retention or deletion checks, revise this plan first.
+
+## 1. Finding — lifecycle queries repeatedly scan the operation journal
+
+The user reports a fall from a previously consistent 109 MiB/s to approximately
+30–40 MiB/s, beginning at least several weeks before November 7. Live inspection
+identified repeated full-table inventory queries while downloads were active.
+The dominant workspace lookup spent 15.215 seconds executing across 33 calls
+in one 30-second sample. Other inventory lookups sometimes took 0.5–2 seconds.
+
+**Confirmed defect:** lifecycle lookups evaluate JSON predicates over retained
+operation records without suitable indexes. The shared inventory connection is
+protected by a mutex, held for the query. The operations table occupies about
+277 MiB, mostly historical PAR filename-restoration records unrelated to the
+lookup. Repeated scans read and parse that unrelated history.
+
+**Two co-equal explanations for the speed regression:** inventory mutex
+contention and owner tick/persistence stalls can each leave provider connections
+idle. The inventory scans may also aggravate tick stalls through shared state
+volume I/O, rather than through the inventory mutex. Live profiles confirm the
+scans and long inventory calls; logs separately show long snapshot saves. Neither
+mechanism has yet been assigned a measured share of the 109 to 30–40 MiB/s loss.
+Capture both on the same timeline before attributing the download regression.
+
+**GlusterFS is not established as the primary cause.** It stores both payload
+and inventory, and can amplify metadata and sync costs. Most observed database
+reads were cache-served. No local-versus-GlusterFS payload comparison has been
+performed. The October 6 directory-default change alone is not a diagnosis.
+
+## 2. Evidence — live profiles and an isolated database snapshot
+
+### 2.1 Deployment and measurement boundaries
+
+Read-only inspection on November 7, approximately 23:03–23:16 EST, used status,
+logs, process descriptors, syscall summaries, bounded BPF probes and SQLite
+read-only queries. Additional traffic was requested by the user through
+Curator. Measurements span active downloading, post-processing and maintenance;
+the individual samples below identify their scope.
+
+| Item | Observed value and interpretation |
+|---|---|
+| Deployed checkout | `/opt/noirr/runner` at `b5ef661`; merges PR #282. |
+| Running binary | API reports `0.3.0+unknown`, built November 7 at 22:55 EST. Checkout identity is not independently embedded in that version string; measured symbols and queries are from the running executable. |
+| Storage | `/processing` maps to host `/mnt/processing`, GlusterFS FUSE. `/working` maps to `/mnt/qnap/working`, NFS 4.1. |
+| Actual payload path | Open active `.runner-file-*.part` descriptors were under `/processing/<job>/`. This was observed during receiving, before extraction/publication. |
+| Configuration | `main_dir=/processing/`, destination `/working/monarr/completed`, no explicit intermediate directory, Newshosting connections 30, pipeline depth 2, configured active-download limit 1. |
+| Rate controls | Live `speed_limit_bps=null`; no blocked provider, quota refusal or low-space latch in the inspected statuses. |
+| Container CPU | No CPU quota, no cpuset restriction, zero cgroup throttled periods. This excludes configured CPU throttling, not every possible CPU bottleneck. |
+| First active rate | 29,424,515 B/s, about 28.1 MiB/s, before syscall tracing. |
+| Inventory size | SQLite file 305,512,448 bytes, about 291.4 MiB. `dbstat` attributes 290,189,312 bytes, about 276.7 MiB, to `operations`. |
+| Operation history | 12,546 succeeded operations; 6,992 `par_restore` records contain 263,155,374 bytes of JSON text. Row counts are snapshots during ongoing work. |
+
+`/proc/.../io` application-byte counters include cache hits. They are not disk
+or network throughput. Strace adds substantial overhead at hundreds of thousands
+of reads per second; rates observed under tracing must not be compared directly
+with the earlier 109 MiB/s baseline. BPF probes also have overhead. No claimed
+throughput improvement is derived from either instrumented rate.
+
+### 2.2 The repeated reads belong to the inventory database
+
+A one-second trace of positional reads, with raw syscall arguments rather than
+payload contents, attributed 59,497 calls to descriptor 38. Of these, 58,431
+requested 4,096 bytes. Descriptor 38 was `/processing/queue/artifacts.sqlite`.
+A separate eight-second sample counted 603,390 `pread64` calls.
+
+A 30-second SQL-correlated BPF sample attributed the following page reads to
+specific SQLite statements. It overlapped ongoing downloading and lifecycle
+work; it was not a controlled single-job benchmark.
+
+| Query family | Page-read calls | Time in completed `sqlite3_step` calls |
+|---|---:|---:|
+| Transform scratch lookup | 2,337,621 | 7.626 s |
+| Completed relocation cleanup candidates | 422,448 | 1.487 s |
+| Discovery status | 70,829 | 0.237 s |
+| Torrent-copy compaction candidates | 70,372 | 0.228 s |
+
+A subsequent 30-second sample during the new active traffic measured 33 scratch
+lookup steps taking 15.215 s, 12 completed-relocation cleanup steps taking
+5.151 s, two discovery-status steps taking 1.119 s, and two torrent-compaction
+steps taking 1.110 s. These are elapsed times inside SQLite calls, not
+percentages of physical storage utilization or complete operation durations.
+
+A separate 20-second function profile measured 288 completed `Inventory::get`
+calls. Twenty-six took at least 256 ms, including six in the 1,024–2,048 ms
+bucket. That measures complete lookup calls, including any mutex wait and
+row decoding. It does not isolate mutex wait by itself.
+
+**Counter-evidence to an overbroad claim:** twelve sampled `Owner::grant_work`
+calls completed in roughly 1–16 ms. No long `for_job` calls were captured in
+that interval. We have not proved that the scheduler function itself waits
+seconds on every request, nor identified the exact affected caller for every
+long inventory lookup. Trace that dependency in milestone 1.
+
+### 2.3 Payload syncs have a cost, but do not explain the whole profile
+
+A 20-second syscall summary recorded 46 `fdatasync` calls totaling 0.495 s,
+about 10.8 ms per call. A separate 12-second summary recorded 57 totaling
+0.394 s, about 6.9 ms per call. These summaries include all traced sync calls;
+they do not distinguish payload, queue journal and other file descriptors.
+
+Provider snapshots showed all 30 TLS connections established, with empty
+receive queues and periods of approximately 0.9–3 seconds since the last data
+on some sockets. This is consistent with request gaps; it does not establish
+whether the application or provider caused each gap.
+
+Logs reported snapshot saves blocking engine ticks for 1.6–3.2 seconds.
+This is a co-equal causal hypothesis, not a secondary storage footnote.
+[rate.rs](../crates/nzbd-engine/src/rate.rs) documents the same failure mode: a
+late tick can reflect journal fsync and snapshot work on a slow state volume.
+[owner_persistence.rs](../crates/nzbd-engine/src/owner_persistence.rs) already
+includes `elapsed_ms` in `PersistenceFinished`. Queue journals, snapshots and
+inventory share GlusterFS state storage. The observed socket idle intervals fit
+a stalled owner at least as well as an inventory mutex wait. A common timeline
+of tick duration, persistence elapsed time, lock waits and wire traffic is
+required; the earlier logs alone do not establish the later download cause.
+
+### 2.4 A snapshot proves the lookup can avoid scanning unrelated history
+
+A consistent SQLite online backup was made through a read-only source connection
+into memory on nuc3, then streamed to the required external drive. Index
+experiments changed only that isolated copy. SQLite on the comparison host was
+3.54.1; the timings below are not a prediction of nuc3's payload throughput.
+
+| Query | Before | After targeted index | Query-plan change |
+|---|---:|---:|---|
+| Missing transform scratch ID | 112.69 ms | 0.0424 ms | `SCAN operations` to indexed equality search |
+| Latest discovery status | 102.32 ms | 0.0105 ms | Full table scan and temporary sort to ordered partial-index scan |
+
+These were single before/after observations, with different cache conditions.
+The durable result is the change in query plan; the latency ratios are
+illustrative, not a benchmark confidence interval. The missing-ID query returned
+zero rows both times; discovery returned one row. Exhaustive result equivalence
+and migration tests are still required.
+
+Local query-comparison receipts and the private snapshot are retained outside
+the Git checkout. The measurements are summarized here; database contents must
+not be committed or included in a PR.
+
+
+### 2.5 Review follow-up — candidate selectivity and all nine query plans
+
+The snapshot's kind × state histogram is below. It contains no `sqlite_stat1`.
+The new candidate index must win against `operations_state` without relying on
+ANALYZE having run. All counts are from the consistent snapshot, not an estimate.
+
+| Kind | Succeeded | Failed | Cancelled | Review | Running | Preview |
+|---|---:|---:|---:|---:|---:|---:|
+| delete | 419 | 0 | 0 | 101 | 0 | 0 |
+| directory_publish | 448 | 0 | 122 | 0 | 0 | 0 |
+| extract | 176 | 5 | 0 | 0 | 0 | 0 |
+| inspect | 14 | 2 | 0 | 0 | 0 | 0 |
+| par_repair | 13 | 32 | 0 | 0 | 1 | 0 |
+| par_restore | 6,992 | 0 | 0 | 0 | 0 | 0 |
+| relocate | 448 | 0 | 16 | 0 | 0 | 0 |
+| retention_preview | 1 | 0 | 0 | 0 | 0 | 1 |
+| retire_workspace | 199 | 0 | 0 | 0 | 0 | 0 |
+| scan | 3,836 | 0 | 0 | 0 | 0 | 0 |
+| stage | 0 | 1 | 0 | 0 | 0 | 0 |
+| torrent-copy | 0 | 0 | 0 | 0 | 0 | 0 |
+
+The succeeded-only index spans 12,546 rows. Kind selection narrows relocation
+work to 464 rows, of which 448 succeeded. There are zero torrent-copy rows in
+this snapshot: the empty-kind lookup is useful evidence for avoiding unrelated
+history, but is not a populated torrent workload benchmark. Add populated,
+mixed-state torrent fixtures in the Rust regression suite.
+
+Checking the complete production queries exposed two defects in the original
+three-index proposal:
+
+- With `operations_kind_state` installed, SQLite chose it for discovery and
+  added `USE TEMP B-TREE FOR ORDER BY`, bypassing the original discovery index.
+- The stage-cleanup query at `torrent.rs:1731` constrains kind but not state.
+  `(kind,state)` groups rows by state before its implicit rowid tiebreaker, so
+  this query still needed a temporary sort. The compaction query at line 1773
+  constrains both columns and did not need a sort.
+
+The revised candidate in §4 adds kind as the first discovery-index expression
+and replaces `(kind,state)` with a kind-only index. In the same snapshot all
+nine exact query plans select the intended index, neither torrent cursor query
+sorts, and both show `rowid>?` in the index search. Relocation queries choose
+`operations_kind` over `operations_state` and retain all state/authority filters.
+The trade-off is testing state on 464 relocation candidates rather than 448;
+this avoids adding a fourth index solely for the state-unconstrained torrent
+query. Revalidate this choice with the application's bundled SQLite and larger
+mixed-state journals before implementation is accepted.
+
+Full SQL, histogram and before/after plan receipts are retained outside Git.
+The permanent tests in
+[operation_index_tests.rs](../crates/nzbd-state/src/artifacts/operation_index_tests.rs)
+now exercise all nine production statements with the bundled SQLite.
+
+## 3. Code history — recent changes are credible contributors
+
+| Change | Source evidence | What it establishes |
+|---|---|---|
+| September 25, `b7c2822` | Adds `Inventory::discovery_status` in [tasks.rs](../crates/nzbd-state/src/artifacts/tasks.rs). | Introduced the unindexed JSON kind filter and latest-created sort. |
+| September 30, `3f1efc2` | Adds per-segment `sync_data` in [writer.rs](../crates/nzbd-engine/src/writer.rs). | Adds a durability cost on the receive/write path; not the dominant measured database scan. |
+| October 6, `897920b` | Adds `scratch_operation` in [workspace_lifecycle.rs](../crates/nzbd-state/src/artifacts/workspace_lifecycle.rs). | Introduced the dominant measured workspace lookup and its broad uses in custody checks. |
+| October 6, `6f7149c` | Changes empty-intermediate fallback in [configuration](../crates/nzbd-config/src/lib.rs). | Changes allocation location; distinct from `897920b` and not independently proven to explain the rate loss. |
+| November 1, `a630414` | Introduces the completed-relocation candidate query shape in [relocation.rs](../crates/nzbd-state/src/artifacts/relocation.rs). | Adds another measured scan over succeeded operation history. Later cleanup changes also affect its final predicate. |
+
+These dates fit a regression developing over weeks as operation history grows.
+They do not locate the user's last known fast deployment or prove that the
+November 7 pipeline changes introduced the problem. Compare the actual deployed
+binary revisions when evaluating that narrower question.
+
+### 3.1 The dominant lookup scans JSON and holds the shared connection
+
+The exact query in `scratch_operation` is:
+
+```sql
+SELECT data FROM operations
+WHERE json_extract(data,'$.kind') IN ('extract','par_repair')
+  AND json_extract(json_extract(data,'$.request'),'$.scratch.id')=?1
+LIMIT 1;
+```
+
+`Operation.request` is a JSON-encoded string inside the operation JSON. The
+nested extraction is intentional. The existing primary key and `state` and
+`artifact` indexes do not serve this scratch-ID predicate.
+
+[Inventory](../crates/nzbd-state/src/artifacts/mod.rs) uses a shared
+`Mutex<Connection>`. `scratch_operation` holds that mutex while executing the
+query. Its callers include `artifact_in_use` and `workspace_assessment`; the
+former participates in custody/admission checks, not just the Files UI.
+The normal `artifact_in_use` call checks a source artifact ID, which does not
+match a transform scratch ID. Its normal outcome is therefore a miss that scans
+the complete table. Start caller attribution with `reserve_reconciliation` in
+[startup.rs](../crates/nzbd-state/src/artifacts/startup.rs), which has roughly a
+dozen reconciliation call sites; it is a candidate for the observed cadence,
+not yet a measured attribution. Other source-ID callers include deletion,
+worker retry/cancellation, materialization and seed-retirement admission.
+
+```text
+custody / workspace lookup
+          |
+          v
+shared inventory connection locked
+          |
+          v
+scan operation JSON, including unrelated historical PAR restores
+          |
+          +---- other inventory users can wait for the connection
+          |
+          v
+return matching workspace or absence
+```
+
+The completed-relocation cleanup query additionally filters nested request
+fields while selecting `state='succeeded'`. The existing state index includes
+12,546 succeeded records. Reconciliation repeats the query for storage roots.
+Read the complete predicate in [relocation.rs](../crates/nzbd-state/src/artifacts/relocation.rs)
+before changing it; it contains authority, delivery, retry and cleanup guards.
+
+## 4. Proposed contract — change access paths without changing authority
+
+Re-verify all SQL against baseline `b5ef661` at implementation time. The first
+candidate correction is additive, non-unique SQLite expression indexes, created
+idempotently by inventory initialization for new and existing installations:
+
+```sql
+CREATE INDEX IF NOT EXISTS operations_transform_scratch
+ON operations(
+  json_extract(json_extract(data,'$.request'),'$.scratch.id'),
+  json_extract(json_extract(data,'$.request'),'$.scratch.generation')
+)
+WHERE json_extract(data,'$.kind') IN ('extract','par_repair');
+
+CREATE INDEX IF NOT EXISTS operations_scan_recent
+ON operations(
+  json_extract(data,'$.kind'),
+  json_extract(data,'$.created_at') DESC
+)
+WHERE json_extract(data,'$.kind')='scan';
+
+CREATE INDEX IF NOT EXISTS operations_kind
+ON operations(json_extract(data,'$.kind'));
+```
+
+The first index serves scratch ID lookups and the generation-qualified variant
+in [transforms.rs](../crates/nzbd-state/src/artifacts/transforms.rs). The second
+serves the discovery equality filter and its order, even with the generic kind
+index present. The third serves relocation and torrent-kind filtering while
+retaining rowid order when kind is fixed; state remains a residual predicate.
+All three revised shapes were checked together on the snapshot against the nine
+queries in §6.2. Bundled-SQLite regression tests and write/migration cost checks
+remain acceptance requirements. Place the statements in the existing schema
+batch in [mod.rs](../crates/nzbd-state/src/artifacts/mod.rs), beside
+`operations_state` and `operations_artifact`, following the `artifacts_bytes`
+upgrade precedent.
+
+1. **Keep query predicates and authority checks intact.** Indexing changes the
+   candidate access path; it must not waive generation, identity, Keep, hold,
+   active-use, retry, delivery or exact-operation requirements.
+2. **Keep indexes non-unique and test the producer invariant.**
+   [workspace()](../crates/nzbd-state/src/artifacts/transforms.rs) derives
+   `scratch.id = format!("scratch-{key}")` from the operation primary key,
+   returns the existing workspace for a known key, and `save_operation` upserts
+   on that key. Supported producer calls cannot create two operations with one
+   scratch ID. The traversal-order ambiguity is closed for that path. Test
+   repeated same-key admission and distinct keys, asserting one operation per
+   derived scratch ID. This is a construction invariant, not a new database
+   UNIQUE constraint or permission to adopt arbitrary malformed historical rows.
+3. **Let SQLite maintain derived keys transactionally.** Do not introduce a
+   separately updated cache or manually populated side table in this fix.
+4. **Measure migration and writes.** Index construction parses existing JSON
+   and holds write locks. Measure startup cost, added database size and
+   `save_operation` latency on a realistic journal. Operation data and transform
+   requests are serde-written, so malformed JSON is not expected in normal
+   records. Include a non-transform operation with a non-JSON request in the
+   upgrade fixture: the partial WHERE must shield it from nested extraction.
+   A genuine CREATE INDEX failure must fail inventory open loudly through the
+   existing schema batch; never add a fallback that hides the failure.
+5. **Keep connection/thread redesign separate unless measurements require it.**
+   First remove proven scans. Additional connections and moving callers off
+   the actor introduce distinct consistency and lifecycle considerations.
+
+## 5. Guardrails — preserve data and isolate the hypothesis
+
+Do not disable segment sync, journal durability, CRC checks, verified publication
+or deletion custody to obtain a higher rate. Do not delete operation history or
+recovery receipts to shrink the table. Do not move existing payloads or change
+intermediate-directory settings during the first comparison: doing so changes
+two variables and obscures whether the code correction helped.
+
+The branch implements the three indexes and regression tests. Production
+database/index state and download configuration have not been modified.
+Deployment and active-throughput qualification remain separate from PR merge.
+
+## 6. Milestones — prove correctness before claiming speed restoration
+
+### 6.1 Capture the affected caller and a repeatable active baseline
+
+Use bounded profiles during a substantial normal Usenet download. Attribute
+scratch-query calls starting with `reserve_reconciliation` → `artifact_in_use`
+and check other source-ID callers and workspace assessment. Capture owner tick
+latency and `PersistenceFinished.elapsed_ms` on the same timeline as inventory
+mutex owner/waiter intervals, actor responsiveness, wire bytes, payload bytes
+and file completion. Distinguish direct connection-lock contention from state
+I/O that delays persistence or a tick. Include maintenance and post work because
+those were present in the observed workload.
+
+**Acceptance:** a retained receipt identifies the slow query, calling path,
+mutex owner/waiter, owner tick and persistence elapsed time within the active
+download interval. Explicitly report if scheduler latency remains small, if
+tick/persistence stalls dominate, or if scans precede stalls through shared I/O;
+do not infer the missing dependency from scan volume alone.
+
+### 6.2 Implement indexes and protect upgrades and result semantics
+
+Add the reviewed indexes in inventory schema initialization. Regression tests
+must reopen an existing installation without those indexes, preserve all rows
+and allow repeated startup. Exercise real and normal-miss source IDs, both
+transform kinds, generation mismatch, the one-operation-per-derived-scratch-ID
+invariant, non-transform history with a non-JSON request, and latest-discovery
+ordering. Test updates to operation kind,
+request and state so index entries cannot become stale.
+
+Permanent `cargo test` tests must execute `EXPLAIN QUERY PLAN` for every exact
+production statement below, with all proposed indexes present, on fixtures large
+enough to exercise unrelated history and mixed operation states. Share production
+SQL constants with tests or otherwise guard against test SQL drifting from the
+real call site. A one-time snapshot check is not sufficient. Partial-index
+predicate implication is syntactically sensitive: preserve the production
+`IN ('extract','par_repair')` form and order in the partial WHERE.
+
+| Baseline statement | Required plan assertion |
+|---|---|
+| [workspace_lifecycle.rs:634](../crates/nzbd-state/src/artifacts/workspace_lifecycle.rs#L634), `scratch_operation` | `USING INDEX operations_transform_scratch` |
+| [transforms.rs:486](../crates/nzbd-state/src/artifacts/transforms.rs#L486), generation-qualified scratch | `USING INDEX operations_transform_scratch`; both equality keys |
+| [torrent.rs:1868](../crates/nzbd-state/src/artifacts/torrent.rs#L1868), artifact/state/scratch | `USING INDEX operations_transform_scratch`; preserve residual artifact/state predicates |
+| [tasks.rs:10](../crates/nzbd-state/src/artifacts/tasks.rs#L10), discovery | `USING INDEX operations_scan_recent`; no temporary sort |
+| [relocation.rs:1521](../crates/nzbd-state/src/artifacts/relocation.rs#L1521), completed source relocations | `USING INDEX operations_kind`; no rowid sort |
+| [relocation.rs:1701](../crates/nzbd-state/src/artifacts/relocation.rs#L1701), cleanup wake | `USING INDEX operations_kind` |
+| [relocation.rs:3093](../crates/nzbd-state/src/artifacts/relocation.rs#L3093), full cleanup-candidate predicate | `USING INDEX operations_kind`; keep correlated authority subqueries |
+| [torrent.rs:1731](../crates/nzbd-state/src/artifacts/torrent.rs#L1731), stage cleanup | `USING INDEX operations_kind`; rowid lower bound; no temporary sort |
+| [torrent.rs:1773](../crates/nzbd-state/src/artifacts/torrent.rs#L1773), compaction | `USING INDEX operations_kind`; rowid lower bound; no temporary sort |
+
+Line numbers identify `b5ef661`; relocate the complete statement if edits move
+it. Test with no `sqlite_stat1`, as in production, and with populated torrent
+history. Retain the existing custody, concurrent-use, Keep and cleanup-retry
+tests. Do not force planner choice with `INDEXED BY` just to make tests pass.
+
+```bash
+cargo test -p nzbd-state --lib  # Inventory and lifecycle regression suite.
+cargo fmt --all -- --check     # Formatting check for the reviewed changes.
+```
+
+**Acceptance:** fresh/open-upgrade/idempotent migration tests pass; fixture
+results agree with the original queries; access costs scale with matching
+candidates rather than unrelated PAR history. Required repository CI is green.
+Builds, caches and test scratch stay on the external drive.
+
+### 6.3 Compare the corrected binary on nuc3 with storage unchanged
+
+After review and an approved rollout, retain the previous executable/image and
+record an identifiable candidate build. Use the same provider settings, storage
+paths and comparable large downloads. Collect multiple sustained intervals
+without syscall tracing; keep traced samples separate. Record post-processing,
+maintenance, competing traffic, owner tick latency and persistence elapsed time
+for both versions. Check whether any remaining production statement still scans
+`operations`: its roughly 277 MiB size exceeds SQLite's usual roughly 2 MiB
+connection page-cache default, so scans can churn the cache even on OS cache
+hits. Measure the actual cache setting rather than assuming the default. The
+`par_restore` full scans in `writer_naming.rs` are test-only, not production
+follow-ups.
+
+**Acceptance:** full-table metadata reads and long inventory waits fall sharply,
+no correctness/retention behavior changes, and measured wire/payload throughput
+improves. Do not require exactly 109 MiB/s from a single uncontrolled release.
+If inventory work falls but throughput does not improve, reject it as the
+complete explanation. Test owner tick and persistence stalls next, including
+shared-state I/O coupling; also check network/provider and writer sync. Only
+then proceed to the payload-storage comparison in §6.4.
+
+### 6.4 Evaluate storage only if the corrected download remains limited
+
+Compare equivalent new allocations on local storage and GlusterFS without
+changing queue state placement and provider settings simultaneously. Measure
+per-file write/sync latency and idle request time. Separate the later completed
+publication copy from active receiving.
+
+**Acceptance:** a controlled comparison quantifies the storage contribution.
+The outcome, rather than the mere presence of a GlusterFS mount, determines
+whether another storage or batching change is justified.
+
+## 7. Fable review — disposition and remaining decisions
+
+Fable approved the direction and preservation of authority, with four required
+corrections. This revision closes the scratch-ID ambiguity using the producer
+invariant, names permanent query-plan tests for all nine production statements,
+adds the kind × state histogram and measured planner choices, and makes owner
+tick/persistence stalls a co-equal causal hypothesis throughout qualification.
+Caller attribution starts with normal source-ID misses in reconciliation.
+Upgrade tests now explicitly cover a non-transform non-JSON request; schema
+failures remain fatal rather than hidden.
+
+**New evidence requiring review:** the original `(kind,state)` index caused a
+sort in the state-unconstrained torrent cursor query, and competed with the
+original discovery partial index. The revised set keeps three indexes by using
+kind-only selection and a discovery equality/order prefix. All nine exact plans
+now choose the intended index without a temporary sort on SQLite 3.54.1. Review
+this trade-off before implementation; permanent tests must verify it on the
+bundled SQLite and realistic populated fixtures.
+
+The review's approval is of the indexing direction, not proof of the complete
+109 MiB/s regression cause or approval of an unmeasured production rollout.
+The user authorized implementation, PR creation and merge after review. The
+implementation changes access paths only; production deployment and the
+active-throughput comparison remain outstanding.
+
+## 8. Implementation — additive indexes and permanent regression checks
+
+The three index definitions in §4 are in the existing inventory schema batch.
+[operation_queries.rs](../crates/nzbd-state/src/artifacts/operation_queries.rs)
+shares all nine exact SQL statements with their production callers and tests;
+comparison with `b5ef661` confirmed their SQL text is unchanged.
+
+[Four regression tests](../crates/nzbd-state/src/artifacts/operation_index_tests.rs)
+cover existing-inventory upgrade and repeated open, query/result equivalence and
+index selection for all nine statements without ANALYZE, ordered torrent rowid
+cursors with mixed states, non-JSON requests in non-transform history, kind and
+request/state/order updates, workspace scratch-ID construction, and fatal schema
+creation errors. The fixture includes 512 unrelated PAR records and 96 mixed-state
+torrent records so empty production torrent history cannot hide a bad plan.
+
+A local warm-snapshot cost check on SQLite 3.54.1 added about 332 KiB of indexes.
+Individual creation took 322 ms (kind), 137 ms (discovery), and 147 ms (scratch),
+including local commits. Updating the same 32 large PAR records (5.6 MB JSON)
+inside rollback-only trials took 1.4–2.2 ms before indexing and 4.4–4.9 ms after.
+Those update timings exclude commit/fsync and are not nuc3 predictions. The
+added write cost is real and remains part of runtime qualification.
+
+The first CI run exposed a fixture race in
+[`acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor`](../crates/nzbd-engine/src/owner_tests.rs):
+it attempted publication immediately after asynchronous import acknowledgement,
+while source verification could still hold custody. The fixture now waits on
+the existing export-readiness helper before publication. Production custody
+checks are unchanged. The exact failing test and the affected owner subset are
+included in follow-up validation.
+
+Validation results and PR merge status are recorded with the PR. The remaining
+root-cause attribution and live comparison gates in §6 remain necessary before
+claiming the earlier 109 MiB/s rate has been restored.
+
+## 9. Follow-up — writer-birth waits caused repeated queue selection
+
+**Measured November 8:** PR #284 merged as `1f73dea`; its three indexes were
+also applied to nuc3 with explicit user approval in a 0.85-second transaction.
+Live query plans used the indexes, but short rate samples remained about
+15–34 MiB/s. The indexing defect was real; it was not the complete explanation
+for the reported throughput loss.
+
+A 30-second function profile after indexing recorded 35,451
+`ensure_allocation` calls across 322 `grant_work` calls, about 110 allocation
+checks per request. Some lease requests took 512–2,048 ms. A separate profile
+found most owner ticks took 4–16 ms, queue document clones took 32–128 ms,
+and background snapshot saves took 512–2,048 ms. These observations distinguish
+normal tick work from slow message/scheduling work; background save latency
+alone does not prove direct owner blocking.
+
+In [grant_work](../crates/nzbd-engine/src/owner.rs), an asynchronously starting
+writer has no published writer generation until its persistence completion is
+handled by the owner. The old loop used `continue` on that missing generation.
+It selected the unchanged Pending segment again, up to `max + jobs.len()` times,
+while the owner could not process the completion that would make it ready.
+Each pass also cloned the complete job in `ensure_allocation`, even when its
+allocation was already cached. Large queues magnify both selection and copying.
+
+The correction returns the current lease batch immediately on an unready
+writer. It preserves any earlier granted leases, yields the owner to process
+persistence completions, and leaves the active-download limit and durable
+writer-birth boundary intact. It does not expand selection to lower-priority
+jobs or start writers across the entire pending queue. Cached allocation checks
+borrow the job; only a genuinely scheduled allocation clones its descriptor.
+
+[Three scheduler regression tests](../crates/nzbd-engine/src/owner_tests.rs)
+use a real blocked persistence worker and a test-only selection counter. The
+66-job fixture failed before the fix with 67 selections rather than one, then
+passed after the correction. Cases cover normal and Post-fetch selection,
+no premature lease or extra writer birth, continued leasing after durable
+completion, and retaining an earlier lease when the next writer is unready.
+All 319 engine unit tests passed locally. The counter is absent from production
+builds. No NZB-fetch task logic is changed in this follow-up.
+
+The remaining acceptance gate is an active-download comparison on nuc3 after
+the reviewed scheduler correction is installed. Do not infer restoration to
+109 MiB/s from the deterministic selection-count improvement alone.
+
+## 10. Follow-up — per-article durability round trips on GlusterFS
+
+**Measured November 8, after the verified #287 deployment:** one active job
+remained Downloading for an untraced 30.138-second window. Its durable byte
+counter advanced 1.295 GB, or 40.98 MiB/s. The active limit stayed at one.
+The previous indexing and scheduling fixes did not restore the 109 MiB/s target.
+
+A separate 20-second kernel trace classified actual open files through the
+process fdtable and dentry, rather than reusing a sampled descriptor-number
+list. It counted 1,123 payload `fdatasync` calls taking 18.059 seconds in total
+(mean 16.08 ms), and 1,123 journal calls taking 12.526 seconds (mean 11.15 ms).
+Payload files were on the `/processing` GlusterFS FUSE mount. At roughly 700 KiB
+per article, one payload sync per article predicts approximately the observed
+40–45 MiB/s ceiling. The journal's separate per-record sync would constrain
+throughput even if payload flushing alone were improved. These measurements
+identify application durability round trips; they do not establish the raw
+sequential bandwidth of the storage or the provider.
+
+The payload writer now shares one durable sync across an already-queued
+contiguous prefix of at most eight segment commands. Each segment's buffered
+write finishes before processing the next; pending facts retain metadata only.
+An empty queue, the bound, cancellation, rejected input, or any control command
+flushes the prefix before further processing. Written facts are emitted only
+after successful sync and verification of the final file identity. Every fact
+in the group carries that same post-sync identity. Publication, finalization,
+and sealing cannot overtake pending writes. Sync failure or a conflicting file
+mutation acknowledges none of the affected facts and retains the partial file.
+
+The persistence lane similarly groups at most 32 already-queued contiguous
+journal appends. It retains the first non-append request as the next FIFO
+barrier. Per-revision completions follow the shared sync, with the original
+filesystem error context preserved on failure. An append or sync failure fences
+later append groups until a successful complete snapshot establishes durable
+owner state and rotates local append descriptors to a fresh journal incarnation.
+Recovery checkpoints retain the old journal files, including torn tails, and
+foreign writers remain untouched; healthy checkpoint compaction is unchanged. No timer, input-capacity increase, early acknowledgement, or
+relaxation of payload or journal durability is introduced.
+
+Regression coverage adds six writer tests for shared sync and final identity,
+cancellation ordering, failed sync, control barriers, duplicates/rejected
+overlaps, and external mutation during sync. Six persistence tests cover prefix
+bounds/barriers, shared-sync completion, append and sync failures, and the
+cross-batch failure fence. A real torn-tail replay regression covers worker,
+delegated, and ordinary authoritative recovery checkpoints; a state test checks
+incarnation rotation, stable lease identity, and retained foreign journal access. Combined validation and deployment evidence belong
+with the PR. Runtime acceptance still requires untraced sustained measurements
+on nuc3 with one active download, unchanged provider settings, and verified
+binary provenance. The target remains 109 MiB/s; a passing test suite alone
+does not establish that throughput.
+
+## 11. Follow-up — receipt custody refresh blocked the owner
+
+PR #290 merged as `0b7fa3b` and deployed the verified `ef5692d` source tree.
+A separate actual-file 20-second trace showed the intended flush reduction:
+payload writer syncs fell from 1,123 calls / 18.059 seconds to 100 calls /
+1.399 seconds; journal syncs fell from 1,123 / 12.526 seconds to 15 / 0.192
+seconds. Recovery-loaded untraced windows still measured only 11–13 MiB/s.
+These windows do not establish steady-state restoration to 109 MiB/s.
+
+Targeted owner probes isolated the remaining pauses. Most `grant_work` calls
+took less than 128 microseconds, but occasional writer births and completion
+handlers took 1–4 seconds. Queue document cloning consumed only 0.438 seconds
+in one 20-second sample, and owner ticks only 0.064 seconds. In the next
+20-second sample, `refresh_url_admission_custody` consumed 17.634 seconds;
+synchronizing receipt fields in memory took 0.002 seconds and lifecycle
+timing took 0.021 seconds. All 30 provider sockets were present, with empty
+receive buffers and several-second command gaps. The owner was repeatedly
+blocked in receipt refresh rather than servicing those connections.
+
+`persist_then` refreshes every URL receipt before enqueuing a structural
+snapshot. A pinned receipt calls `Inventory::get`, which reads and decodes
+the complete artifact JSON, including its file manifest, while holding the
+inventory connection mutex. Custody refresh uses only generation, state,
+ownership and Keep flags. The checkpoint path runs for writer birth, file
+publication intent and recovery progress, so queue and receipt history amplify
+the cost. The refresh behavior predates the batching change.
+
+A further syscall probe identified the dominant round trip: in a 20-second
+window, 1,318 custody refreshes consumed 1.284 seconds, of which 1,124 `fcntl`
+calls consumed 1.235 seconds. Page reads took only 0.001 seconds and futex waits
+0.010 seconds. Individual SQLite read transactions repeatedly acquire/release
+file locks through the GlusterFS volume. A projection alone cannot remove
+those per-query lock round trips.
+
+A separate read-only nuc3 comparison fetched the same 200 artifact records
+(360,536 bytes per sweep) without the proposed index: 200 individual SELECTs
+took 681–806 ms; one bound `json_each` SELECT took 3.8–4.9 ms. This isolates
+transaction/lock round trips from manifest projection and changes no runtime
+state. It is not a download-throughput result.
+
+The follow-up reads all checkpoint receipt headers with one bound JSON-array
+query and one SQLite read statement/transaction, then applies the same custody
+rules to each receipt. Missing rows and per-row decoding failures leave only
+that receipt unchanged. Unpinned failed sources are pinned first using the
+existing generation/installation checks. The batch reads current values at
+one consistent point; it is not cached across checkpoints.
+
+Both batch and individual lookups use an indexed `json_remove(data,'$.files')`
+projection (guarded by `json_valid`, retaining malformed rows as raw data). The index carries the compact header beside the artifact
+ID, avoiding reads and decoding of the full manifest on this hot path. It
+returns an explicit custody-only value, retains the existing artifact metadata
+validation and generation comparison, and reads current values on every call.
+There is no cache timeout, delayed custody update, or change to the state/Keep
+rules. The rare unpinned failed-source lookup retains its existing behavior.
+
+Validation must cover existing-inventory reopen, index selection and avoidance
+of table-blob reads, equality with the current full-artifact custody fields,
+missing/stale generations, and updates to state/ownership/Keep metadata.
+After review, CI and deployment, repeat the owner-latency trace and sustained
+one-slot download measurements. The 109 MiB/s runtime gate remains open.
+
+## 12. Follow-up — malformed BODY frames stalled every provider connection
+
+After the custody batching rollout, a 20-second probe measured only 12.2 ms
+of custody refresh work. A later hard stall was a distinct transport failure.
+A passive probe of the running downloader observed 30 successful greeting,
+USER, PASS and BODY responses (`200`, `381`, `281`, `222`), ruling out a
+provider authentication failure. Separate extra-connection login tests received
+`502` / “too many” because the normal pool already held its connection quota;
+those extra probes are not evidence that the downloader failed authentication.
+
+A decoder probe then captured 30 actual `Malformed("bad =ypart range")` errors.
+Every failing wire chunk was 128–256 bytes and already ended with the NNTP
+dot/CRLF terminator. Input registers and result representation were verified
+against the exact running ELF disassembly; this is not an assumed Rust enum
+layout or a sampled descriptor-number classification. No article contents or
+credentials were recorded.
+
+The decode-error branch consumed the entire buffered chunk and then called
+`drain_body` with a fresh terminator scanner. It had discarded the terminator
+it was about to wait for, and could also discard the next pipelined response.
+The resulting read timeout incorrectly turned an article-level validation
+failure into a connection failure. All 30 connections repeated this cycle
+instead of advancing past malformed articles. The branch dates to July 17
+(`2f45cd5`), so it is an older defect exposed by the current article data,
+separate from the later durability and receipt-refresh changes.
+
+The correction gives transport framing its own persistent `TerminatorScanner`
+across every BODY chunk. Only bytes through the current article's terminator
+reach the decoder or are consumed from the connection. After a decoder error,
+the same scanner discards the rest of that article, then reports one ordinary
+article failure. The next pipelined response remains buffered. Invalid ranges,
+CRC failures, expected lengths and durable writer acknowledgements stay
+enforced; no invalid article is accepted to improve throughput.
+
+Regression coverage must include the observed malformed part range, a plain
+text stub, a malformed article followed by a valid pipelined response in the
+same write, and terminators fragmented across every boundary with dot-stuffed
+content. Capture the pre-fix timeout, then verify prompt article rejection and
+valid successor bytes without a connection failure. The production 0.4
+backport and current-main PR integration need separate source/hash receipts.
+The one-active-download 109 MiB/s acceptance gate remains open.
+
+
+## 13. Remaining bottleneck — full queue writes on GlusterFS
+
+After deployment of the framing fix, a 20-second decoder probe recorded 7,775
+successful calls and no validation errors. Recovery eventually drained to no
+pending/checking jobs, but two untraced one-slot windows still averaged only
+7.77 and 6.13 MiB/s. The speed regression is not resolved by the earlier fixes.
+
+The queue snapshot contains about 1.93 million segments and occupies 225–227 MB.
+A steady 20-second trace measured 12 snapshot saves taking 16.38 seconds. Actual
+syscalls inside those saves spent 10.57 seconds writing, 1.95 seconds in
+fdatasync, 0.39 seconds renaming and 0.015 seconds syncing directories. These
+are queue-state writes on the GlusterFS mount, not decoded payload writes.
+Per-file birth and completion calls were observed producing full checkpoints;
+first post-admission checkpoints added pressure for distinct jobs. The sampled
+post-admissions were not repeated for the same job. A separate steady admission
+sample saw no rejected sends, so increasing the queue bound is not supported
+as the current fix.
+
+The per-file generation and publication barriers date to November 1 `a630414`.
+They contribute to the present regression; the earlier reported onset is not
+precise enough to attribute every prior slow interval to this commit. Removing
+those barriers would weaken recovery. Instead, the next implementation retains
+the exact complete document and atomic durability sequence while reducing its
+on-disk representation. A same-host read-only benchmark reduced 226,988,198
+bytes to 59,533,252 bytes in 0.276 seconds with exact round-trip recovery.
+
+See [Queue snapshot encoding](QUEUE_SNAPSHOT_ENCODING.md) for the versioned
+format, integrity limits, old-binary refusal, offline rollback, alternatives and
+runtime acceptance gate. Neither the compression ratio nor successful unit
+checks establishes 109 MiB/s; deployment measurement is still required.
+
+
+## 14. Remaining CPU cost — repeatedly encoding unchanged jobs
+
+Lossless compression reduced measured write time from 10.57 to 3.68 seconds per
+20-second diagnostic sample. The next sample's 16 saves still consumed 17.40
+seconds, mostly in CPU encoding rather than filesystem calls. The active queue
+contains roughly two million segment records, although only a small part changes
+at a file barrier.
+
+A bounded encoder now reuses a complete job fragment only after full field
+equality, rebuilding fresh root/admission fields and preserving exact order.
+Every output is a self-contained full snapshot with checked frame count, decoded
+length and checksum; no prior file or cache is part of recovery authority.
+Ownership transfer avoids cloning jobs merely for cache retention. Structural
+capacity accounting and independent per-store budgets bound retained entries;
+temporary buffers and actual process RSS are measured separately.
+
+On the actual nuc3 document, read-only native encoding fell from 0.764 seconds
+to 0.082 seconds for an unchanged document, or 0.152 seconds with the largest
+job changed. All reconstructed bytes matched ordinary serialization. See
+[Queue snapshot encoding](QUEUE_SNAPSHOT_ENCODING.md) for memory accounting,
+version-2 compatibility and mandatory offline conversion before downgrade.
+This establishes encoder benefit, not restored download throughput.
+
+## 15. Per-article cost that grows with the file — 2026-11-15 (0.9.7)
+
+Runner still rarely reached the link's peak after §10–§14. A release-mode
+benchmark against the in-tree mock server
+([throughput.rs](../crates/nzbd-engine/tests/throughput.rs), one large file,
+20 connections) showed the article rate falling as the file grew: 994 → 845 →
+610 articles/s at 1.5 k, 6 k and 12 k articles. Production files are larger
+still (a 40–60 GB remux is 60–85 k articles at ~716 KiB).
+
+**Cause 1 — the owner re-encoded the file's whole proof per article.** Every
+acknowledged segment parsed the `*File:proof:<file>` parameter (which holds
+every proven range of the file), scanned all of them for overlap, appended
+one, and serialized the whole document back, on the owner's single thread.
+That is O(n) per article and O(n²) per file; mid-file on a large download it
+dominates the owner, delaying `WorkRequest` replies, which is exactly when
+connections sit idle. With only that round trip skipped (an experiment, not a
+change), the same 12 k-article file ran at 1,061 articles/s — flat.
+
+**Cause 2 — one payload sync per article, still.** §10's shared sync covers
+only segments already queued when the writer looks, which in steady state is
+one or two; it batches only once the queue backs up, and a backed-up queue
+blocks the connections feeding it. §10 measured 16 ms per GlusterFS
+`fdatasync`, one per article.
+
+**Correction.** The writer's durability checkpoint is now the unit of
+acknowledgement (ARCHITECTURE.md §8.4). It syncs when 32 MiB are pending,
+when the file is fully covered, when the oldest pending write is one second
+old, or before any control command, and reports one `Written` fact for the
+whole checkpoint. The owner updates the proof, journal records and totals once
+per checkpoint; the overlap check sorts the batch and makes one pass over the
+proof. The writer's own per-segment range check is indexed instead of a scan,
+and the per-segment `metadata()` call is gone (the post-write identity already
+carries the length). Everything §5 guards is unchanged: no segment is
+acknowledged before the sync that covers it succeeds, a failed sync or a
+mutation during it acknowledges nothing, and control commands cannot overtake
+pending writes. This deliberately revisits two properties §10 recorded: the
+checkpoint age is a timer (it only delays acknowledgement, never advances it),
+and the writer input queue is 32 segments instead of 8 so connections keep
+reading while a checkpoint syncs.
+
+**Measured (release, 2 vCPU sandbox, loopback, local ext4 — not nuc hardware; 100 KiB articles, 20 connections, `NZBD_BENCH_DEPTH=8`):**
+
+| Case | Before | After |
+|---|---|---|
+| 600 MiB, 6,144 articles | 82.5 MiB/s | 125.2 MiB/s |
+| 1,200 MiB, 12,288 articles | 59.5 MiB/s | 125.2 MiB/s (flat with size) |
+
+**Adversarial review — dispositions.** A segment repeated inside one
+checkpoint (the writer re-acknowledges a duplicate delivery) was briefly an
+identity failure; the owner now treats an identical repeat as idempotent and
+only a contradicting one as a failure, as for a repeat of a Done segment.
+Tests now cover the age deadline (unknown and uncovered file size) and the
+byte bound. Accepted as-is, with reasons:
+
+- *Memory.* The writer queue holds up to 32 decoded segments (~23 MiB at
+  ~716 KiB) per file being written, up from 8; total is that times the
+  files written concurrently, which the scheduler keeps small (one active
+  job takes its files in order). A byte budget across writers is the next
+  step if a node ever shows pressure.
+- *Residual proof cost.* The proof is still parsed and serialized whole,
+  now once per checkpoint (~46 articles at 32 MiB) instead of per article:
+  a large constant factor, still O(n) per checkpoint. Caching the typed
+  proof in the owner and serializing only at persistence would remove it,
+  but touches every reader of `*File:proof:`; measure on the node first.
+- *Lag.* Progress, quota volume and the space-op success signal move at
+  acknowledgement, so they trail the disk by at most one checkpoint per file
+  (1 s or 32 MiB). Quota can overshoot by about that much per active file.
+
+**Sliding pipeline window — measured, not shipped.** Topping a connection's
+BODY commands up before each read (instead of draining each batch) gained
+~10% with 4 connections, depth 2 and a 30–60 ms RTT, was neutral at 20
+connections, and cost ~20% at ~1,000 articles/s on 2 vCPU (one owner
+`WorkRequest` per article at depth 2). At the deployed 30 connections it buys
+nothing measurable and adds lease-accounting risk, so it is left out.
+Throughput per connection is outstanding requests ÷ RTT either way; a
+high-latency provider gains more from a higher `pipeline_depth`.
+
+Local syncs are cheap, so the GlusterFS gain from far fewer syncs is not in
+these numbers.
+
+**Acceptance on nuc4 (0.9.7, untraced).** Job 3842 (73.4 GiB, ~107 k
+articles, 146 × 500 MB rar volumes on `/processing`, one active download,
+Newshosting 30 connections, pipeline depth 2) downloaded on 2026-11-18. File
+completion times on the volume give the rate without attaching anything to
+the process: from 20:43 to 20:50 UTC exactly 12 volumes (6.29 GB) completed
+every minute, **100.0 MiB/s** sustained; 128 volumes (67.5 GB) in 20:42–20:52,
+≈ 98 MiB/s. §10 measured 41.0 MiB/s for the same setup before this change,
+and §13's windows were 6–13 MiB/s. That is 92 % of the 109 MiB/s target and
+close to what the gigabit link carries as payload, with the rate no longer
+falling as the file grows. The job's earlier 17:12–20:42 gap is a
+write-reservation (allocation) hold, not download speed.

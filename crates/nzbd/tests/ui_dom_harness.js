@@ -383,8 +383,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   const doomed2 = T.rowModel(job(1, { health: 700 }), { idx: 0, count: 1, healthAbortArmed: false });
   eq(doomed2.hNote, "below estimated repair threshold", "…and so is the un-armed case");
   const held = job(1, { status: "paused", control: {
-    lifecycle: "held", cause: "identity_conflict", retry_policy: "review",
-    message: "conflicting yEnc declared size",
+    lifecycle: "held", cause: "storage_unavailable", retry_policy: "scheduled_retry",
+    message: "conflicting yEnc declared size", deadline_unix: 3600 + 86400,
   } });
   eq(T.sectionOf({ ...held, stages: [{ stage: "unpack", started_at_unix: 1 }] }), "attention", "hold overrides a stale stage");
   eq(T.sectionOf(job(2, { status: "completed", pp_done: false })), "post_queued", "completed download awaits post-processing");
@@ -395,12 +395,24 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(heldRow.dRest.includes("conflicting yEnc declared size"), "the hold reason appears in the row");
   // Field report 2026-11-01: two HELD jobs with only "delete" to click.
   // Every hold now offers exactly one of: pause (Runner is retrying it)
-  // or retry (a person decides, or the retries were paused).
-  eq(heldRow.pauseHidden, false, "every hold, review included, offers an exit");
-  eq(heldRow.pauseLabel, "retry", "a review hold offers retry");
-  eq(heldRow.pauseAction, "resume", "retry rides the resume action the engine accepts for holds");
-  ok(heldRow.pauseTip.includes("held again"), "the tip says a persisting cause re-holds");
-  ok(heldRow.pauseTip.includes("retained evidence"), "an identity-conflict retry says it overwrites evidence");
+  // or retry (the retries were paused). Contract v2: no hold waits for a
+  // person, and every hold says when it runs out.
+  eq(heldRow.pauseHidden, false, "every hold offers an exit");
+  eq(heldRow.pauseLabel, "pause", "a retried hold offers pause");
+  ok(!heldRow.dRest.includes("needs review"), "no hold is a review item");
+  const deadlined = T.rowModel(held, { mixedSection: false, nowMs: 3600 * 1000 });
+  ok(deadlined.dRest.includes("fails as hold expired in"), "a hold shows its deadline");
+  ok(deadlined.dRest.includes("storage unavailable: conflicting yEnc"), "a hold names its cause before its message");
+  const relative = T.rowModel({ ...held, control: { ...held.control, deadline_unix: undefined, deadline_in_s: 7200 } }, { mixedSection: false });
+  ok(relative.dRest.includes("fails as hold expired in 2h"), "a hold with only deadline_in_s still shows its deadline");
+  // 0.6.0: the persisted status of a hold is `held` itself; the row reads
+  // the same as a 0.5.0 `paused` + held control.
+  const held060 = T.rowModel({ ...held, status: "held" }, { mixedSection: false });
+  eq(held060.st, "HELD", "a 0.6.0 held status reads as held");
+  eq(held060.pauseLabel, "pause", "a 0.6.0 retried hold offers pause");
+  eq(T.sectionOf({ ...held, status: "held" }), "attention", "a 0.6.0 hold needs attention");
+  const legacyReview = T.rowModel({ ...held, control: { ...held.control, retry_policy: "review" } });
+  eq(legacyReview.pauseLabel, "pause", "a policy from an older build is still an automatic hold");
   const storageHold = { ...held.control, cause: "storage_unavailable", stage: "download_write",
     retry_policy: "scheduled_retry", message: "write /processing/x.part: Transport endpoint is not connected (os error 107)",
     blocked_since_unix: 0, next_retry_at_unix: 3600 + 90 };
@@ -412,6 +424,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(!retrying.dRest.includes("needs review"), "an automatically retried hold is not a review item");
   const paused = T.rowModel({ ...held, control: { ...storageHold, manual_pause: true } }, { nowMs: 3600 * 1000 });
   eq(paused.pauseLabel, "retry", "a paused automatic hold offers retry");
+  eq(paused.pauseAction, "resume", "retry rides the resume action the engine accepts for holds");
+  ok(paused.pauseTip.includes("held again"), "the tip says a persisting cause re-holds");
   ok(paused.dRest.includes("retries paused") && !paused.dRest.includes("next retry in"),
     "a paused hold says its retries are paused, not when the next one fires");
   const capacityRow = T.rowModel({ ...held, control: { ...held.control,
@@ -423,10 +437,13 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
 // --- 8b. storage paths: capacity, warning levels, stable rows ------------
 {
   const GiB = 1024 ** 3;
+  const MiB = 1024 ** 2;
   const storage = T.storageModels({ storage: [
-    { label: "working", path: "/data/working", available_bytes: 25 * GiB, total_bytes: 100 * GiB },
-    { label: "downloads", path: "/data/downloads", available_bytes: 10 * GiB, total_bytes: 100 * GiB },
-    { label: "failed", path: "/data/failed", available_bytes: null, total_bytes: null },
+    { name: "processing", label: "state · working", path: "/data/working", available_bytes: 25 * GiB, total_bytes: 100 * GiB,
+      io: { source: "block", detail: "nvme0n1p2", read_bps: 2 * MiB, write_bps: 90 * MiB } },
+    { name: "completed", label: "downloads", path: "/data/downloads", available_bytes: 10 * GiB, total_bytes: 100 * GiB,
+      io: { source: "nfs", detail: "nas:/share", read_bps: null, write_bps: null } },
+    { label: "failed", path: "/data/failed", available_bytes: null, total_bytes: null, io: null },
   ] });
   eq(storage.length, 3, "every configured storage path gets a row");
   eq(storage[0].pct, "75%", "fullness is used capacity, not free capacity");
@@ -434,17 +451,105 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   eq(storage[0].free, "25.0 GiB free", "remaining capacity is stated too");
   ok(storage[1].cls.includes("warn"), "a filesystem at 90% reads as a warning");
   eq(storage[2].pct, "measuring…", "the initial probe does not pretend zero usage");
+  eq(storage[0].label, "processing", "a row is named for what the filesystem is for");
+  ok(storage[0].tip.includes("(state · working)"), "the configured roles stay in the tooltip");
+  ok(storage[0].tip.includes("75.0 GiB used of 100 GiB"), "used and total capacity move into the tooltip");
+  eq(storage[2].label, "failed", "an older daemon without a name falls back to the role label");
+  eq(storage[0].ioA, "W 90.0 MiB/s", "the write rate is stated");
+  eq(storage[0].ioB, "R 2.0 MiB/s", "the read rate is stated");
+  ok(storage[0].ioTip.includes("nvme0n1p2") && storage[0].ioTip.includes("other program"),
+    "block-device I/O is named as device-wide");
+  ok(storage[1].ioQuiet && storage[1].ioA === "measuring…", "no rate until the second sample");
+  ok(storage[1].ioTip.includes("nas:/share") && storage[1].ioTip.includes("Other clients"),
+    "NFS I/O is named as this machine's traffic only");
+  eq(storage[2].ioA, "no I/O data", "a filesystem with no device identity says so");
+  {
+    const na = T.storageIoModel({ source: "unsupported", detail: "cifs", read_bps: null, write_bps: null });
+    ok(na.ioQuiet && na.ioA === "I/O n/a" && na.ioTip.includes("(cifs)"),
+      "a filesystem without counters names its type rather than drawing a flat line");
+    const own = T.storageIoModel({ source: "runner", detail: "fuse.glusterfs", read_bps: 1024, write_bps: 2048 });
+    ok(!own.ioQuiet && own.ioA === "W 2.0 KiB/s" && own.ioTip.includes("Runner's own") &&
+      own.ioTip.includes("fuse.glusterfs"),
+      "a filesystem without kernel counters graphs Runner's own I/O and says so");
+    const stale = T.storageIoModel({ source: "stale", detail: "sda1", read_bps: null, write_bps: null });
+    eq(stale.ioA, "I/O stalled", "a stopped sampler is reported, not frozen");
+  }
 
   const list = node("div");
   T.reconcileRows(list, storage, fake);
   const first = list.children[0];
-  eq(first.children[0].children[0].textContent, "working", "the path role is visible");
-  eq(first.children[0].children[1].textContent, "/data/working", "the actual path is visible");
-  eq(first.children[1].children[0].style.width, "75.0%", "the bar shows the same fullness");
+  const cap = first.children[0], ioCell = first.children[1];
+  eq(cap.children[0].children[0].textContent, "processing", "the filesystem's name is visible");
+  eq(cap.children[0].children[1].textContent, "/data/working", "the actual path is visible");
+  eq(cap.children[1].children[0].children[0].style.width, "75.0%", "the bar shows the same fullness");
+  eq(cap.children[1].children[1].textContent, "25.0 GiB free", "free space sits beside the bar");
+  eq(ioCell.children[1].children[0].textContent, "W 90.0 MiB/s", "the write rate sits beside its graph");
+  eq(ioCell.children[1].children[1].textContent, "R 2.0 MiB/s", "the read rate sits under it");
   resetCounts();
   T.reconcileRows(list, storage, fake);
   eq(counts.text + counts.cls + counts.style + counts.prop, 0,
     "unchanged storage readings do not rewrite their rows");
+}
+
+// --- 8c. storage I/O history: gaps stay gaps, three minutes per row -----
+{
+  T.storageIo.clear();
+  T.storageIoLatest.clear();
+  const rows = [{ path: "/p" }];
+  const live = (r, w) => [{ path: "/p", io: { source: "block", detail: "sda1", read_bps: r, write_bps: w } }];
+  let t = 1_000_000;
+  T.noteStorageIo(live(1, 2), t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.sampleStorageIo(rows, true, t += 1000);
+  eq(JSON.stringify(T.storageIo.get("storage:/p").w), "[2,2]",
+    "an unchanged rate (not re-sent by the stream) still advances the graph");
+  T.noteStorageIo([{ path: "/p", io: { source: "unsupported", detail: "cifs", read_bps: null, write_bps: null } }], t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.noteStorageIo(live(3, 4), t);
+  T.sampleStorageIo(rows, true, t += 1000);
+  T.sampleStorageIo(rows, false, t += 3000);
+  T.sampleStorageIo(rows, false, t += 4000);
+  const h = T.storageIo.get("storage:/p");
+  eq(JSON.stringify(h.w), "[2,2,null,4,4,null]",
+    "unmeasured seconds and a dead stream without a recent poll are gaps, not zeros");
+  eq(JSON.stringify(T.storageRuns(h.w)), "[[0,1],[3,4]]", "each measured run is drawn on its own");
+  for (let i = 0; i < 400; i++) T.sampleStorageIo(rows, true, t += 1000);
+  eq(T.storageIo.get("storage:/p").w.length, 180, "history keeps the same three minutes as the rate tile");
+  T.sampleStorageIo([], true, t += 1000);
+  ok(!T.storageIo.has("storage:/p") && !T.storageIoLatest.has("storage:/p"),
+    "a filesystem that leaves the config drops its history");
+  // A tick's rows carry no io: the row reads the stream's latest instead.
+  T.noteStorageIo(live(5, 6), t);
+  const fromTick = T.storageModels({ storage: [{ name: "completed", path: "/p", available_bytes: 1, total_bytes: 2 }] });
+  eq(fromTick[0].ioA, "W 6 B/s", "a tick row shows the rate from the storage_io frame");
+  const fresh = T.storageModels({ storage: [{ name: "completed", path: "/new", available_bytes: 1, total_bytes: 2 }] });
+  eq(fresh[0].ioA, "measuring…", "a row with no sample yet is measuring, not missing");
+  T.storageIo.clear();
+  T.storageIoLatest.clear();
+}
+
+// The summary's progress blocks arrive under snake_case keys (their fields
+// are camelCase); the detail line reads them from where the API puts them.
+{
+  const fetching = job(92, { url_fetch: { attempts: 2, nextRetryAtUnix: null, blockedSinceUnix: null, lastError: "HTTP 503" } });
+  ok(T.detailModel(fetching).lifecycleStatus.startsWith("NZB fetch retry 2") &&
+    T.detailModel(fetching).lifecycleStatus.includes("HTTP 503"), "url_fetch retry is shown");
+  // A fetch waiting on its backoff offers "retry now"; one in flight shows
+  // the button but has nothing to cut short.
+  const now = 1_700_000_000_000;
+  const waiting = job(95, { status: "fetching", url_fetch: { attempts: 3, nextRetryAtUnix: now / 1000 + 600, blockedSinceUnix: now / 1000 - 400, lastError: "http: status 429 Too Many Requests (indexer asked to wait 12h)" } });
+  const waitingModel = T.detailModel(waiting, now);
+  ok(!waitingModel.lifecycleHidden && !waitingModel.lifecycleRetryHidden && !waitingModel.lifecycleRetryDisabled,
+    "a fetch waiting on its backoff can be retried now");
+  ok(waitingModel.lifecycleStatus.includes("indexer asked to wait 12h"), "the indexer's own ask is shown");
+  const inFlight = T.detailModel(job(96, { status: "fetching", url_fetch: { attempts: 3, nextRetryAtUnix: null, blockedSinceUnix: null, lastError: null } }), now);
+  ok(!inFlight.lifecycleRetryHidden && inFlight.lifecycleRetryDisabled, "an in-flight fetch has nothing to retry");
+  const due = T.detailModel(job(97, { status: "fetching", url_fetch: { attempts: 1, nextRetryAtUnix: now / 1000 - 1, blockedSinceUnix: null, lastError: null } }), now);
+  ok(due.lifecycleRetryDisabled, "a fetch already due is retrying on its own");
+  const post = job(93, { post_timing: { startedAtUnix: 1, elapsedMs: 4000, workMs: 3000, waitMs: 1000, attempts: 1 } });
+  ok(T.detailModel(post).lifecycleStatus.startsWith("Post-processing: "), "post_timing is shown");
+  const cleanup = job(94, { failed_cleanup: { attempts: 3 } });
+  ok(T.detailModel(cleanup).lifecycleStatus.startsWith("Source cleanup attempt 3"), "failed_cleanup attempts are shown");
 }
 
 // Repair progress is an optional, stable text node; old snapshots stay valid.
@@ -815,6 +920,11 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   ok(T.satisfied({ kind: "delete", jobId: 9 }, byId), "an absent job does");
   ok(T.satisfied({ kind: "pause", jobId: 9 }, byId),
     "a job that left the queue stops being overridden");
+  // 0.6.0 persists a hold as `held`: pausing a held job keeps it held (the
+  // control records the pause), and a retry is done only once it leaves.
+  const held = new Map([[1, job(1, { status: "held", control: { lifecycle: "held", manual_pause: true } })]]);
+  ok(T.satisfied({ kind: "pause", jobId: 1 }, held), "held satisfies a pause");
+  ok(!T.satisfied({ kind: "resume", jobId: 1 }, held), "held does not satisfy a retry");
 }
 
 // --- 19. connection states, including the one the old UI could not see ---
@@ -1200,6 +1310,25 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
 // This is the whole point of M4: one click deletes, the toast offers Undo
 // for as long as the server says the job is parked, and Undo requeues it.
 (async () => {
+  // Disk-full recovery is visible and uses its own action, with no lane toggle.
+  {
+    const button = sandbox.document.getElementById("retry-storage");
+    const prior = T.store.status;
+    T.store.status = { ...prior, disk_low: true, disk_guard_write_latched: true,
+      enospc_where: "post-processing: /downloads/job" };
+    T.renderStatus();
+    eq(button.hidden, false, "disk-full stop exposes retry storage now");
+    ok(sandbox.document.getElementById("hold").textContent.includes("checking automatically"), "storage error explains automatic retries");
+    routes.set("/api/v1/queue/actions/retry-storage", { status: 200, body: { ok: true } });
+    seen.length = 0;
+    await button.onclick();
+    ok(seen.some(r => r.url === "/api/v1/queue/actions/retry-storage"), "retry uses the dedicated storage action");
+    ok(!seen.some(r => /actions\/(pause|resume)/.test(r.url)), "storage retry never toggles a lane");
+    T.store.status = { ...prior, disk_low: false };
+    T.renderStatus();
+    eq(button.hidden, true, "retry hides after storage recovers");
+  }
+
   const stack = sandbox.document.getElementById("toasts");
   const reset = () => { stack.children.length = 0; routes.clear(); seen.length = 0; T.pending.clear(); };
 
@@ -1845,6 +1974,8 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       "the download interlude remains in the post-processing section");
     eq(T.detailModel(fetchingDelayedPar, 1_542_000).recoverHidden, true,
       "recovery controls stay hidden while the backend rejects restarts");
+    eq(T.sectionOf(post("publication_verify")), "verifying", "final proof checks are verifying, not renaming");
+    eq(T.detailModel(post("publication_verify"), 1_542_000).st, "VERIFYING PUBLICATION", "final verification has its own label");
     // An unknown stage from a newer daemon must land in a visible section
     // rather than vanish between the buckets.
     eq(T.sectionOf(post("teleporting")), "post_queued",
@@ -1855,7 +1986,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     for (const st of ["queued", "downloading", "paused", "fetching", "post_queued"])
       ok(keys.has(T.sectionOf(job(1, { status: st }))), "section exists for " + st);
     for (const st of ["par_rename", "par_verify", "par_repair", "rar_rename",
-                      "unpack", "cleanup", "move", "post_unpack_rename", "script"])
+                      "unpack", "cleanup", "move", "post_unpack_rename", "script", "publication_verify"])
       ok(keys.has(T.sectionOf(post(st))), "section exists for stage " + st);
 
     // Only the download queue keeps its move controls: off it, the arrows
@@ -2240,7 +2371,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     const save = doc.getElementById("cfg-save");
     const msg = doc.getElementById("cfg-msg");
     const config = process.env.NZBD_UI_CONFIG ? JSON.parse(process.env.NZBD_UI_CONFIG) : {
-      paths: {}, queue: {}, post: { failure_action: "park" }, history: {}, server: [], category: [],
+      paths: {}, queue: {}, post: { keep_failed_downloads: true }, history: {}, server: [], category: [],
       torrent: { enabled: false, listen_port: 6881, pex: true },
     };
     let stored = config, submitted, rejectSave = false, reloadFailure = null;
@@ -2281,14 +2412,51 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       "unmet storage readiness does not disable enablement");
     await vm.runInContext("toggleHistorySync()", sandbox);
     eq(syncState.paused, false, "Dev enable resumes synchronization on network storage");
-    ok(doc.getElementById("history-sync-info").textContent.includes("idle"),
+    ok(doc.getElementById("history-sync-info").textContent === "Repair pending",
       "successful resume updates displayed synchronization state");
     eq(doc.getElementById("cfg-history-sync-enable").textContent, "Pause history synchronization",
       "successful resume offers the inverse operation");
     await vm.runInContext("toggleHistorySync()", sandbox);
     eq(syncState.paused, true, "the next click pauses instead of resuming again");
-    ok(doc.getElementById("history-sync-info").textContent.includes("paused"),
+    ok(doc.getElementById("history-sync-info").textContent === "Paused",
       "successful pause renders the new state");
+
+    // Diagnostics stay collapsed by default, survive live ticks, and use text
+    // nodes even when a filesystem error contains HTML-like filenames.
+    const renderSync = status => vm.runInContext("renderHistorySync(" + JSON.stringify(status) + ")", sandbox);
+    const failedSync = { ...syncState, paused: false, state: "failed", repair_pending: false,
+      last_success_age_secs: 63401, last_duration_ms: 437, last_bytes_read: 0,
+      last_scan: "full", last_entries_reconciled: 482, last_files_rebuilt: 1,
+      last_error: "corrupt state: history changed during reconciliation; retrying" };
+    renderSync(failedSync);
+    eq(doc.getElementById("history-sync-info").textContent, "Interrupted", "a replay conflict gets a readable status");
+    eq(doc.getElementById("history-sync").dataset.tone, "warning", "a replay conflict is amber");
+    ok(!doc.getElementById("history-sync-message").textContent.includes("retry automatically"),
+      "clean local history does not promise an unnecessary retry");
+    eq(doc.getElementById("history-sync-age").textContent, "17h 36m ago", "sync age uses readable units");
+    eq(doc.getElementById("history-sync-scan").textContent, "Full · 482 entries", "completed scan is distinct from last attempt");
+    eq(doc.getElementById("history-sync-error-text").textContent, failedSync.last_error, "raw diagnostics remain available");
+    eq(doc.getElementById("history-sync-storage").textContent, "Network or FUSE filesystem", "storage type has a readable label");
+    const details = doc.getElementById("history-sync-details");
+    details.open = true;
+    const rawError = 'open <img src=x onerror="alert(1)">: permission denied';
+    renderSync({ ...failedSync, repair_pending: true, last_error: rawError,
+      last_incomplete_tails: 1, last_malformed_lines: 2 });
+    eq(doc.getElementById("history-sync-info").textContent, "Needs attention", "a persistent error remains prominent");
+    eq(doc.getElementById("history-sync").dataset.tone, "error", "a persistent error is red");
+    eq(doc.getElementById("history-sync-error-text").textContent, rawError, "errors are displayed as literal text");
+    eq(doc.getElementById("history-sync-error-text").innerHTML, "", "errors never become HTML markup");
+    eq(details.open, true, "status updates preserve expanded diagnostics");
+    eq(doc.getElementById("history-sync-log-notes").hidden, false, "log anomalies remain visible in diagnostics");
+    renderSync({ ...failedSync, state: "idle", last_error: null, last_success_age_secs: 0 });
+    eq(doc.getElementById("history-sync-info").textContent, "Ready", "healthy local history is ready");
+    eq(doc.getElementById("history-sync-error").hidden, true, "recovery hides the old error");
+    eq(doc.getElementById("history-sync-error-text").textContent, "", "recovery clears the old error text");
+    eq(doc.getElementById("history-sync-log-notes").hidden, true, "recovery clears log anomalies");
+    eq(doc.getElementById("history-sync-age").textContent, "just now", "recent synchronization has a readable age");
+    eq(vm.runInContext("historySyncAge(null)", sandbox), "Never", "missing success is explicit");
+    eq(vm.runInContext("historySyncAge(172861)", sandbox), "2d 0h ago", "old synchronization uses days");
+    renderSync(syncState);
 
     eq(vm.runInContext("cfgDirty", sandbox), false, "live enable does not dirty config form");
     eq(doc.getElementById("cfg-history-sync-enable").disabled, false,
@@ -2321,9 +2489,9 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
       }
     }
     const enable = controls.find(control => control.dataset.path === "torrent.enabled");
-    const failure = controls.find(control => control.dataset.path === "post.failure_action");
-    ok(!!failure, "the form uses the canonical failure_action field");
-    eq(failure?.value, config.post.failure_action, "the form shows the configured failure policy");
+    const failure = controls.find(control => control.dataset.path === "post.keep_failed_downloads");
+    ok(!!failure, "the form exposes failed download retention");
+    eq(failure?.checked, config.post.keep_failed_downloads, "the form shows the configured retention choice");
     ok(form.innerHTML.includes('data-settings-view="dev"'), "settings renders a Dev view");
     const advice = T.enableAdvisory({ torrent: { listen_port: 6881, dht: true, socks_proxy_url: "socks5://localhost:1080" }, cluster: { enabled: true } });
     ok(advice.includes("unmet"), "incompatible configuration is advisory");
@@ -2357,7 +2525,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     await save.onclick();
     eq(JSON.parse(submitted).torrent.enabled, true, "Save changes submits BitTorrent enabled");
     eq(JSON.parse(submitted).torrent.listen_port, 6881, "save preserves the default listen port");
-    eq(JSON.parse(submitted).post.failure_action, config.post.failure_action, "save preserves the configured failure policy");
+    eq(JSON.parse(submitted).post.keep_failed_downloads, config.post.keep_failed_downloads, "save preserves the configured failure policy");
     ok(!("health_action" in JSON.parse(submitted).post), "save does not add the legacy alias");
     if (process.env.NZBD_UI_SAVED_CONFIG_PATH) fs.writeFileSync(process.env.NZBD_UI_SAVED_CONFIG_PATH, submitted);
     eq(msg.textContent, "saved", "save confirmation survives the settings reload");
@@ -2443,6 +2611,15 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     ok(owned.ret.startsWith("expires "), `retention names the expiry (got ${owned.ret})`);
     const kept = T.fileRowModel(entry("Kept", { state: "retained", owned: true, keep: true, hold: null }, 1, 1, true));
     eq(kept.ret, "keep indefinitely", "keep reads as keep");
+    const parked = T.fileRowModel({ ...entry("Bad.Archive", { state: "parked_failed", owned: true, keep: false, hold: null,
+      failure_reason: "unpack", salvage: "pending", failure_assessment: { disposition: "unusable", reason: "archive is corrupt", assessedAt: 1 } }, 3, 100, true), earliest_expiry: 1790700000 });
+    eq(parked.parked, "Parked: unpack failed · archive is corrupt · salvage pending", "a parked source says why it is parked");
+    ok(parked.ret.startsWith("expires "), "…and when it expires");
+    eq(T.fileRowModel(entry("Plain", { state: "retained" })).parked, "", "only parked sources carry a reason");
+    const keptFailed = T.fileRowModel(entry("Kept.Fail", { state: "retained", owned: true, keep: true, hold: null, failure_reason: "par" }, 1, 1, true));
+    eq(keptFailed.parked, "Kept: PAR2 repair failed", "a keep-on-failure source says why it failed");
+    ok(T.fileDetailModel({ artifact: art("kf", { state: "retained", owned: true, hold: null, keep: true, failure_reason: "par", inspected_at: 1 }), files: [], total: 0, offset: 0, events: [], preview: null })
+      .facts.some(f => f[0] === "parked" && f[1] === "Kept: PAR2 repair failed"), "…and so does the details panel");
     const active = T.fileRowModel(entry("Live", { state: "active" }));
     eq(active.inspectHidden, true, "a folder still being written cannot be walked");
     eq(active.st, "downloading", "active reads as downloading");
@@ -2725,6 +2902,57 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
     sandbox.setTimeout = realTimeout;
     routes.clear(); seen.length = 0;
     T.store.files = null; T.setFilesDetailForTest(null, null);
+  }
+
+  // --- split pause lanes ---------------------------------------------------
+  // Downloads and post-processing pause independently: one toggle and one
+  // attributed badge per lane, and the queue says why post work is waiting.
+  {
+    const st0 = T.store.status, src0 = T.store.pauseSource, psrc0 = T.store.postPauseSource;
+    T.store.pauseSource = "web-ui"; T.store.postPauseSource = "curator";
+    const badges = (s) => T.statusModels(s).filter(m => /paused/.test(m.text)).map(m => m.text);
+    eq(badges({ download_paused: false, post_paused: false }).length, 0, "no lane paused → no pause badge");
+    eq(JSON.stringify(badges({ download_paused: true, post_paused: false })),
+      JSON.stringify(["downloads paused · by web-ui"]), "download lane badge names its sender");
+    eq(JSON.stringify(badges({ download_paused: false, post_paused: true })),
+      JSON.stringify(["post-processing paused · by curator"]), "post lane badge names its sender");
+    eq(badges({ download_paused: true, post_paused: true }).length, 2, "both lanes → two badges");
+    eq(badges({ download_paused: false }).length, 0, "an older daemon without post_paused reads as running");
+
+    const dl = sandbox.document.getElementById("btn-pause");
+    const pp = sandbox.document.getElementById("btn-pause-post");
+    ok(dl && pp, "one toggle per lane");
+    ok(!/id="btn-resume"/.test(html), "the old resume button is gone");
+    T.setPauseButtons(false, true);
+    ok(!dl.dataset.paused && pp.dataset.paused === "1", "only the paused lane latches");
+    eq(pp.attrs["aria-pressed"], "true", "the latched lane reports pressed");
+    eq(dl.attrs["aria-pressed"], "false", "…and the running one does not");
+    eq(pp.title, T.LANES.post.pausedTip, "a paused lane says a click resumes it");
+    T.setPauseButtons(true, false);
+    ok(dl.dataset.paused === "1" && !pp.dataset.paused, "lanes flip independently");
+    eq(dl.title, T.LANES.download.pausedTip, "the download lane's tip follows its state");
+    T.setPauseButtons(false, false);
+
+    // Queue: a parked job (last span closed) vs one still finishing its stage.
+    const running = job(71, { status: { post: { stage: "par_repair" } }, remaining_bytes: 0,
+      stages: [{ stage: "par_repair", started_at_unix: 1 }] });
+    const parked = job(72, { status: { post: { stage: "par_verify" } }, remaining_bytes: 0,
+      stages: [{ stage: "par_verify", started_at_unix: 1, ms: 4000 }] });
+    const detail = (j, postPaused) => JSON.stringify(T.rowModel(j, { idx: 0, count: 1, postPaused }));
+    ok(/holds after this stage/.test(detail(running, true)), "a running stage finishes, then holds");
+    ok(/held — post-processing paused/.test(detail(parked, true)), "a parked job says it is held");
+    ok(!/post-processing paused|holds after/.test(detail(running, false)), "no hold text while the lane runs");
+
+    T.store.jobsLoaded = true; T.pending.clear();
+    T.store.jobs = [job(73, { status: "post_queued", remaining_bytes: 0 })];
+    T.store.status = Object.assign({}, st0 || {}, { post_paused: true });
+    const sec = T.queueModels().find(m => m.kind === "section" && m.section === "post_queued");
+    eq(sec && sec.held, "held · post-processing paused", "the waiting-to-post-process heading says why");
+    T.store.status = Object.assign({}, st0 || {}, { post_paused: false });
+    const sec2 = T.queueModels().find(m => m.kind === "section" && m.section === "post_queued");
+    eq(sec2 && sec2.held, "", "…and nothing when the lane runs");
+
+    T.store.status = st0; T.store.jobs = []; T.store.pauseSource = src0; T.store.postPauseSource = psrc0;
   }
 
   if (failures.length) {

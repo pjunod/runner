@@ -1,17 +1,18 @@
 # File lifecycle operations
 
-**Status:** implementation under final preparation · **Updated:** 2026-11-01
+**Status:** implementation under final preparation · **Updated:** 2026-11-07 (pipeline contract v2 M3: per-file publication, no acceptance)
 
 Runner records payload ownership separately from History. Removing a History
 row does not abandon its files. Unknown folders are retained for review, and
 failed or pending deletion preserves the retry record. See the
-[delivery status](FILE_LIFECYCLE_STATUS.md) for review and test results.
+[delivery status](archive/FILE_LIFECYCLE_STATUS.md) for review and test results.
 
 ## 1. Enable and inspect
 
-Settings → Dev → **Enable file lifecycle automation** controls automatic failed
-payload expiry. Enablement always accepts the operator's choice; readiness
-information is advisory. Manual inspection, Keep and recovery remain available.
+Settings → Dev → **Enable file lifecycle automation** controls periodic
+discovery scans. Failed-payload expiry is not behind it (0.9.0): a parked
+failure expires at its deadline either way. Enablement always accepts the
+operator's choice; readiness information is advisory. Manual inspection, Keep and recovery remain available.
 A specific destructive action still requires verified ownership and no active
 writer, recovery claim or Keep hold.
 
@@ -27,9 +28,19 @@ fresh **Grab** in Curator, or retry the retained source. Removing such a queue
 entry does not offer an Undo that would reuse its consumer request token.
 Ordinary parked jobs retain their existing Undo/requeue behavior.
 
-New owned failures use seven days by default. Expiry requires both its wall
-clock deadline and seven days of observed eligible daemon uptime. Downtime and
-holds extend retention. Zero days means indefinitely. Removing Keep or applying
+**Failed-download policy.** Settings → Post-processing → **keep failed
+downloads** (`post.keep_failed_downloads`) defaults off: Delete after salvage
+and cleanup custody settle. Enable it for Park; reason, recoverability and
+Curator admission do not force parking. Per-download Keep retains its source
+indefinitely. Legacy `failure_action`/`health_action` values do not govern the
+daemon's retention choice. Health cancellation remains armed either way.
+
+New owned failures use seven days by default. Expiry is the wall-clock
+deadline alone: it is the same across restarts and downtime, and Keep or a
+hold suspends it. Zero days means indefinitely. An owned allocation whose job
+is not in the recovered queue at startup is a parked failure with the same
+retention (it was a review hold before 0.9.0); importing the job reclaims
+it. Removing Keep or applying
 a changed policy starts a fresh period. Existing unknown folders never acquire
 retroactive expiry merely because automation is enabled.
 
@@ -44,7 +55,10 @@ not a scan failure. Open a folder's **details**; adopt unknown files only
 after reviewing the file list. Adoption enables Keep. Newly added or replaced
 content revokes ownership when inspected. A reviewed hold can be released
 explicitly; active recovery claims cannot be released that way. The list is
-filtered (**Needs review** = live rows that are unowned, held or in error),
+filtered (**Needs attention** = live Runner rows with an error, a blocked
+cleanup, an open intent, a hold with no automatic exit, or past their
+registered exit; **Not Runner's** = live content Runner did not create,
+informational only),
 searched, sorted and paged on the server; the counts on the filter chips
 describe the whole inventory, not the current search.
 
@@ -68,10 +82,11 @@ opening a job never scans the Delivery collection to guess its receipt.
 Measured queue, fetch, download and processing steps remain separate for each
 machine and process session. A subtotal counts overlapping completed steps once,
 using recorded monotonic endpoints. The immutable publication snapshot measures
-queue, URL fetch, download and processing through READY. Consumer acceptance
-and handoff retry observations remain in the separate mutable receipt lane;
-Runner does not invent a handoff duration ending after the snapshot. The wire
-contract also accepts a future explicit `handoff` interval.
+queue, URL fetch, download and processing through READY. There is no consumer
+acceptance (pipeline contract v2 §2.5): curator owns a publication from the
+moment its `.runner-manifest.json` exists, and Runner does not invent a
+handoff duration ending after the snapshot. The wire contract also accepts a
+future explicit `handoff` interval.
 
 Evidence stays bounded at 128 major intervals. Omission counters are conservative
 lower bounds: **at least N omitted**, and any subtotal describes the **recorded
@@ -80,11 +95,32 @@ measurements survive late imports without being counted twice. StageSpan-based
 processing details lack historical per-span machine/session identity; their
 origin remains explicitly unrecorded, including after restart. Missing or interrupted measurements stay
 unknown. Processing details expand the major steps and are not added again.
-Publication/consumer acceptance and source-copy cleanup follow separately. Copy
+Publication and source-copy cleanup follow separately. Copy
 status, retry attempts and errors lead; exact references can be expanded. Retry
 source cleanup uses its existing independent action, and polling preserves its
 button and focus. Phone queue and History details show the same receipt and
 provide visible retry results.
+
+## Failed deletion review
+
+A changed manifest or legacy device-only root identity stays in review. Normal
+inspection, expiry and deletion never relax those checks. To explicitly review
+the *current* bytes, use `GET /api/v1/artifacts/{id}/cleanup-review`. It hashes
+regular files through descriptors and returns old/current root and allocation
+identities, the current manifest, revision, generation and a fingerprint. A
+changed root or payload inode, missing allocation marker, active writer,
+recovery or publication move refuses the preview. Legacy remount review also
+requires a current stable mount identity; an unmounted fallback cannot pass.
+
+After reviewing that exact root and content, POST to the same endpoint with
+`revision`, `generation`, `fingerprint` and `acknowledged: true`. Any intervening
+metadata/content change refuses acceptance. Present files receive a **new
+generation**, fresh immutable allocation sidecar and **Keep**, with automatic
+cleanup disabled. Old delete approvals are cancelled. Acceptance deletes
+nothing; release Keep and submit a new ordinary guarded deletion separately.
+An explicitly reviewed absent payload becomes `source_gone` after current-root
+verification. A failed database commit leaves the old allocation sidecar intact.
+Review acceptance is recorded in the artifact event ledger.
 
 ## 2. Recover media into Curator
 
@@ -126,8 +162,35 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
 - Queue retirement waits for writer-stop acknowledgements. Startup reconciles
   interrupted retirement before resuming writers.
 - Category moves and failed-file parking journal their source and destination.
-  Publication refuses an existing destination. Cross-volume moves verify copies
-  before exact-entry source cleanup. Incomplete scratch is retained for review.
+  A destination root that cannot be created (for example a park volume that is
+  not mounted) is journaled too: the move's operation waits on its retry
+  ladder with the error (shown on the row), and the same move retries. Publication refuses an existing destination. Cross-volume whole-directory
+  moves verify copies before exact-entry source cleanup. Incomplete scratch is
+  retained for review.
+- A selected publication moves **file by file** under a journaled intent
+  (`relocation_intents`: generation, target, each file's identity, digest and
+  destination), written before the first rename; `.runner-manifest.json` is
+  written last. On restart each open intent is finished (every file found
+  unchanged in the target or the source) or unwound (moved files put back by
+  identity, the target removed, the job failed `io` with the retention policy applied) — never both.
+  While an intent is open, deletion, disposal and queue retirement refuse
+  either side; the source shows in state `transitioning`. Same-volume files are renamed (no copy, one digest read at
+  most); cross-volume files are streamed once, hashing as they are written. A
+  published file that a retained PAR set still needs is linked instead, and
+  its source name is retained as `retained_repair_dependency`.
+  An unwind never removes the only copy: a cross-volume copy goes only while
+  the source still holds the journaled original, a linked repair input's
+  publication name only while the source name is the same inode; otherwise
+  the move stops for review and its operation error is shown on the artifact.
+  A stuck move (review or retry ladder) is abandoned from the Files detail —
+  **Abandon move and retain original** — which unwinds it, or, where it
+  cannot be put back safely, closes it without deleting anything and
+  registers the publication directory (no manifest) for an explicit
+  disposition; the job's next publication attempt fails `io` and applies the
+  retention policy once custody settles.
+  The processing directory then holds only unselected siblings, which Runner
+  disposes of once the delivery row exists. See
+  [INTEGRATION.md §2a](INTEGRATION.md#2a-publication-manifest-and-the-move-journal-pipeline-contract-v2-runner-040).
 - A fully journaled recovery publication can finish after a crash by checking
   directory identity, manifest, sizes and hashes. Incomplete staging is retained
   and exposed for explicit review; it is not erased by matching a scratch name.
@@ -135,8 +198,9 @@ consumers never cause expiry. A missing heartbeat is diagnostic only.
   quality/provenance, episode links and each file receipt commit together.
   Outbox delivery retries independently of the browser or original HTTP request.
 
-Do not manually erase SQLite journals, sidecars, rollback files or a directory
-with an active claim. A review state is a request to inspect the recorded paths
+Do not manually erase SQLite journals, sidecars, rollback files, a directory
+with an active claim, or a publication directory without its
+`.runner-manifest.json` (reconciliation owns it until it finishes or unwinds). A review state is a request to inspect the recorded paths
 and actual filesystem, not evidence that the files are disposable.
 
 ## 4. Backup and restore
@@ -174,6 +238,11 @@ Linux and macOS use descriptor-relative, no-follow access and exclusive
 publication. Windows keeps ordinary queue operation and inspection; destructive
 ownership is refused where equivalent deletion primitives are unavailable.
 This is an operation-level inability to prove safe deletion, not an enable gate.
+The native Windows adapter gate verifies ACLs, wire format, and that unsupported
+descriptor-relative absence proofs and deletion refuse without touching payload.
+Owned publication/retirement fixtures require Unix descriptors and run on Linux
+and macOS. The broader Windows daemon state/history suite is not certified by
+this adapter gate; unsupported operations are not reported as passing.
 
 Each cluster node keeps its inventory in its local control directory. Imported
 pre-existing worker payloads remain unowned. A remote writer lease must retire
@@ -224,6 +293,22 @@ ranges despite 100% article health. When no usable PAR bytes are known, the UI
 says **recovery data unconfirmed** instead of presenting the 85% fallback as a
 repair guarantee.
 
+A control-request timeout during failed-repair cleanup preserves the source.
+Runner retries the live Keep read up to three times, with a one-second wait
+between reads. If the owner still cannot answer, the job carries
+`cause=engine_unavailable`, `retry_policy=scheduled_retry` and a retry time.
+The normal hold backoff applies; a timeout does not establish bad payload data
+or authorize deletion. Issued mutations are not replayed by the read retry.
+The hold recovery task continues after request timeouts.
+
+On upgrade, the exact legacy hold `subprocess failed: read live Keep setting:
+engine is shutting down` is re-armed automatically. Manual pauses remain in
+force. Once Runner can read the live job again, a failed repair completes as
+`PAR_FAILURE` in History, preserving files when Keep is set. Other review holds
+retain their existing policy. The
+`legacy_repair_timeout_recovers_automatically_and_records_terminal_failure`
+regression checks this recovery with Keep both set and clear.
+
 Multipart posts may use a different obfuscated yEnc filename in every article.
 Runner keeps the first safe confirmed filename for that NZB file, including any
 collision suffix, while requiring all articles to declare the same total size.
@@ -268,10 +353,20 @@ of the durable revision. Polling held facts take precedence over older history.
 `POST /api/v1/queue/{id}/resume` in Monarr calls Runner's existing
 `POST /api/v1/jobs/{id}/actions/resume`; it does not add an NZB. Runner requires
 writer quiescence, capacity reservation and a bounded 64 KiB write/flush probe.
-Attempts and exponential backoff survive restart (eight attempts; initial
-30-second backoff). Quota release is explicitly operator-triggered because
-`statvfs` supplies no authoritative quota headroom. Manual pause and review
-holds survive resource release.
+Retries continue until the hold deadline; storage backoff is 30–60 seconds
+and survives restart. `JobControl.next_retry_at_unix` is the sole automatic
+retry clock, so legacy probe parameters cannot postpone a due retry. Quota
+holds can recover automatically through actual admission and write evidence;
+`statvfs` alone supplies no authoritative quota headroom. Manual pause and
+review holds survive automatic resource release.
+
+After clearing space, automatic storage probes resume eligible work with
+storage delays capped at 30–60 seconds; persisted long storage holds are
+shortened. The web **retry storage now** button calls
+`POST /api/v1/queue/actions/retry-storage`, including probes for idle post
+failures. It preserves both manual lane pauses and the evidence latch.
+Successful probes, rather than a free-space reading or a lane toggle, release
+eligible work; stop/custody and per-job manual-pause gates still apply.
 
 The web and mobile queues put held jobs under **Needs attention**, with the
 recorded reason. Failed jobs and torrents with missing files or storage holds
@@ -330,3 +425,39 @@ extraction verdict.
 Regression coverage lives in `missing_articles_finish_download_but_keep_partial_private`,
 `private_partial_repairs_with_par_and_fails_without_par`, and
 `sfv_restores_obfuscated_old_rar_without_volume_numbers`.
+
+## Failed publications, failed transforms and rediscovery
+
+- **A copy publication whose job then failed** (a `publish` failure after the
+  bytes were copied out) never becomes a delivery, so the source retirement it
+  deferred "until the delivery row exists" would never fire. Once the failure
+  is durable, the processing copy follows the job's own disposition: under
+  **Delete** (the published generation deleted) it retires by closed scope;
+  under **Park** it is parked in place with the failed TTL — recovery input
+  (PAR volumes, archives) is never wiped by a park. A blocked retirement is
+  parked with the TTL too. A job or row that keeps its failure never
+  qualifies.
+- **A failed job's unfinished transforms** (`extract`/`par_repair` journals
+  still `running`/`retry`, often with their workspace gone) end with the failed
+  attempt: the journal becomes `failed`, a missing workspace `source_gone`, and
+  the source leaves `transitioning`, so the disposition can move it. No file is
+  touched.
+- **Every incomplete disposal is bounded.** One that holds no operation ladder
+  of its own retries on a durable ladder (1 min doubling to 6 h); after 12
+  attempts (about a day) it settles and every live row of the job is parked
+  with the failed TTL in the same transaction. Retry now bypasses the wait
+  and does not spend the budget.
+- **An interrupted allocation** at a name only Runner gives (a transform
+  key, a `.job-<N>-` directory) stays Runner's: empty and orphaned it is
+  removed (never recursively); with bytes it is parked with the failed TTL;
+  for a live job it becomes its allocation.
+- **A scan never records a publication still landing** (an open intent's
+  target, an unresolved move's destination, a directory containing one,
+  `.runner-*` staging). Runner publications an older build recorded as
+  unknown/Keep/review are folded back: a duplicate of Runner's own row (same
+  directory object) is closed with a pointer to it; an unregistered
+  directory whose verifying `.runner-manifest.json` names one of this
+  installation's generations becomes `transferred`. Anything else stays
+  **Not Runner's**.
+- **An interrupted writer retirement whose directory is already gone** is
+  settled `source_gone` at startup instead of re-arming its hold every boot.

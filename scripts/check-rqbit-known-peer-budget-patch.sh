@@ -110,5 +110,8 @@ fi
     fi
     cargo test -p librqbit --lib "$exact_test" -- --exact --nocapture
   done
-  cargo check -p rqbit --all-targets
+  # Compile the contributed CLI integration without installing the unrelated
+  # stock web UI's provenance snapshot and npm build-time dependency graph.
+  cli_features="$(python3 "$repository_root/scripts/rqbit-cli-check-features.py" crates/rqbit/Cargo.toml)"
+  cargo check -p rqbit --all-targets --no-default-features --features "$cli_features"
 )

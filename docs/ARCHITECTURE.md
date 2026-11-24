@@ -235,11 +235,15 @@ Per server: a pool task + up to `max_connections` connection tasks (spawned on d
 
 Response bytes are decoded **incrementally in the connection task** (no extra hop): the `nzbd-yenc` streaming decoder handles yEnc header/trailer parse, escape sequences and CRLF/dot-unstuffing across arbitrary chunk boundaries, in-place, with running CRC32. Phase 1 ships a scalar decoder (correct, ~0.5–1 GB/s/core, plenty behind TLS); the `rapidyenc-sys` feature (vendored CC0 sources, `cc` build — the binding doesn't exist in the ecosystem yet, we write it) restores the >4.5 GB/s ceiling and serves as differential-fuzzing oracle for the scalar impl.
 
-Decoded chunks go to a **per-file writer task** (bounded channel = backpressure): DirectWrite default (sparse preallocate via `truncate`, positional writes at `yenc_begin − 1`; on Linux `pwrite` needs no seek serialization), optional RAM article cache with a global budget and 90%-flush policy, temp-file fallback, gap zero-fill + atomic rename at assembly, `fsync` policy configurable (default: dirs on rename, data relaxed). Per-segment CRCs recorded for par2 quick-verify.
+Decoded chunks go to a **per-file writer task** (bounded channel = backpressure, 32 decoded segments so connections keep reading while a sync runs): DirectWrite default (sparse preallocate via `truncate`, positional writes at `yenc_begin − 1`; on Linux `pwrite` needs no seek serialization), optional RAM article cache with a global budget and 90%-flush policy, temp-file fallback, gap zero-fill + atomic rename at assembly, data synced at durability checkpoints and directories on rename (below). Per-segment CRCs recorded for par2 quick-verify.
+
+**Durability checkpoints.** A segment is acknowledged to the owner (and becomes proof that survives a restart) only after a successful `fdatasync` of the file it was written to. Syncs are not per segment: the writer accumulates written segments into one checkpoint and syncs when 32 MiB are pending, when the file is fully covered (so the owner can finalize immediately), when the oldest pending write is one second old, or before any control command. The checkpoint is one `Written` fact naming every segment and the shared post-sync identity; the owner updates that file's proof, journal and totals once per checkpoint. Per-article syncs on the GlusterFS `/processing` mount cost ~16 ms each (one per ~700 KiB) and the proof holds every range of the file, so both a per-segment sync and a per-segment proof round trip cap throughput — the latter quadratically in the file's article count. A crash loses at most one checkpoint per file of unacknowledged writes; those segments are still Pending and are downloaded again.
 
 ### 8.5 Rate, quota, stats
 
 A global token-bucket rate limiter (replacing the C++ sleep-loop): connection tasks `acquire(n)` before each read; changing the limit is instant, fairness is inherent, and per-server buckets compose. Speed metering is **one measurement, attributed twice, normalized by time**: connection tasks record wire bytes per job *and* per server at the single read site; the owner tick drains those counters stamped with the measured wall time they cover and folds them into per-entity EMAs (α = 1/5) at bytes ÷ measured seconds — so a tick that fsync work delayed cannot inflate a rate (2.5 s of bytes counted as "one second" was field report 2026-07-26: a header claiming 24.8 MiB/s over a ~9.9 MiB/s wire). The header `download_rate_bps` is the **sum of the per-server EMAs**, so the tile, the provider chips and the row rates agree to integer rounding by construction rather than by hope; nzbget's 30×1 s window average is retired — two windows over the same counters is two numbers claiming to be the same thing. Per-server volume counters (sec/min/hour/day arrays) and daily/monthly quota with `QuotaStartDay` reproduce nzbget's accounting; quota-reached behaves as pause-except-force. The min-free-disk guard reads a **cached** lowest free-space value across every configured write root. An independent prober starts immediately without delaying daemon startup, runs each admitted statvfs on a detached OS thread with its own two-second response deadline, and starts the next cycle 10 s after the bounded prior cycle finishes; the owner loop itself never touches those volumes. A degraded process-wide permit pool can serialize responsive roots, so recovery evidence can take longer than two seconds without making any individual filesystem call unbounded. A statvfs against a write-saturated FUSE/network destination can block for seconds, and running it inline every 10th tick starved lease handout, sawtoothing throughput ~30% at >100 MiB/s (field report 2026-07-26). Timed-out roots retain conservative last-known data and are not rescheduled until their prior syscall returns. A process-wide 64-call permit ceiling stays held for each detached syscall across hot reload and path churn, so incomplete evidence cannot clear an existing hold and wedged mounts cannot grow blocking work without bound. Every section of the owner tick is now individually timed, and the `engine tick ran long` warning carries the full breakdown (`guards/volumes/publish/journal_sync/finalize/snapshot_save`) — nothing in the tick is unmeasured.
+
+**Storage throughput.** The dashboard's per-filesystem read/write rates come from `nzbd-engine::disk_io`, a sampler on its own OS thread (`nzbd-disk-io`) that wakes once a second, takes the filesystems from the capacity probe's latest reading (their `st_dev`), and reads only procfs: `/proc/self/mountinfo` to find each device's mounts, `/proc/diskstats` for block devices (by major:minor, or by the mount source's device name when `st_dev` is anonymous, as on btrfs), and `/proc/self/mountstats` for NFS (the server-byte columns). A filesystem with none of these (GlusterFS and other FUSE mounts, SMB, overlay) falls back to `nzbd_state::io_meter`, which counts Runner's own bytes per `st_dev` at four points: the article writer, external tools (par2, 7z, unrar) from their `/proc/<pid>/io` `rchar`/`wchar` sampled every 100 ms while they run and charged to the directory they run in (on kernel 7.0, as on the nucs, an exited child's counters are unreadable even before it is reaped, so the last interval of each run is lost; copies made with `splice()`/`copy_file_range()` never reach these counters, which par2, 7z and unrar do not use), the cross-filesystem publication copy and the PAR fingerprint pass, and torrent payload transfer (verified bytes written, uploaded bytes read) on the torrent root's filesystem as the capacity probe last saw it. Nothing it reads touches the storage, so a wedged mount cannot stall it; the owner reads its latest value from an `ArcSwap` when publishing and withholds rates older than five seconds as `stale`. Each row reports its `source` (`block`, `nfs`, `runner`, `stale`) so the UI can say whether a rate is device-wide or this machine's share. The rate is the counter delta over measured wall time; a counter that goes backwards (device replaced, remount) yields no rate for that sample. History is kept in the browser, the same three minutes as the rate sparkline.
 
 ### 8.6 Crash recovery
 
@@ -255,29 +259,45 @@ Readiness means the secure control listener responds; it does not require every
 download to be runnable. See [deployment probes](DEPLOY.md#container-health-and-discovery-startup)
 and the [reviewed recovery plan](STARTUP_VERIFICATION_PLAN.md).
 
-Recovery loads queue metadata before touching payload roots. Root-scoped workers
-then reconcile lifecycle state and establish allocation capabilities
-independently, so a blocked mount does not hold engine construction or another
-root's metadata progress. The owner captures startup artifact generations,
-revisions and existing journal fingerprints before admitting runtime work.
-Root replay is limited to that snapshot; delayed startup work cannot classify
-new runtime allocations or operations as crash leftovers. Typed article-range
-workspaces allocate below their fenced nested parent. A subsequent range uses
-a fresh allocation generation, preserving the previous workspace's bytes and
-custody; preparation remains inside the engine's bounded payload lane.
+Recovery loads queue metadata before touching payload roots, then classifies
+every recovered job from metadata alone (one SQLite pass for open relocation
+intents and transform custody). Only the file being written at a restart may
+need anything (Paul, 2026-11-11), so only a job with unproven ranges, an
+identity conflict or an open lifecycle intent (relocation, transform custody,
+a non-active allocation) keeps a verification ticket. Proven, paused and
+legacy jobs are released untouched: no file is opened and no payload byte is
+read at boot. Allocation revalidation happens at lease time, only for the jobs
+actually leased. The proof/identity check is lazy — at writer spawn (the
+writer compares the recorded object, mount + inode, with the file it opens)
+and at post-processing admission (from metadata) — and a mismatch holds only
+that job, retaining its `Done` ranges. A legacy `Done` range with no writer
+proof, on a job this installation's own snapshot carried, is stamped from a
+stat at first open without a read; PAR verification in post-processing is the
+backstop. Imported and adopted rows are still verified by reading.
+
+Lifecycle root reconciliation runs on its own background thread, off the
+bounded payload lane, so a slow FUSE/NFS root never queues lease-time work
+behind it. It touches only allocations that are not live and active, and it
+gates only the jobs with open intents. The owner captures startup artifact
+generations, revisions and existing journal fingerprints before admitting
+runtime work. Root replay is limited to that snapshot; delayed startup work
+cannot classify new runtime allocations or operations as crash leftovers.
+Phase timings (listener bound, owner ready, classification, first lease,
+per-root reconciliation) are in `/api/v1/status` as `startup`. Typed
+article-range workspaces allocate below their fenced nested parent. A
+subsequent range uses a fresh allocation generation, preserving the previous
+workspace's bytes and custody; preparation remains inside the engine's bounded
+payload lane.
 Verification uses bounded batches (up to 64 ranges,
 32 MiB, or 250 ms), retaining a cursor bound to the observed file identity
 between batches. The owner publishes checked-byte progress and can admit newly
 eligible higher-priority work before a yielded job resumes; manual pauses
 remain effective. Current writer proofs bind installation, allocation and file
-generation, descriptor identity, and exact immutable ranges. Legacy ranges
-require CRC reads and a successful descriptor sync before receiving such a
-proof. Protocol 1 permits metadata-only recovery on recognized local filesystem
-identities; unqualified network/FUSE mounts, including GlusterFS, continue
-background range verification because deployment-specific identity and flush
-guarantees have not been established. Missing data, mismatches, identity
-conflicts and unavailable storage remain distinct outcomes; unavailable I/O
-never erases Done evidence.
+generation, descriptor identity, and exact immutable ranges. A writer
+acknowledges a range only after its write, `sync_data` and `fstat` succeed,
+so a proven range is never re-read on any filesystem, GlusterFS FUSE and NFS
+included. Missing data, mismatches, identity conflicts and unavailable storage
+remain distinct outcomes; unavailable I/O never erases Done evidence.
 
 The queue owner captures immutable documents and sends persistence requests to
 one bounded, ordered filesystem lane, independent from bounded payload-I/O
@@ -313,7 +333,7 @@ generation while retaining prior custody. History and the canonical queue
 replacement complete before the owner releases operational fences. Replay
 requires the accepted control result and current authority checkpoint, and
 never adopts a replacement inode merely because a marker exists.
-See [startup verification status](STARTUP_VERIFICATION_STATUS.md).
+See [startup verification status](archive/STARTUP_VERIFICATION_STATUS.md).
 
 Shutdown stops intake, cancels workers, consumes their remaining results, and waits for actual worker termination before saving the final document and clearing the diagnostic marker. A failed drain or final save prevents a replacement backend from being started in the same process.
 
@@ -341,7 +361,7 @@ provide a trustworthy cluster-wide “last line.” A later completion has a new
 `completed_at`; the same key cannot be revived. Old binaries skip the tagged
 mutation as an unknown line, so a rolling cluster must finish upgrading before
 it relies on a new forget. See
-[DEFECT_HISTORY_DELETE.md](DEFECT_HISTORY_DELETE.md) for the defect and decision.
+[DEFECT_HISTORY_DELETE.md](archive/DEFECT_HISTORY_DELETE.md) for the defect and decision.
 
 **History loading and retention.** Native and compat listings read a local
 SQLite WAL snapshot; native page rows and total share one read transaction.
@@ -509,6 +529,7 @@ Native config is **TOML** (`nzbd.toml`): typed, serde-validated, sectioned (`[pa
 | 17 | **Web UI: one embedded no-build page with a hand-rolled keyed reconciler** (§12) | Svelte 5 + Vite SPA (a Node build chain in CI, permanently, for component structure we don't need at this size); vendoring preact+htm (13 KB of third-party JS in-tree to diff one `<table>` that ~150 lines diff fine). Trade-off accepted knowingly: no virtualized tables and no i18n scaffolding, revisit past ~500 rows or ~120 KB |
 | 18 | **Delete parks the regenerated NZB to history and is undoable; no `confirm()` anywhere** (§12) | Confirmation dialogs (interrupt before anything happens, then say nothing afterwards — the worst of both ends); bare instant delete (a misclick on a 60 GiB job costs a full re-download); two-step inline arming for everything (still two clicks, the thing being complained about). Arming is kept for the one action nothing can undo: deleting downloaded files |
 | 19 | **BitTorrent: one protocol-neutral queue/backend seam; immutable seed tree; readiness is durable state** ([proposal](BITTORRENT_PROPOSAL.md), [M0 report](BITTORRENT_M0_REPORT.md), [M1b report](BITTORRENT_M1B_REPORT.md)). **Amended:** the maintained twelve-patch rqbit v8.1.1 engine retains the accepted M0 boundaries, adds feature-gated loopback DHT test support, and announces as Runner with a tracker-compliant lifecycle. Single-node activation owns one session, durable admission/recovery, shared scheduling/bandwidth/quota/disk policy, native web/mobile surfaces, and a narrow qBittorrent Web API 2.8.1 projection. DHT-on may query a privacy-unknown magnet hash before list-only metadata validation; public metadata proceeds and private metadata is rejected before managed admission. Disabled mode opens no peer listener and refuses orphaned live torrent state. M6 cluster ownership still requires its own ADR; proxy use remains fail-closed for DHT and UDP trackers. | A second daemon (two queue authorities and lifecycle stores); pretending pieces/peers are NNTP articles/servers (dishonest state); pinning a release candidate or entering `libtorrent` FFI before an explicit engine decision. First release is deliberately v1 TCP/IPv4 and single-node. |
+| 20 | **Pipeline contract v2: one terminal fact per job, typed at the producer, environmental holds only, per-file journaled publication with no acknowledgement** ([ADR-20](adr/0020-pipeline-contract-v2.md), [contract](PIPELINE_CONTRACT.md)) | Patching the v1 seam (review holds, acknowledgement, four retry clocks and text-matched causes each fixed a symptom and left the next); a broker or new transport (SSE + REST + SQLite already carry it) |
 
 ## 16. Roadmap
 

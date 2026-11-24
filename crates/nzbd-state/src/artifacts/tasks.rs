@@ -7,7 +7,12 @@ impl Inventory {
         Ok(())
     }
     pub fn discovery_status(&self) -> Result<Option<Operation>> {
-        let raw: Option<String> = self.db.lock().unwrap().query_row("SELECT data FROM operations WHERE json_extract(data,'$.kind')='scan' ORDER BY json_extract(data,'$.created_at') DESC LIMIT 1", [], |r| r.get(0)).optional()?;
+        let raw: Option<String> = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(operation_queries::DISCOVERY_STATUS, [], |r| r.get(0))
+            .optional()?;
         raw.map(|r| serde_json::from_str(&r).map_err(Error::from))
             .transpose()
     }
@@ -150,6 +155,11 @@ impl Inventory {
                         if !entry.file_type()?.is_dir() {
                             continue;
                         }
+                        // A publication still landing is Runner's, not a
+                        // discovery; the next scan sees it committed.
+                        if self.publication_in_flight(&path)? {
+                            continue;
+                        }
                         count += 1;
                         let a = self.discover(&root, &path, active.contains(&path))?;
                         // A row that says "0 files · 0 B" for a folder nobody
@@ -167,6 +177,7 @@ impl Inventory {
                         }
                     }
                 }
+                self.fold_rediscovered_publications()?;
                 if !failures.is_empty() {
                     return Err(Error::Conflict(failures.join("; ")));
                 }
@@ -193,6 +204,11 @@ impl Inventory {
     /// task twice. Bounded so a task that re-queues itself cannot spin.
     pub fn run_tasks(&self) -> Result<()> {
         let _runner = self.tasks.lock().unwrap();
+        // A kicked runner can outlive shutdown: a closed inventory has
+        // released its store, so leave everything for the next boot.
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         self.retry_delivery_cleanup()?;
         for _ in 0..400 {
             // A kicked runner can outlive shutdown; leave the rest queued for

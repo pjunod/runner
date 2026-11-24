@@ -154,5 +154,9 @@ esac
   # The desktop member requires host WebKit/GTK development packages. This
   # verifier is intentionally headless, but still compiles every affected
   # library, CLI, example, and test workspace member.
-  cargo check --workspace --exclude rqbit-desktop
+  # Preserve library and CLI compile coverage; stock web UI is not part of
+  # these contribution proofs and must not run its npm installation hook.
+  cargo check --workspace --exclude rqbit-desktop --exclude rqbit
+  cli_features="$(python3 "$repository_root/scripts/rqbit-cli-check-features.py" crates/rqbit/Cargo.toml)"
+  cargo check -p rqbit --all-targets --no-default-features --features "$cli_features"
 )

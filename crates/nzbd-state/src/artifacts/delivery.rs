@@ -42,14 +42,16 @@ pub struct DeliveryRunnerStages {
     pub spans: Vec<nzbd_types::StageSpan>,
 }
 
-/// Immutable description of one published generation plus its independent
-/// consumer-acceptance receipt. The payload bytes never contain this record.
+/// Immutable description of one published generation: a row of the
+/// read-only reconciliation feed (contract §2.5). There is no acceptance.
+/// Since M3 the publication directory also carries the same manifest as
+/// `.runner-manifest.json`; this record is still written for one release so
+/// a rolled-back curator finds what it expects (contract §6).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Delivery {
     pub protocol_version: u8,
     pub sequence: i64,
-    pub status: String,
     pub delivery_id: String,
     pub publication_generation: String,
     pub artifact_id: String,
@@ -83,9 +85,40 @@ pub struct Delivery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
     pub ready_at: i64,
-    pub accepted_at: Option<i64>,
-    pub consumer_receipt_id: Option<String>,
+    /// The publication's `.runner-manifest.json` as written (contract §2.5:
+    /// the feed carries the manifest body). Absent for publications made
+    /// before M3, whose manifest is `files` + `manifestDigest` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<super::RunnerManifest>,
     pub source_cleanup: SourceCleanup,
+}
+
+/// The `deliveries.data` JSON: the immutable row.
+pub(super) fn delivery_row_json(delivery: &Delivery) -> serde_json::Result<String> {
+    serde_json::to_string(delivery)
+}
+
+impl Delivery {
+    /// Contract §2.5: `completed` for the success publication, `salvage` for
+    /// the verified partial output of a failed job (derived from the
+    /// immutable terminal outcome the row was written with).
+    pub fn kind(&self) -> &'static str {
+        if self.terminal_outcome.starts_with("SUCCESS") {
+            "completed"
+        } else {
+            "salvage"
+        }
+    }
+
+    /// The feed shape: the immutable row with its `kind`; `files` and
+    /// `manifestDigest` are the manifest body.
+    pub fn feed_value(&self) -> serde_json::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("kind".into(), self.kind().into());
+        }
+        Ok(value)
+    }
 }
 
 fn default_terminal_outcome() -> String {
@@ -123,9 +156,32 @@ pub struct SourceCleanupAttempt {
     pub error: Option<String>,
 }
 
-fn digest_files(root: &File, entries: &[FileEntry]) -> Result<Vec<DeliveryFile>> {
+/// The delivery manifest of a publication. A file whose digest the
+/// committed move journal holds, and which still bears the identity it had
+/// when it landed, is not read again (contract §2.5: one hash pass). The
+/// publication's own `.runner-manifest.json` is the commit marker, not a
+/// payload file.
+fn digest_files(
+    root: &File,
+    entries: &[FileEntry],
+    journaled: &std::collections::HashMap<String, (Identity, String)>,
+    scope: &str,
+) -> Result<Vec<DeliveryFile>> {
     let mut files = Vec::new();
-    for entry in entries.iter().filter(|entry| !entry.identity.directory) {
+    for entry in entries
+        .iter()
+        .filter(|entry| !entry.identity.directory && entry.path != super::RUNNER_MANIFEST_NAME)
+    {
+        if let Some((landed, sha256)) = journaled.get(&entry.path) {
+            if landed.same_publication(&entry.identity) {
+                files.push(DeliveryFile {
+                    path: entry.path.clone(),
+                    size_bytes: entry.identity.bytes,
+                    sha256: sha256.clone(),
+                });
+                continue;
+            }
+        }
         let mut file = fs::open_relative(root, &entry.path)?;
         if fs::identity_for_file(&file)? != entry.identity {
             return Err(Error::Conflict(format!(
@@ -137,6 +193,8 @@ fn digest_files(root: &File, entries: &[FileEntry]) -> Result<Vec<DeliveryFile>>
         let mut buffer = [0u8; 64 * 1024];
         loop {
             let read = file.read(&mut buffer)?;
+            crate::fileops::payload_read(read);
+            fs::count_op(scope, "hash_bytes", read as u64);
             if read == 0 {
                 break;
             }
@@ -159,16 +217,31 @@ fn digest_files(root: &File, entries: &[FileEntry]) -> Result<Vec<DeliveryFile>>
 }
 
 fn manifest_digest(files: &[DeliveryFile]) -> String {
+    manifest_digest_of(
+        files
+            .iter()
+            .map(|file| (file.path.as_str(), file.size_bytes, file.sha256.as_str())),
+    )
+}
+
+/// The deployed `runner-manifest-v1` digest (contract §2.5; curator
+/// `ports.ManifestDigest`), over `(path, bytes, sha256)` already in bytewise
+/// path order: SHA-256 of `runner-manifest-v1\n` then, per file,
+/// `<len(path)>:<path>\n<bytes>\n<sha256>\n`; bare lowercase hex. The
+/// publications on disk depend on these bytes never changing.
+pub(super) fn manifest_digest_of<'a>(
+    files: impl IntoIterator<Item = (&'a str, u64, &'a str)>,
+) -> String {
     let mut canonical = b"runner-manifest-v1\n".to_vec();
-    for file in files {
-        let path = file.path.as_bytes();
+    for (path, bytes, sha256) in files {
+        let path = path.as_bytes();
         canonical.extend_from_slice(path.len().to_string().as_bytes());
         canonical.push(b':');
         canonical.extend_from_slice(path);
         canonical.push(b'\n');
-        canonical.extend_from_slice(file.size_bytes.to_string().as_bytes());
+        canonical.extend_from_slice(bytes.to_string().as_bytes());
         canonical.push(b'\n');
-        canonical.extend_from_slice(file.sha256.as_bytes());
+        canonical.extend_from_slice(sha256.as_bytes());
         canonical.push(b'\n');
     }
     format!("{:x}", Sha256::digest(canonical))
@@ -176,8 +249,6 @@ fn manifest_digest(files: &[DeliveryFile]) -> String {
 
 type DeliveryRow = (
     String,
-    Option<i64>,
-    Option<String>,
     String,
     Option<String>,
     u32,
@@ -189,14 +260,13 @@ type DeliveryRow = (
 );
 
 fn read_delivery(db: &Connection, id: &str) -> Result<Delivery> {
-    let (data, accepted_at, receipt, cleanup_status, cleanup_error, cleanup_attempts, next_retry, blocked_since, cleanup_started, cleanup_last_attempt, cleanup_completed): DeliveryRow = db
+    let (data, cleanup_status, cleanup_error, cleanup_attempts, next_retry, blocked_since, cleanup_started, cleanup_last_attempt, cleanup_completed): DeliveryRow = db
         .query_row(
-            "SELECT data,accepted_at,consumer_receipt_id,cleanup_status,cleanup_error,cleanup_attempts,cleanup_next_retry_at,cleanup_blocked_since,cleanup_started_at,cleanup_last_attempt_at,cleanup_completed_at FROM deliveries WHERE id=?1",
+            "SELECT data,cleanup_status,cleanup_error,cleanup_attempts,cleanup_next_retry_at,cleanup_blocked_since,cleanup_started_at,cleanup_last_attempt_at,cleanup_completed_at FROM deliveries WHERE id=?1",
             [id],
             |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
-                row.get(10)?,
+                row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
             )),
         )
         .optional()?
@@ -219,13 +289,6 @@ fn read_delivery(db: &Connection, id: &str) -> Result<Delivery> {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    delivery.accepted_at = accepted_at;
-    delivery.consumer_receipt_id = receipt;
-    delivery.status = if accepted_at.is_some() {
-        "accepted".into()
-    } else {
-        "ready".into()
-    };
     delivery.source_cleanup = SourceCleanup {
         status: cleanup_status,
         error: cleanup_error,
@@ -235,7 +298,8 @@ fn read_delivery(db: &Connection, id: &str) -> Result<Delivery> {
         warning: blocked_since
             .filter(|at| now().saturating_sub(*at) >= 1800)
             .map(|_| {
-                "source cleanup has been blocked for at least 30 minutes; retries continue".into()
+                "source cleanup has been blocked for at least 30 minutes; review the recorded cause"
+                    .into()
             }),
         started_at: cleanup_started,
         last_attempt_at: cleanup_last_attempt,
@@ -243,6 +307,41 @@ fn read_delivery(db: &Connection, id: &str) -> Result<Delivery> {
         attempt_history,
     };
     Ok(delivery)
+}
+
+/// A publication whose delivery manifest has been read and digested but not
+/// yet committed (see [`Inventory::prepare_delivery`]).
+#[derive(Debug)]
+pub struct PreparedDelivery {
+    job: u32,
+    artifact: Artifact,
+    observed: Vec<super::FileEntry>,
+    pub publication_path: String,
+    existing_delivery: Option<Delivery>,
+    file_outcomes: Vec<DeliveryFileOutcome>,
+    source_artifact_id: String,
+    source_generation: String,
+    pub files: Vec<DeliveryFile>,
+    pub manifest_digest: String,
+    /// The publication's root is on another filesystem than its source's.
+    pub cross_volume: bool,
+    /// The publication's `.runner-manifest.json`, when it has one.
+    pub manifest: Option<super::RunnerManifest>,
+    /// Built from the committed move journal, not the filesystem (contract
+    /// §2.5, consumer owns bytes after handoff): the commit re-reads nothing.
+    journaled: bool,
+}
+
+impl PreparedDelivery {
+    pub fn generation(&self) -> &str {
+        &self.artifact.generation
+    }
+    pub fn source_artifact_id(&self) -> &str {
+        &self.source_artifact_id
+    }
+    pub fn source_generation(&self) -> &str {
+        &self.source_generation
+    }
 }
 
 impl Inventory {
@@ -348,6 +447,21 @@ impl Inventory {
         )
     }
 
+    /// Whether a delivery's publication sits on another filesystem than
+    /// its source did (`publication.cross_volume`, contract §2.1). Reported
+    /// only when both are observed; a retired source reads as not.
+    pub fn delivery_cross_volume(&self, delivery: &Delivery) -> bool {
+        let publication = std::fs::metadata(&delivery.publication_path)
+            .ok()
+            .and_then(|meta| crate::io_meter::device_of_metadata(&meta));
+        let source = self
+            .get(&delivery.source_artifact_id)
+            .ok()
+            .and_then(|source| std::fs::metadata(&source.root).ok())
+            .and_then(|meta| crate::io_meter::device_of_metadata(&meta));
+        matches!((publication, source), (Some(a), Some(b)) if a != b)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_delivery_with_lifecycle_snapshot(
         &self,
@@ -361,23 +475,29 @@ impl Inventory {
         runner_stages: Option<DeliveryRunnerStages>,
         lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
     ) -> Result<Delivery> {
-        if lifecycle_timing
-            .as_ref()
-            .is_some_and(|timing| !timing.valid())
-        {
-            return Err(Error::Conflict(
-                "invalid measured lifecycle snapshot".into(),
-            ));
-        }
-        if runner_stages.as_ref().is_some_and(|snapshot| {
-            snapshot.spans.len() > 128
-                || snapshot.node_id.is_empty()
-                || snapshot.node_id.len() > 256
-                || snapshot.clock_domain.is_empty()
-                || snapshot.clock_domain.len() > 256
-        }) {
-            return Err(Error::Conflict("invalid Runner stage snapshot".into()));
-        }
+        let prepared = self.prepare_delivery(job, admitted_for_delivery)?;
+        self.commit_prepared_delivery(
+            prepared,
+            request_token,
+            terminal_outcome,
+            failure_stage,
+            failure_cause,
+            keep_source_on_failure,
+            runner_stages,
+            lifecycle_timing,
+        )
+    }
+
+    /// Contract §2.1: everything a `completed` terminal's `publication`
+    /// needs — path, generation, the digested manifest, cross-volume — read
+    /// and hashed without writing anything, so the terminal is recorded
+    /// before the delivery row exists or the source is retired. The commit
+    /// re-checks the publication is unchanged and reuses the digests.
+    pub fn prepare_delivery(
+        &self,
+        job: u32,
+        admitted_for_delivery: bool,
+    ) -> Result<PreparedDelivery> {
         if !admitted_for_delivery {
             return Err(Error::Conflict(
                 "pre-existing job is exempt from automatic delivery lifecycle".into(),
@@ -405,6 +525,21 @@ impl Inventory {
                     "delivery requires an active, owned, unheld publication".into(),
                 ));
             }
+            let publication_path = artifact.path.to_string_lossy().into_owned();
+            // Contract §2.5: a per-file publication's committed journal is
+            // the authority for what was published. Once it is visible the
+            // consumer may already have moved files out of it, so it is
+            // never read again (job 2709: curator imported before the row).
+            if let Some(intent) = self.committed_publication_intent(&artifact)? {
+                drop(_guard);
+                return self.prepare_journaled_delivery(
+                    job,
+                    artifact,
+                    intent,
+                    publication_path,
+                    existing,
+                );
+            }
             let root = self.verify(&artifact)?;
             let observed = fs::manifest(&root, 100_000)?;
             if observed != artifact.files {
@@ -412,22 +547,186 @@ impl Inventory {
                     "published payload changed before delivery receipt".into(),
                 ));
             }
-            let publication_path = artifact.path.to_string_lossy().into_owned();
             (artifact, root, observed, publication_path, existing)
         };
         let file_outcomes = self.delivery_file_outcomes(&artifact.id, &artifact.generation)?;
         let (source_artifact_id, source_generation) =
             self.delivery_source_ref(&artifact.id, &artifact.generation, &publication_path)?;
-        // Hashing may read a large media payload. Do it without holding the
-        // inventory mutation lease; the caller runs this method on a bounded
-        // blocking worker.
-        let files = digest_files(&root, &observed)?;
+        // Contract §2.5: a per-file publication's digests come from its
+        // committed move journal; only a file without one (an in-place or
+        // pre-M3 publication) is read here, off the mutation lease, on the
+        // caller's bounded blocking worker.
+        let journaled = self.committed_intent_digests(&artifact.id, &artifact.generation)?;
+        let files = digest_files(&root, &observed, &journaled, &self.installation)?;
         if files.is_empty() {
             return Err(Error::Conflict(
                 "cannot publish a delivery with an empty file manifest".into(),
             ));
         }
         let manifest_digest = manifest_digest(&files);
+        let manifest = super::intents::read_manifest(&root)?;
+        if let Some(manifest) = &manifest {
+            let listed = manifest
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file.bytes, file.sha256.as_str()))
+                .collect::<Vec<_>>();
+            let delivered = files
+                .iter()
+                .map(|file| (file.path.as_str(), file.size_bytes, file.sha256.as_str()))
+                .collect::<Vec<_>>();
+            if manifest.digest != manifest_digest
+                || listed != delivered
+                || manifest.generation != artifact.generation
+            {
+                return Err(Error::Conflict(
+                    "publication manifest disagrees with its delivery record".into(),
+                ));
+            }
+        }
+        let cross_volume = if let Some(manifest) = &manifest {
+            manifest.cross_volume
+        } else {
+            let publication_dev = root
+                .metadata()
+                .ok()
+                .and_then(|meta| crate::io_meter::device_of_metadata(&meta));
+            let source_dev = self
+                .get(&source_artifact_id)
+                .ok()
+                .and_then(|source| std::fs::metadata(&source.root).ok())
+                .and_then(|meta| crate::io_meter::device_of_metadata(&meta));
+            matches!((publication_dev, source_dev), (Some(a), Some(b)) if a != b)
+        };
+        Ok(PreparedDelivery {
+            job,
+            artifact,
+            observed,
+            publication_path,
+            existing_delivery,
+            file_outcomes,
+            source_artifact_id,
+            source_generation,
+            files,
+            manifest_digest,
+            cross_volume,
+            manifest,
+            journaled: false,
+        })
+    }
+
+    /// The committed move journal of the publication `artifact` names, when
+    /// it covers it (same artifact, generation and target directory, every
+    /// file digested).
+    pub(super) fn committed_publication_intent(
+        &self,
+        artifact: &Artifact,
+    ) -> Result<Option<super::RelocationIntent>> {
+        Ok(self
+            .relocation_intent(&artifact.generation)?
+            .filter(|intent| {
+                intent.artifact == artifact.id
+                    && intent.state == super::IntentState::Committed
+                    && intent.target_dir == artifact.path
+                    && !intent.files.is_empty()
+                    && intent.files.iter().all(|file| file.sha256.is_some())
+            }))
+    }
+
+    /// Everything the delivery row needs, from the committed journal alone:
+    /// the files and digests the move recorded, the manifest it wrote, the
+    /// snapshot taken at commit. No filesystem access.
+    fn prepare_journaled_delivery(
+        &self,
+        job: u32,
+        artifact: Artifact,
+        intent: super::RelocationIntent,
+        publication_path: String,
+        existing_delivery: Option<Delivery>,
+    ) -> Result<PreparedDelivery> {
+        let file_outcomes = self.delivery_file_outcomes(&artifact.id, &artifact.generation)?;
+        let (source_artifact_id, source_generation) =
+            self.delivery_source_ref(&artifact.id, &artifact.generation, &publication_path)?;
+        let manifest = self.intent_manifest(&intent)?;
+        let mut files = manifest
+            .files
+            .iter()
+            .map(|file| DeliveryFile {
+                path: file.path.clone(),
+                size_bytes: file.bytes,
+                sha256: file.sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let manifest_digest = manifest_digest(&files);
+        if manifest_digest != manifest.digest || manifest.generation != artifact.generation {
+            return Err(Error::Conflict(
+                "publication journal disagrees with its manifest".into(),
+            ));
+        }
+        Ok(PreparedDelivery {
+            job,
+            observed: artifact.files.clone(),
+            artifact,
+            publication_path,
+            existing_delivery,
+            file_outcomes,
+            source_artifact_id,
+            source_generation,
+            files,
+            manifest_digest,
+            cross_volume: intent.cross_volume,
+            manifest: Some(manifest),
+            journaled: true,
+        })
+    }
+
+    /// The delivery row (and the publication's custody transfer) for a
+    /// prepared publication. Refuses if the publication changed since.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_prepared_delivery(
+        &self,
+        prepared: PreparedDelivery,
+        request_token: Option<&str>,
+        terminal_outcome: &str,
+        failure_stage: Option<&str>,
+        failure_cause: Option<&str>,
+        keep_source_on_failure: bool,
+        runner_stages: Option<DeliveryRunnerStages>,
+        lifecycle_timing: Option<nzbd_types::LifecycleTiming>,
+    ) -> Result<Delivery> {
+        if lifecycle_timing
+            .as_ref()
+            .is_some_and(|timing| !timing.valid())
+        {
+            return Err(Error::Conflict(
+                "invalid measured lifecycle snapshot".into(),
+            ));
+        }
+        if runner_stages.as_ref().is_some_and(|snapshot| {
+            snapshot.spans.len() > 128
+                || snapshot.node_id.is_empty()
+                || snapshot.node_id.len() > 256
+                || snapshot.clock_domain.is_empty()
+                || snapshot.clock_domain.len() > 256
+        }) {
+            return Err(Error::Conflict("invalid Runner stage snapshot".into()));
+        }
+        let PreparedDelivery {
+            job,
+            artifact,
+            observed,
+            publication_path,
+            existing_delivery,
+            file_outcomes,
+            source_artifact_id,
+            source_generation,
+            files,
+            manifest_digest,
+            cross_volume: _,
+            manifest,
+            journaled,
+        } = prepared;
         let id = format!("{}:{}", artifact.id, artifact.generation);
         let _guard = self.mutation_guard()?;
         let mut current = self.get(&artifact.id)?;
@@ -444,11 +743,13 @@ impl Inventory {
                 "publication changed while preparing delivery manifest".into(),
             ));
         }
-        let current_root = self.verify(&current)?;
-        if fs::manifest(&current_root, 100_000)? != observed {
-            return Err(Error::Conflict(
-                "published payload changed while preparing delivery manifest".into(),
-            ));
+        if !journaled {
+            let current_root = self.verify(&current)?;
+            if fs::manifest(&current_root, 100_000)? != observed {
+                return Err(Error::Conflict(
+                    "published payload changed while preparing delivery manifest".into(),
+                ));
+            }
         }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;
@@ -481,7 +782,6 @@ impl Inventory {
         let delivery = Delivery {
             protocol_version: 1,
             sequence,
-            status: "ready".into(),
             delivery_id: id,
             publication_generation: artifact.generation,
             artifact_id: artifact.id,
@@ -501,8 +801,7 @@ impl Inventory {
             runner_stages,
             lifecycle_timing,
             ready_at: now(),
-            accepted_at: None,
-            consumer_receipt_id: None,
+            manifest,
             source_cleanup: SourceCleanup {
                 status: "pending".into(),
                 error: None,
@@ -519,6 +818,9 @@ impl Inventory {
         current.owned = false;
         current.state = "transferred".into();
         current.hold = None;
+        // The handoff succeeded: an earlier attempt's failure (a full
+        // volume, a lost lease) is history, not this row's state.
+        current.error = None;
         current.deadline = None;
         current.revision += 1;
         current.updated_at = now();
@@ -531,26 +833,36 @@ impl Inventory {
                 delivery.delivery_id,
                 delivery.artifact_id,
                 delivery.publication_generation,
-                serde_json::to_string(&delivery)?
+                delivery_row_json(&delivery)?
             ],
         )?;
         tx.commit()?;
+        drop(db);
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            // IMPL §7.6: a crash right after the delivery row, before the
+            // source retirement that follows it.
+            let scope = self
+                .get(&delivery.source_artifact_id)
+                .ok()
+                .and_then(|source| source.identity);
+            if super::intents::crash_point("after_delivery", scope.as_ref()).is_err() {
+                let _ = super::intents::take_injected_crash();
+                return Err(Error::Io(std::io::Error::other(
+                    "injected crash after the delivery row",
+                )));
+            }
+        }
         Ok(delivery)
     }
 
-    /// Scan a bounded sequence window. The cursor advances over accepted rows
-    /// too, while every unaccepted row remains independently discoverable to
-    /// callers that have not advanced past it.
+    /// Scan a bounded sequence window of the reconciliation feed. Every row
+    /// is returned: there is no acceptance (contract §2.5).
     pub fn deliveries_after(&self, after: i64, limit: u32) -> Result<(Vec<Delivery>, i64)> {
-        self.deliveries_page(after, limit, false)
+        self.deliveries_page(after, limit)
     }
 
-    pub fn deliveries_page(
-        &self,
-        after: i64,
-        limit: u32,
-        include_accepted: bool,
-    ) -> Result<(Vec<Delivery>, i64)> {
+    pub fn deliveries_page(&self, after: i64, limit: u32) -> Result<(Vec<Delivery>, i64)> {
         if after < 0 || !(1..=100).contains(&limit) {
             return Err(Error::Conflict("invalid delivery cursor or limit".into()));
         }
@@ -564,20 +876,19 @@ impl Inventory {
         for id in ids {
             let delivery = read_delivery(&db, &id)?;
             cursor = delivery.sequence;
-            if include_accepted || delivery.accepted_at.is_none() {
-                deliveries.push(delivery);
-            }
+            deliveries.push(delivery);
         }
         Ok((deliveries, cursor))
     }
 
-    /// Bounded discovery advances past unsupported rows using only the
-    /// trusted SQLite identity/cursor. Detail remains available for review.
+    /// The read-only reconciliation feed (contract §2.5): every publication
+    /// row in sequence order, with its `kind` and manifest body. Bounded
+    /// discovery advances past unsupported rows using only the trusted
+    /// SQLite identity/cursor; detail remains available for review.
     pub fn deliveries_discovery_page(
         &self,
         after: i64,
         limit: u32,
-        include_accepted: bool,
     ) -> Result<(Vec<serde_json::Value>, i64)> {
         if after < 0 || !(1..=100).contains(&limit) {
             return Err(Error::Conflict("invalid delivery cursor or limit".into()));
@@ -586,13 +897,12 @@ impl Inventory {
         const PAGE_LIMIT: usize = 16 * 1024 * 1024;
         let db = self.db.lock().unwrap();
         let identities = {
-            let mut statement = db.prepare("SELECT id,sequence,length(CAST(data AS BLOB)),accepted_at FROM deliveries WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
+            let mut statement = db.prepare("SELECT id,sequence,length(CAST(data AS BLOB)) FROM deliveries WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
             let rows = statement.query_map(params![after, limit], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
                 ))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -600,18 +910,14 @@ impl Inventory {
         let mut page = Vec::new();
         let mut cursor = after;
         let mut bytes = 1024usize;
-        for (id, sequence, size, accepted_at) in identities {
-            if !include_accepted && accepted_at.is_some() {
-                cursor = sequence;
-                continue;
-            }
+        for (id, sequence, size) in identities {
             let stub = |reason: &str| serde_json::json!({"protocolVersion":1,"sequence":sequence,"deliveryId":id,"discoveryError":reason});
             let row = if size > ROW_LIMIT as i64 {
                 stub("publication manifest exceeds supported discovery size; source retained for review")
             } else {
                 match read_delivery(&db, &id) {
                     Ok(delivery) if delivery.delivery_id == id && delivery.sequence == sequence => {
-                        serde_json::to_value(delivery)?
+                        delivery.feed_value()?
                     }
                     _ => stub("publication manifest is invalid; source retained for review"),
                 }
@@ -630,52 +936,6 @@ impl Inventory {
             cursor = sequence;
         }
         Ok((page, cursor))
-    }
-
-    /// Persist Curator's durable mapping receipt. Repeating the exact tuple is
-    /// safe; a conflicting receipt cannot take over an accepted generation.
-    pub fn accept_delivery(
-        &self,
-        delivery_id: &str,
-        publication_generation: &str,
-        manifest_digest: &str,
-        consumer_receipt_id: &str,
-    ) -> Result<Delivery> {
-        if delivery_id.is_empty()
-            || delivery_id.len() > 256
-            || consumer_receipt_id.is_empty()
-            || consumer_receipt_id.len() > 256
-        {
-            return Err(Error::Conflict("invalid delivery receipt identity".into()));
-        }
-        let _guard = self.mutation_guard()?;
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        let mut delivery = read_delivery(&tx, delivery_id)?;
-        if delivery.publication_generation != publication_generation
-            || delivery.manifest_digest != manifest_digest
-        {
-            return Err(Error::Conflict(
-                "delivery generation or manifest digest changed".into(),
-            ));
-        }
-        if let Some(receipt) = &delivery.consumer_receipt_id {
-            if receipt != consumer_receipt_id {
-                return Err(Error::Conflict(
-                    "delivery already has a different consumer receipt".into(),
-                ));
-            }
-        } else {
-            delivery.accepted_at = Some(now());
-            delivery.consumer_receipt_id = Some(consumer_receipt_id.into());
-            tx.execute(
-                "UPDATE deliveries SET accepted_at=?2,consumer_receipt_id=?3 WHERE id=?1 AND accepted_at IS NULL",
-                params![delivery_id, delivery.accepted_at, delivery.consumer_receipt_id],
-            )?;
-        }
-        tx.commit()?;
-        drop(db);
-        self.delivery(delivery_id)
     }
 
     pub fn delivery(&self, delivery_id: &str) -> Result<Delivery> {

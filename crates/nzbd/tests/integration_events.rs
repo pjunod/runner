@@ -1,5 +1,5 @@
 //! Acceptance tests for the monarr integration surface
-//! (docs/INTEGRATION_PLAN.md N1–N6), driven against a real daemon over
+//! (docs/archive/INTEGRATION_PLAN.md N1–N6), driven against a real daemon over
 //! real sockets.
 //!
 //! These assert the contract a consumer is entitled to rely on, not the
@@ -96,23 +96,59 @@ fn get(addr: &str, path: &str) -> (u16, serde_json::Value) {
     (code, v)
 }
 
-fn wait_healthy(addr: &str, deadline: Duration) {
+fn backend_ready(addr: &str, budget: Duration) -> Option<bool> {
+    if budget.is_zero() {
+        return None;
+    }
+    let start = Instant::now();
+    let mut sock = TcpStream::connect_timeout(&addr.parse().ok()?, budget).ok()?;
+    let remaining = budget.checked_sub(start.elapsed())?;
+    sock.set_write_timeout(Some(remaining)).ok()?;
+    sock.write_all(
+        format!("GET /api/v1/service HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .ok()?;
+    let mut response = Vec::new();
+    loop {
+        let remaining = budget.checked_sub(start.elapsed())?;
+        sock.set_read_timeout(Some(remaining)).ok()?;
+        let mut chunk = [0; 4096];
+        let count = sock.read(&mut chunk).ok()?;
+        if count == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..count]);
+    }
+    let response = String::from_utf8(response).ok()?;
+    if response.split_whitespace().nth(1)? != "200" {
+        return Some(false);
+    }
+    let (_, payload) = response.split_once("\r\n\r\n")?;
+    let first = payload.find('{')?;
+    let last = payload.rfind('}')?;
+    let value: serde_json::Value = serde_json::from_str(&payload[first..=last]).ok()?;
+    Some(value["components"]["backend"] == "ready")
+}
+
+fn wait_healthy(daemon: &mut Daemon, deadline: Duration) {
     let start = Instant::now();
     loop {
+        let exited = daemon._child.0.try_wait().expect("poll daemon");
+        assert!(
+            exited.is_none(),
+            "daemon exited before readiness: {exited:?}\n{}",
+            daemon.log()
+        );
         assert!(
             start.elapsed() < deadline,
-            "daemon did not become healthy at {addr}"
+            "daemon did not become ready at {}\n{}",
+            daemon.addr,
+            daemon.log()
         );
-        if let Ok(mut s) = TcpStream::connect(addr) {
-            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            let _ = s.write_all(
-                format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
-            );
-            let mut buf = String::new();
-            if s.read_to_string(&mut buf).is_ok() && buf.contains("ok") {
-                return;
-            }
+        let budget = Duration::from_secs(2).min(deadline.saturating_sub(start.elapsed()));
+        if backend_ready(&daemon.addr, budget) == Some(true) {
+            return;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -278,20 +314,21 @@ bind = "{addr}"
     let log_path = tmp.path().join("daemon.log");
     let daemon_log = std::fs::File::create(&log_path).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_nzbd"))
-        .args(["run", "--config"])
+        .args(["run", "--monitor-bind", "127.0.0.1:0", "--config"])
         .arg(&cfg_path)
         .stdout(daemon_log.try_clone().unwrap())
         .stderr(daemon_log)
         .spawn()
         .expect("spawn nzbd");
     let child = KillOnDrop(child);
-    wait_healthy(&addr, Duration::from_secs(20));
-    Daemon {
+    let mut daemon = Daemon {
         addr,
         tmp,
         log_path,
         _child: child,
-    }
+    };
+    wait_healthy(&mut daemon, Duration::from_secs(20));
+    daemon
 }
 
 // ---------------------------------------------------------------------------
@@ -387,16 +424,19 @@ fn a_finished_download_announces_its_stages_its_final_dir_and_its_history_row() 
 
     // ---- the completion payload (N1 + N4 + N6) ------------------------
     let done = frames.last().unwrap().json();
-    assert_eq!(done["pp_status"], "SUCCESS", "payload: {done}");
+    assert_eq!(done["outcome"], "completed", "payload: {done}");
     assert_eq!(done["category"], "tv");
-    let final_dir = done["final_dir"].as_str().expect("final_dir").to_string();
+    let final_dir = done["publication"]["path"]
+        .as_str()
+        .expect("publication.path")
+        .to_string();
     assert!(
         final_dir.starts_with(cat_dir.to_str().unwrap()),
         "the category dest_dir must be honored, not merely advertised: {final_dir}"
     );
     assert!(
         std::path::Path::new(&final_dir).is_dir(),
-        "the reported final_dir must be where the files ACTUALLY are: {final_dir}"
+        "the reported publication path must be where the files ACTUALLY are: {final_dir}"
     );
     assert!(
         !d.tmp.path().join("dest/Show.S01E01").exists(),

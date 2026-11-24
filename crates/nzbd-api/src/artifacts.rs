@@ -7,13 +7,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use nzbd_state::artifacts::{Error, Inventory, ListFilter, ListQuery, ListSort, Receipt, Settings};
+use nzbd_state::artifacts::{
+    Error, Inventory, JobDispositionRequest, JobDispositionState, ListFilter, ListQuery, ListSort,
+    Receipt, Settings,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
 
 pub fn router() -> Router<ApiState> {
     Router::new()
+        .route("/api/v1/jobs/{id}/disposition", post(job_disposition))
         .route("/api/v1/deliveries", get(deliveries))
         .route("/api/v1/url-resolution-faults", get(url_resolution_faults))
         .route("/api/v1/deliveries/{id}", get(delivery))
@@ -44,6 +48,10 @@ pub fn router() -> Router<ApiState> {
             "/api/v1/artifact-operations/{id}/abandon-relocation",
             post(abandon_relocation),
         )
+        .route(
+            "/api/v1/artifacts/{id}/cleanup-review",
+            get(cleanup_review).post(accept_cleanup_review),
+        )
         .route("/api/v1/artifacts/{id}/inspect", post(inspect))
         .route("/api/v1/artifacts/{id}/adopt", post(adopt))
         .route(
@@ -67,14 +75,68 @@ pub fn router() -> Router<ApiState> {
         .route("/api/v1/recoveries/{id}/cancel-ack", post(cancel_ack))
 }
 
+async fn job_disposition(
+    State(st): State<ApiState>,
+    Path(id): Path<u32>,
+    Json(request): Json<JobDispositionRequest>,
+) -> Response {
+    if id == 0 || !request.valid() {
+        return error(StatusCode::BAD_REQUEST, "invalid job disposition binding");
+    }
+    let job = nzbd_types::JobId(id);
+    let native_joined = match &st.torrent {
+        Some(torrent) => {
+            torrent
+                .disposition_backend_stopped(job, &request.transfer)
+                .await
+        }
+        None => false,
+    };
+    let receipt = match st
+        .engine
+        .advance_job_disposition(job, request, native_joined)
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(nzbd_engine::EngineError::RequestConflict(reason)) => {
+            return error(StatusCode::CONFLICT, &reason);
+        }
+        Err(error_) => return error(StatusCode::SERVICE_UNAVAILABLE, &error_.to_string()),
+    };
+    let code = if receipt.state == JobDispositionState::Pending {
+        if receipt.operation_id.is_some() {
+            kick_after(st.engine.artifacts(), 0);
+        }
+        if receipt.admitted {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+    } else {
+        StatusCode::OK
+    };
+    (
+        code,
+        Json(json!({
+            "requestId": receipt.request.request_id,
+            "jobId": receipt.job_id.to_string(),
+            "transfer": receipt.request.transfer,
+            "runnerInstanceId": receipt.request.runner_instance_id,
+            "generation": receipt.request.generation,
+            "state": receipt.state,
+            "reason": receipt.reason,
+            "operationId": receipt.operation_id,
+        })),
+    )
+        .into_response()
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeliveryPage {
     #[serde(default)]
     after: i64,
     limit: Option<u32>,
-    #[serde(default)]
-    include_accepted: bool,
 }
 
 #[cfg(test)]
@@ -82,12 +144,13 @@ mod delivery_query_tests {
     use super::DeliveryPage;
 
     #[test]
-    fn delivery_query_uses_the_documented_camel_case_flag() {
+    fn delivery_query_reads_the_cursor_and_tolerates_a_retired_flag() {
+        // M6b: `includeAccepted` is gone; a curator that still sends it is
+        // answered, not refused.
         let page: DeliveryPage =
             serde_urlencoded::from_str("after=41&limit=100&includeAccepted=true").unwrap();
         assert_eq!(page.after, 41);
         assert_eq!(page.limit, Some(100));
-        assert!(page.include_accepted);
     }
 }
 
@@ -104,10 +167,8 @@ async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>
     }
     let db = st.engine.artifacts();
     let limit = page.limit.unwrap_or(50);
-    let include_accepted = page.include_accepted;
     work(move || {
-        let (deliveries, next_cursor) =
-            db.deliveries_discovery_page(page.after, limit, include_accepted)?;
+        let (deliveries, next_cursor) = db.deliveries_discovery_page(page.after, limit)?;
         Ok(json!({
             "protocolVersion": 1,
             "deliveries": deliveries,
@@ -120,7 +181,7 @@ async fn deliveries(State(st): State<ApiState>, Query(page): Query<DeliveryPage>
 
 async fn delivery(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
-    work(move || db.delivery(&id)).await
+    work(move || Ok(db.delivery(&id)?.feed_value()?)).await
 }
 
 async fn retry_delivery_cleanup(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
@@ -128,36 +189,13 @@ async fn retry_delivery_cleanup(State(st): State<ApiState>, Path(id): Path<Strin
     work(move || db.retry_delivery_source_cleanup(&id)).await
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeliveryAcceptance {
-    protocol_version: u8,
-    publication_generation: String,
-    manifest_digest: String,
-    consumer_receipt_id: String,
-}
-
-async fn accept_delivery(
-    State(st): State<ApiState>,
-    Path(id): Path<String>,
-    Json(body): Json<DeliveryAcceptance>,
-) -> Response {
-    let db = st.engine.artifacts();
-    if body.protocol_version != 1 {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "unsupported delivery protocol version",
-        );
-    }
-    work(move || {
-        db.accept_delivery(
-            &id,
-            &body.publication_generation,
-            &body.manifest_digest,
-            &body.consumer_receipt_id,
-        )
-    })
-    .await
+/// Contract §2.5, IMPL §7.4: there is no acceptance. M1a answered `200` as a
+/// no-op for one release; curator M2 no longer calls it, so it is gone.
+async fn accept_delivery() -> Response {
+    error(
+        StatusCode::GONE,
+        "delivery acceptance was removed (pipeline contract v2 §2.5); publications are owned by curator once .runner-manifest.json exists",
+    )
 }
 fn failure(e: Error) -> Response {
     let status = match e {
@@ -186,7 +224,8 @@ struct Page {
     after: i64,
     /// Page size, 1..=200 (default 50).
     limit: Option<usize>,
-    /// `live` (default) · `attention` · `owned` · `cleared` · `all`.
+    /// `live` (default) · `attention` (a person must act) · `foreign`
+    /// (content Runner did not create) · `owned` · `cleared` · `all`.
     filter: Option<ListFilter>,
     /// `updated` (default) · `size` · `files` · `name`.
     sort: Option<ListSort>,
@@ -238,7 +277,6 @@ async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
     };
     work(move || {
         let page = db.list_page(&query)?;
-        let now = nzbd_state::artifacts::now();
         let entries: Vec<_> = page
             .rows
             .into_iter()
@@ -247,7 +285,7 @@ async fn list(State(st): State<ApiState>, Query(p): Query<Page>) -> Response {
                     "files": row.files,
                     "bytes": row.bytes,
                     "measured": row.measured,
-                    "earliest_expiry": row.artifact.earliest_expiry(now),
+                    "earliest_expiry": row.artifact.earliest_expiry(),
                     "artifact": row.artifact,
                 })
             })
@@ -347,6 +385,40 @@ async fn operation(State(st): State<ApiState>, Path(id): Path<String>) -> Respon
 async fn cancel(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
     work(move || db.cancel_delete(&id)).await
+}
+async fn cleanup_review(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
+    if let Err(response) = validate_artifact_role(&st, &id) {
+        return response;
+    }
+    let db = st.engine.artifacts();
+    work(move || db.preview_cleanup_review(&id)).await
+}
+#[derive(Deserialize)]
+struct AcceptCleanupReview {
+    revision: u64,
+    generation: String,
+    fingerprint: String,
+    acknowledged: bool,
+}
+async fn accept_cleanup_review(
+    State(st): State<ApiState>,
+    Path(id): Path<String>,
+    Json(body): Json<AcceptCleanupReview>,
+) -> Response {
+    if let Err(response) = validate_artifact_role(&st, &id) {
+        return response;
+    }
+    let db = st.engine.artifacts();
+    work(move || {
+        db.accept_cleanup_review(
+            &id,
+            body.revision,
+            &body.generation,
+            &body.fingerprint,
+            body.acknowledged,
+        )
+    })
+    .await
 }
 async fn inspect(State(st): State<ApiState>, Path(id): Path<String>) -> Response {
     let db = st.engine.artifacts();
@@ -728,6 +800,68 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    #[tokio::test]
+    async fn cleanup_review_api_requires_acknowledged_current_evidence_and_never_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("dest");
+        let engine = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            root.clone(),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("review-payload");
+        let db = engine.artifacts();
+        db.allocate(900, &root, &path).unwrap();
+        std::fs::write(path.join("media.mkv"), b"original").unwrap();
+        let a = db.finish(900, &path, &root, "parked_failed").unwrap();
+        let operation = db
+            .request_delete(&a.id, a.revision, "api-review-delete", 0)
+            .unwrap();
+        std::fs::write(path.join("media.mkv"), b"changed bytes").unwrap();
+        assert_eq!(db.execute_delete(&operation.id).unwrap().state, "review");
+        let (status, preview) = get(
+            &engine,
+            &format!("/api/v1/artifacts/{}/cleanup-review", a.id),
+        )
+        .await;
+        assert_eq!(status, 200);
+        for acknowledged in [false, true] {
+            let body = serde_json::json!({"revision":preview["revision"],"generation":preview["generation"],"fingerprint":preview["fingerprint"],"acknowledged":acknowledged});
+            let response = crate::router(engine.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/artifacts/{}/cleanup-review", a.id))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if acknowledged {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CONFLICT
+                }
+            );
+        }
+        let accepted = db.get(&a.id).unwrap();
+        assert_ne!(accepted.generation, a.generation);
+        assert!(accepted.keep);
+        assert_eq!(accepted.state, "retained");
+        assert_eq!(
+            std::fs::read(path.join("media.mkv")).unwrap(),
+            b"changed bytes"
+        );
+    }
+
     #[test]
     fn processing_root_discovery_excludes_internal_state_and_configured_roots() {
         use super::{scan_request, Inventory, PathBuf};
@@ -740,6 +874,11 @@ mod tests {
         let scratch = cfg.state_dir().join("transform-workspaces/private");
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(scratch.join("data"), b"private repair bytes").unwrap();
+        // A configured workspace dir on the processing volume is internal too.
+        cfg.paths.workspace_dir = Some(cfg.paths.main_dir.join(".workspaces"));
+        let configured = cfg.workspace_dir().join("private");
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::write(configured.join("data"), b"private repair bytes").unwrap();
         for directory in [
             cfg.dest_dir(),
             cfg.paths.main_dir.join("failed"),
@@ -789,11 +928,14 @@ mod tests {
         std::fs::write(folder.join("ep.mkv"), vec![b'x'; 4096]).unwrap();
         let a = engine.artifacts().discover(&root, &folder, false).unwrap();
 
-        let (status, page) = get(&engine, "/api/v1/artifacts?filter=attention&limit=10").await;
+        // Content Runner did not create is informational ("not Runner's"),
+        // never "needs attention".
+        let (status, page) = get(&engine, "/api/v1/artifacts?filter=foreign&limit=10").await;
         assert_eq!(status, 200);
         assert_eq!(page["total"], 1);
         assert_eq!(page["limit"], 10);
-        assert_eq!(page["counts"]["attention"], 1);
+        assert_eq!(page["counts"]["foreign"], 1);
+        assert_eq!(page["counts"]["attention"], 0);
         assert_eq!(page["counts"]["owned"], 0);
         assert_eq!(
             page["entries"][0]["measured"], false,
@@ -1423,11 +1565,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
-        assert!(response_json(unsupported).await["error"]
-            .as_str()
-            .unwrap()
-            .contains("unsupported delivery protocol"));
+        // There is no acceptance (contract §2.5): `accept` is gone for
+        // every id and body.
+        assert_eq!(unsupported.status(), StatusCode::GONE);
 
         let missing = app
             .clone()
@@ -1449,7 +1589,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.status(), StatusCode::GONE);
 
         let retry_missing = app
             .oneshot(

@@ -296,7 +296,7 @@ features = [
 default-features = false
 
 [dependencies.rusqlite]
-version = "0.40"
+version = "0.41"
 features = [
     "backup",
     "bundled",
@@ -344,7 +344,7 @@ features = ["derive"]
 version = "1.0.57"
 
 [dependencies.serde_rusqlite]
-version = "0.43"
+version = "0.44"
 optional = true
 
 [dependencies.sha2]

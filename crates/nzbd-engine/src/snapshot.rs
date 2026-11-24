@@ -48,6 +48,13 @@ pub struct JobSummary {
     pub repair_progress: Option<RepairProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control: Option<nzbd_types::JobControl>,
+    /// Contract §2.3: the native status, `held` when the job is held (the
+    /// persisted `status` stays `paused` until M6).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_projected: String,
+    /// The curator transfer token (`params["monarr-transfer"]`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub lifecycle_eligible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,13 +147,13 @@ pub struct UrlFetchProgress {
     pub last_error: Option<String>,
 }
 
+/// How many disposal attempts a failed source has had. The schedule and
+/// the last error are the disposal operation's own (`Operation.next_retry`,
+/// `error`), shown on `GET /api/v1/artifacts` and in Files → Attention.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FailedCleanupProgress {
     pub attempts: u32,
-    pub next_retry_at_unix: Option<i64>,
-    pub blocked_since_unix: Option<i64>,
-    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,12 +174,7 @@ pub(crate) fn failed_cleanup_progress(job: &nzbd_types::Job) -> Option<FailedCle
             .map(|(_, value)| value.as_str())
     };
     let attempts = value("*PP:failure-disposition-attempts")?.parse().ok()?;
-    Some(FailedCleanupProgress {
-        attempts,
-        next_retry_at_unix: value("*PP:failed-cleanup-next-retry").and_then(|v| v.parse().ok()),
-        blocked_since_unix: value("*PP:failed-cleanup-blocked-since").and_then(|v| v.parse().ok()),
-        last_error: value("*PP:failed-cleanup-last-error").map(str::to_owned),
-    })
+    Some(FailedCleanupProgress { attempts })
 }
 
 pub(crate) fn post_timing(job: &nzbd_types::Job, now_unix: i64) -> Option<PostTiming> {
@@ -238,9 +240,34 @@ pub struct ServerVolume {
     pub rate_bps: u64,
 }
 
+/// One out-of-space failure that is currently holding intake.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpaceFailureSnapshot {
+    /// What kind of write failed: `download write`, `publish`,
+    /// `post-processing`, `terminal store` or `write`.
+    pub operation: String,
+    /// What the reporter said, verbatim (operation and path when known).
+    pub detail: String,
+    /// The file or directory whose write failed. `None` when the reporter
+    /// could not say — the volume is then unknown, not "one of them".
+    pub path: Option<String>,
+    /// The storage-panel name of the volume holding `path` (`processing`,
+    /// `completed`, …), from the same readings the panel shows. `None`
+    /// when `path` is unknown or on no configured root.
+    pub volume: Option<String>,
+    /// The configured roles on that volume, joined with ` · `.
+    pub volume_label: Option<String>,
+    /// The configured root `path` is under.
+    pub volume_path: Option<String>,
+}
+
 /// The enforcing disk guard's cached evidence for one filesystem.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StorageVolumeSnapshot {
+    /// What the dashboard calls this filesystem: `processing`, `completed`,
+    /// or both when one filesystem holds both.
+    pub name: String,
+    /// The configured roles on this filesystem, joined with ` · `.
     pub label: String,
     pub path: String,
     pub available_bytes: Option<u64>,
@@ -249,6 +276,24 @@ pub struct StorageVolumeSnapshot {
     /// capacity is conservative last-known data; None means no successful
     /// reading has ever been observed.
     pub current: bool,
+    /// Read/write throughput. `None` when the platform gives this
+    /// filesystem no device identity to sample by.
+    pub io: Option<StorageIoSnapshot>,
+}
+
+/// One filesystem's throughput from the storage I/O sampler.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StorageIoSnapshot {
+    /// `block` (device-wide counters, every program on that disk),
+    /// `nfs` (this machine's traffic to the server), `runner` (the kernel
+    /// keeps no counters, e.g. GlusterFS/FUSE or SMB, so this is Runner's
+    /// own I/O there; `detail` names the filesystem type), or `stale` (the
+    /// sampler has stopped publishing; rates are withheld).
+    pub source: &'static str,
+    /// The device name, NFS export, or reason.
+    pub detail: String,
+    pub read_bps: Option<u64>,
+    pub write_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -259,6 +304,8 @@ pub struct QueueSnapshot {
     #[serde(skip)]
     pub queue_authority: bool,
     #[serde(skip)]
+    pub job_disposition_fences: std::collections::HashMap<JobId, String>,
+    #[serde(skip)]
     pub pending_automatic_controls: std::collections::HashSet<JobId>,
     #[serde(skip)]
     pub native_seed_dependencies: std::collections::HashSet<JobId>,
@@ -268,12 +315,20 @@ pub struct QueueSnapshot {
     pub native_seed_retirements:
         std::collections::HashMap<JobId, crate::torrent_acquisitions::ManagedSeedRetirement>,
     pub download_paused: bool,
+    /// Post-processing lane paused: downloaded jobs wait in `PostQueued`
+    /// and a running job holds at its next stage boundary.
+    pub post_paused: bool,
     /// Daily/monthly quota exhausted (force-priority jobs still run).
     pub quota_reached: bool,
     /// Intake is held by a below-floor reading, an observed write failure, an
     /// initial fail-safe measurement, or incomplete evidence after a prior
     /// hold.
     pub disk_low: bool,
+    /// W5a: jobs whose own finalize retry is the evidence an out-of-space
+    /// failure needs; hold recovery may release their (download-side)
+    /// storage hold while `disk_low`. Post-side holds are never gated.
+    #[serde(skip)]
+    pub space_retry_jobs: std::collections::HashSet<JobId>,
     /// Lowest measured free space across every configured write root. None
     /// means the enforcing probe has no usable reading or is disabled.
     #[serde(default)]
@@ -306,6 +361,12 @@ pub struct QueueSnapshot {
     /// (operation and path, as the fsx layer stamped it).
     #[serde(default)]
     pub enospc_where: Option<String>,
+    /// Every out-of-space failure currently holding intake, one per failed
+    /// operation, each resolved to the configured volume its path is on.
+    /// `enospc_where` is only the latest report's text; this is what says
+    /// which volume and which path.
+    #[serde(default)]
+    pub enospc_failures: Vec<SpaceFailureSnapshot>,
     /// Per-server session/day/month volume counters (this node).
     pub server_volumes: Vec<ServerVolume>,
     /// Servers currently blocked after connect failures (retrying on a
@@ -322,6 +383,9 @@ pub struct QueueSnapshot {
     pub session_downloaded_bytes: u64,
     /// Bytes still to fetch across active jobs (non-paused files).
     pub remaining_bytes: u64,
+    /// Restart phase timings since process start (no-wedge item 7).
+    #[serde(default)]
+    pub startup: crate::startup_phases::StartupPhases,
     pub jobs: Vec<JobSummary>,
 }
 
@@ -351,6 +415,8 @@ mod mobile_queue_contract_tests {
                 verification: None,
                 repair_progress: None,
                 control: None,
+                status_projected: String::new(),
+                transfer: None,
                 lifecycle_eligible: false,
                 url_fetch: None,
                 failed_cleanup: None,

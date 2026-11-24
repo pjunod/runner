@@ -212,20 +212,13 @@ pub struct PostSection {
     pub deobfuscate_final: bool,
     /// NZBGet `PostStrategy`: sequential | balanced | aggressive | rocket.
     pub strategy: String,
-    /// What to do with the FILES of a job that ended in a terminal
-    /// failure — par failure, unpack failure, health abort, post crash:
-    /// none | park | delete.
-    ///
-    /// Was `health_action` (NZBGet `HealthCheck`) and still parses under
-    /// that name. It only ever governed the health gate, so a par failure
-    /// left its whole directory in the category tree forever — which is
-    /// how ~523 GB of known-bad downloads accumulated under an importer's
-    /// watch folder (docs/REGRAB_LOOP_PLAN.md D2). The default is
-    /// `delete`: the bytes are known-bad and the job's NZB is parked with
-    /// its history entry, so `requeue` gets them back.
+    /// Legacy failure policy, retained for parsing older configurations and
+    /// NZBGet compatibility. `keep_failed_downloads` controls runtime retention.
     #[serde(alias = "health_action")]
     pub failure_action: String,
-    /// Where `failure_action = "park"` puts a failed job's directory.
+    /// Retain failed payloads in the failed directory. Off by default.
+    pub keep_failed_downloads: bool,
+    /// Where retained failed downloads are moved.
     /// Defaults to `<main_dir>/failed` — deliberately off the category
     /// tree an importer watches.
     pub failed_dir: Option<PathBuf>,
@@ -233,6 +226,13 @@ pub struct PostSection {
     pub script_timeout_secs: u64,
     /// How long to wait for delayed par-block downloads during repair.
     pub par_fetch_timeout_secs: u64,
+    /// Seconds an environmental hold (storage, capacity, mount, tool…) may
+    /// last before runner ends the job `failed/hold_expired` with its bytes
+    /// parked (pipeline contract v2 §2.3).
+    pub hold_deadline_secs: u64,
+    /// The same deadline for `password_required` holds, which wait on a
+    /// person.
+    pub password_hold_deadline_secs: u64,
 }
 
 impl Default for PostSection {
@@ -248,10 +248,13 @@ impl Default for PostSection {
             deobfuscate_final: true,
             strategy: "balanced".into(),
             failure_action: "delete".into(),
+            keep_failed_downloads: false,
             failed_dir: None,
             tool_timeout_secs: 3600,
             script_timeout_secs: 3600,
             par_fetch_timeout_secs: 600,
+            hold_deadline_secs: 86_400,
+            password_hold_deadline_secs: 604_800,
         }
     }
 }
@@ -363,6 +366,11 @@ pub struct Paths {
     pub temp_dir: Option<PathBuf>,
     pub torrent_dir: Option<PathBuf>,
     pub torrent_watch_dir: Option<PathBuf>,
+    /// Transform workspaces (PAR repair / extraction scratch). Unset: under
+    /// the state directory. Put it on the processing volume (beside
+    /// `main_dir`) when the state directory is a small local disk, so a
+    /// workspace's output reaches processing by rename, not by copy.
+    pub workspace_dir: Option<PathBuf>,
 }
 
 impl Default for Paths {
@@ -376,6 +384,7 @@ impl Default for Paths {
             temp_dir: None,
             torrent_dir: None,
             torrent_watch_dir: None,
+            workspace_dir: None,
         }
     }
 }
@@ -622,6 +631,22 @@ impl Config {
         expand_home(&self.paths.dest_dir)
     }
 
+    /// Transform workspace root: `paths.workspace_dir`, else
+    /// `<state_dir>/transform-workspaces`.
+    pub fn workspace_dir(&self) -> PathBuf {
+        self.configured_workspace_dir()
+            .unwrap_or_else(|| self.state_dir().join("transform-workspaces"))
+    }
+
+    /// `paths.workspace_dir` when set (expanded); `None` keeps the default.
+    pub fn configured_workspace_dir(&self) -> Option<PathBuf> {
+        self.paths
+            .workspace_dir
+            .as_ref()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| expand_home(p))
+    }
+
     /// Usenet processing root: nonempty InterDir, otherwise MainDir.
     pub fn download_dir(&self) -> PathBuf {
         self.paths
@@ -682,6 +707,9 @@ impl Config {
             }
         };
         push("state".into(), self.state_dir());
+        if let Some(path) = self.configured_workspace_dir() {
+            push("workspaces".into(), path);
+        }
         if self.cluster.enabled {
             if let Some(path) = &self.cluster.shared_dir {
                 push(
@@ -2135,6 +2163,33 @@ Server2.Connections=0
     }
 
     #[test]
+    fn workspace_dir_defaults_under_state_and_follows_the_setting() {
+        let mut cfg = Config::default();
+        cfg.paths.queue_dir = Some(PathBuf::from("/srv/nzbd/state"));
+        assert_eq!(cfg.configured_workspace_dir(), None);
+        assert_eq!(
+            cfg.workspace_dir(),
+            PathBuf::from("/srv/nzbd/state/transform-workspaces")
+        );
+        assert!(!cfg
+            .storage_roots()
+            .iter()
+            .any(|root| root.label.contains("workspaces")));
+        let parsed: Config = toml::from_str(
+            "[paths]\nmain_dir = \"/processing\"\nqueue_dir = \"/srv/nzbd/state\"\nworkspace_dir = \"/processing/.workspaces\"\ndest_dir = \"/processing/completed\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.workspace_dir(),
+            PathBuf::from("/processing/.workspaces")
+        );
+        assert!(parsed
+            .storage_roots()
+            .iter()
+            .any(|root| root.path == std::path::Path::new("/processing/.workspaces")));
+    }
+
+    #[test]
     fn storage_roots_are_complete_expanded_and_deduplicated() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
@@ -2680,5 +2735,19 @@ socks_proxy_password = "proxy-secret"
         assert_eq!(renamed.servers[1].password.as_deref(), Some(SECRET_MASK));
         // …so the strict validator refuses it too, belt and braces.
         assert!(renamed.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod failure_retention_tests {
+    #[test]
+    fn failed_payload_retention_is_opt_in_and_round_trips() {
+        let default: super::Config = toml::from_str("").unwrap();
+        assert!(!default.post.keep_failed_downloads);
+        let mut keep = default;
+        keep.post.keep_failed_downloads = true;
+        let saved = toml::to_string(&keep).unwrap();
+        let loaded: super::Config = toml::from_str(&saved).unwrap();
+        assert!(loaded.post.keep_failed_downloads);
     }
 }

@@ -17,10 +17,10 @@ Add an optional session-wide cap on live peers, `SessionOptions::peer_limit_tota
 
 ## Tests
 ```
-# upstream main f4ca7d91 + this commit; Linux x86_64, Rust 1.97.1
+# upstream main f23bacdd + this commit; Linux x86_64, Rust 1.97.1
 cargo fmt --all -- --check     # ok
-cargo clippy --all-targets     # no warnings (also clean with Rust 1.94)
-cargo test                     # 171 passed, 0 failed (main alone: 168 passed, 0 failed)
+cargo clippy --all-targets     # no warnings
+cargo test                     # 174 passed, 0 failed (main alone: 171 passed, 0 failed)
 ```
 The new tests (`peer_semaphore_tests` in `librqbit`) are part of that run and pass.
 

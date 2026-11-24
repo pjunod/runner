@@ -5,6 +5,7 @@ pub mod hash_id;
 pub mod lengths;
 pub mod magnet;
 pub mod peer_id;
+pub mod retry;
 pub mod spawn_utils;
 pub mod speed_estimator;
 #[cfg(any(feature = "sha1-crypto-hash", feature = "sha1-ring"))]

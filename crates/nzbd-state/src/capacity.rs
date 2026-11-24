@@ -96,10 +96,40 @@ mod native {
             None => available(root)?,
         };
         if free < bytes.saturating_add(*reserved).saturating_add(RESERVE) {
-            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            return Err(super::CapacityShortfall {
+                root: root.to_path_buf(),
+                needed: bytes,
+                claimed: *reserved,
+                headroom: RESERVE,
+                free,
+            }
+            .into());
         }
         *reserved = reserved.saturating_add(bytes);
         Ok(Reservation { key, bytes })
+    }
+
+    /// [`reserve`] `bytes` once per distinct filesystem among `roots`. A
+    /// write that lands in one root and is renamed into another needs the
+    /// space once when both are on the same device, not once per root.
+    /// A refusal names the root it was for.
+    pub fn reserve_each<'a>(
+        roots: &[&'a Path],
+        bytes: u64,
+    ) -> Result<Vec<Reservation>, (&'a Path, io::Error)> {
+        let mut seen = Vec::with_capacity(roots.len());
+        let mut claims = Vec::with_capacity(roots.len());
+        for &root in roots {
+            let device = std::fs::symlink_metadata(root)
+                .map_err(|error| (root, error))?
+                .dev();
+            if seen.contains(&device) {
+                continue;
+            }
+            seen.push(device);
+            claims.push(reserve(root, bytes).map_err(|error| (root, error))?);
+        }
+        Ok(claims)
     }
 
     #[allow(clippy::unnecessary_cast)] // statvfs field widths vary across supported Unix targets
@@ -164,7 +194,7 @@ mod native {
 #[cfg(all(unix, test))]
 pub(crate) use native::FAIL_NEXT_RESERVATION;
 #[cfg(unix)]
-pub use native::{available, health, reserve, Reservation};
+pub use native::{available, health, reserve, reserve_each, Reservation};
 #[cfg(all(unix, feature = "test-support"))]
 pub use native::{inject_available_test_limit, CapacityTestLimit};
 #[cfg(not(unix))]
@@ -176,10 +206,114 @@ pub fn reserve(_: &std::path::Path, _: u64) -> std::io::Result<Reservation> {
     ))
 }
 #[cfg(not(unix))]
+pub fn reserve_each<'a>(
+    roots: &[&'a std::path::Path],
+    bytes: u64,
+) -> Result<Vec<Reservation>, (&'a std::path::Path, std::io::Error)> {
+    roots
+        .iter()
+        .map(|&root| reserve(root, bytes).map_err(|error| (root, error)))
+        .collect()
+}
+#[cfg(not(unix))]
 pub fn available(_: &std::path::Path) -> std::io::Result<u64> {
     Err(std::io::Error::other("capacity context unavailable"))
 }
 #[cfg(not(unix))]
 pub fn health(root: &std::path::Path, bytes: u64, _: &str) -> std::io::Result<Reservation> {
     reserve(root, bytes)
+}
+
+/// A reservation refused because the forecast does not fit: nothing was
+/// written and nothing failed on disk. Carried inside an `io::Error` of kind
+/// `StorageFull`, so it classifies as a capacity hold like a real `ENOSPC`,
+/// but it says which filesystem and by how much instead of impersonating the
+/// kernel's "No space left on device".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityShortfall {
+    /// The directory the reservation was for.
+    pub root: std::path::PathBuf,
+    /// What this reservation asked for.
+    pub needed: u64,
+    /// Already claimed on the same filesystem by in-flight writers,
+    /// extraction and relocation.
+    pub claimed: u64,
+    /// Headroom always kept free.
+    pub headroom: u64,
+    /// What statvfs reported available.
+    pub free: u64,
+}
+
+impl std::fmt::Display for CapacityShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "not enough free space forecast on {}: needs {} with {} already claimed in flight and {} headroom, {} free",
+            self.root.display(),
+            gib(self.needed),
+            gib(self.claimed),
+            gib(self.headroom),
+            gib(self.free),
+        )
+    }
+}
+
+impl std::error::Error for CapacityShortfall {}
+
+impl From<CapacityShortfall> for std::io::Error {
+    fn from(shortfall: CapacityShortfall) -> Self {
+        std::io::Error::new(std::io::ErrorKind::StorageFull, shortfall)
+    }
+}
+
+impl CapacityShortfall {
+    /// The shortfall inside `error`, if a reservation refused it.
+    pub fn of(error: &std::io::Error) -> Option<&CapacityShortfall> {
+        error.get_ref()?.downcast_ref()
+    }
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+#[cfg(all(test, unix))]
+mod shortfall_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_forecast_names_the_root_and_the_numbers_and_still_reads_as_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = available(dir.path()).unwrap();
+        let error = match reserve(dir.path(), free) {
+            Err(error) => error,
+            Ok(_) => panic!("a reservation of everything free plus headroom must be refused"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(
+            error.raw_os_error(),
+            None,
+            "a forecast is not the kernel's ENOSPC"
+        );
+        let shortfall = CapacityShortfall::of(&error).expect("typed shortfall");
+        assert_eq!(shortfall.root, dir.path());
+        assert_eq!(shortfall.needed, free);
+        let text = error.to_string();
+        assert!(text.contains(&dir.path().display().to_string()), "{text}");
+        assert!(
+            text.starts_with("not enough free space forecast on "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn roots_on_one_filesystem_are_reserved_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let claims = reserve_each(&[&a, &b], 1).unwrap();
+        assert_eq!(claims.len(), 1);
+    }
 }

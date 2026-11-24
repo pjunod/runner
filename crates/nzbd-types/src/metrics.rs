@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Default)]
 pub struct PpStageStats {
     /// Indexed by position in [`PostStage::ALL`].
-    count: [AtomicU64; 9],
-    millis: [AtomicU64; 9],
+    count: [AtomicU64; PostStage::ALL.len()],
+    millis: [AtomicU64; PostStage::ALL.len()],
 }
 
 impl PpStageStats {

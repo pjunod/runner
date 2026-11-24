@@ -10,7 +10,7 @@
 //!   ordered by checked headers; split-file continuity establishes membership.
 //!   Ambiguous sets retain their names and fail explicitly.
 
-use crate::PostError;
+use crate::{FsContext, PostError};
 use md5::{Digest, Md5};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -57,10 +57,27 @@ fn files_of(dir: &Path) -> Vec<PathBuf> {
 }
 
 pub(crate) fn full_md5(path: &Path) -> Option<[u8; 16]> {
+    read_content_digests(path, false).map(|(md5, _)| md5)
+}
+
+fn read_content_digests(
+    path: &Path,
+    capture_sha: bool,
+) -> Option<([u8; 16], nzbd_state::fileops::ContentProof)> {
+    read_content_digests_tracked(path, capture_sha, &mut 0)
+}
+
+fn read_content_digests_tracked(
+    path: &Path,
+    capture_sha: bool,
+    scanned: &mut u64,
+) -> Option<([u8; 16], nzbd_state::fileops::ContentProof)> {
     let mut file = nzbd_state::fileops::open(path).ok()?;
     let before = crate::fingerprint::FileStamp::of(&file.metadata().ok()?);
+    let identity = nzbd_state::fileops::identity(&file).ok()?;
     let mut read_bytes = 0;
     let mut digest = Md5::new();
+    let mut sha256 = sha2::Sha256::new();
     let mut buf = [0; 65536];
     loop {
         crate::attempt::checkpoint().ok()?;
@@ -70,7 +87,11 @@ pub(crate) fn full_md5(path: &Path) -> Option<[u8; 16]> {
             break;
         }
         read_bytes += n as u64;
+        *scanned += n as u64;
         digest.update(&buf[..n]);
+        if capture_sha {
+            sha256.update(&buf[..n]);
+        }
     }
     if read_bytes != before.length
         || crate::fingerprint::FileStamp::of(&file.metadata().ok()?) != before
@@ -78,7 +99,16 @@ pub(crate) fn full_md5(path: &Path) -> Option<[u8; 16]> {
     {
         return None;
     }
-    Some(digest.finalize().into())
+    if nzbd_state::fileops::identity(&file).ok()? != identity {
+        return None;
+    }
+    Some((
+        digest.finalize().into(),
+        nzbd_state::fileops::ContentProof {
+            identity,
+            sha256: format!("{:x}", sha256.finalize()),
+        },
+    ))
 }
 
 fn create_parents(root: &Path, target: &Path) -> std::io::Result<()> {
@@ -116,7 +146,7 @@ pub(crate) fn rename_owned(
     to: PathBuf,
     custody: Custody<'_>,
 ) -> Result<Option<(PathBuf, PathBuf)>, PostError> {
-    crate::attempt::checkpoint()?;
+    crate::attempt::checkpoint().map_err(PostError::Io)?;
     if from == to {
         return Ok(None);
     }
@@ -136,15 +166,89 @@ pub fn par_rename(dir: &Path) -> Renames {
     par_rename_owned(dir, None)
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RenameMetrics {
+    pub source_read_bytes: u64,
+    pub source_hash_ms: u64,
+    pub readback_bytes: u64,
+    pub readback_ms: u64,
+    pub namespace_ms: u64,
+    pub manifest_ms: u64,
+    pub journal_ms: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub noop_files: u64,
+    pub renamed_files: u64,
+}
+#[derive(Debug)]
+pub struct RenameOutcome {
+    pub renames: Vec<(PathBuf, PathBuf)>,
+    pub metrics: RenameMetrics,
+}
+
+/// These are lookup constraints from the current owner export, not proofs.
+pub fn naming_candidates(
+    job: &nzbd_types::Job,
+    dir: &Path,
+) -> Vec<nzbd_state::artifacts::writer_naming::NamingCandidate> {
+    let mut generations = std::collections::HashMap::new();
+    let mut publications = std::collections::HashMap::new();
+    for (key, value) in &job.params {
+        if let Some(file) = key.strip_prefix("*File:generation:") {
+            generations.entry(file).or_insert(value);
+        } else if let Some(file) = key.strip_prefix("*File:publication:") {
+            publications.entry(file).or_insert(value);
+        }
+    }
+    job.files
+        .iter()
+        .filter_map(|file| {
+            if !file.finalized || file.crc32.is_none() || file.is_par2 {
+                return None;
+            }
+            let file_key = file.id.0.to_string();
+            let generation = generations.get(file_key.as_str())?.parse().ok()?;
+            let name = publications
+                .get(file_key.as_str())
+                .map_or(file.filename.as_str(), |name| name.as_str());
+            let relative = crate::namespace::relative(name).ok()?;
+            Some(nzbd_state::artifacts::writer_naming::NamingCandidate {
+                file: file.id.0,
+                writer_generation: generation,
+                path: dir.join(relative),
+            })
+        })
+        .collect()
+}
+
 pub fn par_rename_owned(
     dir: &Path,
     custody: Option<(&nzbd_state::artifacts::Inventory, u32)>,
 ) -> Renames {
-    let mut renames = Vec::new();
+    par_rename_owned_with_candidates(dir, custody, &[]).map(|outcome| outcome.renames)
+}
 
-    // 1. Give obfuscated par2 files their extension back (by magic).
+pub fn par_rename_owned_with_candidates(
+    dir: &Path,
+    custody: Option<(&nzbd_state::artifacts::Inventory, u32)>,
+    current: &[nzbd_state::artifacts::writer_naming::NamingCandidate],
+) -> Result<RenameOutcome, PostError> {
+    let mut renames = Vec::new();
+    let mut metrics = RenameMetrics::default();
+    // Taking the batch releases all unused descriptors when this pass returns,
+    // including cancellation/errors. Sibling renames do not change file scope.
+    let expected: HashMap<_, _> = custody
+        .map(|(inventory, job)| {
+            inventory
+                .take_writer_naming(job, current)
+                .into_iter()
+                .map(|entry| (entry.path().to_owned(), entry))
+                .collect()
+        })
+        .unwrap_or_default();
+
     for p in files_of(dir) {
-        crate::attempt::checkpoint()?;
+        crate::attempt::checkpoint().map_err(PostError::Io)?;
         if !ext_is(&p, "par2") && head(&p, 8) == PAR2_MAGIC {
             let to = dir.join(format!(
                 "{}.par2",
@@ -156,59 +260,113 @@ pub fn par_rename_owned(
         }
     }
 
-    // Prefixes narrow candidates; size and full digest establish intact identity.
-    let sets = crate::par2::load_sets(dir)?;
-    for set in sets {
+    for set in crate::par2::load_sets(dir)? {
         let mut wanted: HashMap<[u8; 16], Vec<&crate::par2::Par2File>> = HashMap::new();
         for f in &set.files {
             wanted.entry(f.md5_16k).or_default().push(f);
         }
         for p in files_of(&set.root) {
+            crate::attempt::checkpoint().map_err(PostError::Io)?;
             if ext_is(&p, "par2") || p.extension().is_some_and(|e| e == "part") {
                 continue;
             }
-            let Some(hash) = md5_16k(&p) else {
+            let cached = expected.get(&p).filter(|entry| {
+                custody.is_some_and(|(inventory, _)| inventory.naming_candidate_matches(entry, &p))
+            });
+            let hash = match cached {
+                Some(entry) => Some(entry.md5_prefix()),
+                None => md5_16k(&p),
+            };
+            let Some(catalog) = hash.as_ref().and_then(|hash| wanted.get(hash)) else {
                 continue;
             };
-            let Some(catalog) = wanted.get(&hash) else {
+            if catalog.iter().all(|file| set.root.join(&file.name) == p) {
+                metrics.noop_files += 1;
                 continue;
+            }
+            let full = if cached.is_some() {
+                metrics.cache_hits += 1;
+                None
+            } else {
+                metrics.cache_misses += 1;
+                let started = std::time::Instant::now();
+                let read = read_content_digests_tracked(
+                    &p,
+                    custody.is_some(),
+                    &mut metrics.source_read_bytes,
+                );
+                metrics.source_hash_ms +=
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                crate::attempt::checkpoint().map_err(PostError::Io)?;
+                read
             };
-            let full = full_md5(&p);
             let matches: Vec<_> = catalog
                 .iter()
-                .filter(|f| {
-                    std::fs::metadata(&p).is_ok_and(|m| m.len() == f.length)
-                        && full == Some(f.md5_full)
+                .filter(|file| {
+                    let length = cached
+                        .map(|entry| entry.bytes())
+                        .or_else(|| std::fs::metadata(&p).ok().map(|m| m.len()));
+                    let md5 = cached
+                        .map(|entry| entry.md5_full())
+                        .or_else(|| full.as_ref().map(|(md5, _)| *md5));
+                    length == Some(file.length) && md5 == Some(file.md5_full)
                 })
                 .collect();
             if matches.len() != 1 {
                 continue;
             }
-            let f = matches[0];
-            let Ok(relative) = crate::namespace::relative(&f.name) else {
+            let Ok(relative) = crate::namespace::relative(&matches[0].name) else {
                 continue;
             };
             let target = set.root.join(relative);
             if p == target {
+                metrics.noop_files += 1;
                 continue;
             }
-            create_parents(&set.root, target.parent().unwrap())?;
-            crate::attempt::checkpoint()?;
+            crate::attempt::checkpoint().map_err(PostError::Io)?;
+            create_parents(&set.root, target.parent().unwrap())
+                .at("create directory", target.parent().unwrap())?;
             if let Some((inventory, job)) = custody {
-                inventory.restore_file(job, &p, &target).map_err(|e| {
+                let result = if let Some(entry) = cached {
+                    inventory.restore_file_expected(
+                        job,
+                        &p,
+                        &target,
+                        entry,
+                        &crate::attempt::checkpoint,
+                        &crate::attempt::scanned,
+                    )
+                } else {
+                    inventory.restore_file_with_proof_observed(
+                        job,
+                        &p,
+                        &target,
+                        &full.as_ref().unwrap().1,
+                        &crate::attempt::checkpoint,
+                        &crate::attempt::scanned,
+                    )
+                }
+                .map_err(|e| {
                     PostError::Subprocess(format!(
                         "par rename {} to {}: {e}",
                         p.display(),
                         target.display()
                     ))
                 })?;
+                metrics.readback_bytes += result.readback_bytes;
+                metrics.readback_ms += result.readback_ms;
+                metrics.namespace_ms += result.namespace_ms;
+                metrics.manifest_ms += result.manifest_ms;
+                metrics.journal_ms += result.journal_ms;
                 renames.push((p, target));
+                metrics.renamed_files += 1;
             } else if let Some(pair) = safe_rename(&p, target)? {
                 renames.push(pair);
+                metrics.renamed_files += 1;
             }
         }
     }
-    Ok(renames)
+    Ok(RenameOutcome { renames, metrics })
 }
 
 /// RAR5 archives carry their volume number in the main archive header;
@@ -421,7 +579,7 @@ pub(crate) fn split_volume_ext(ext: &str) -> bool {
 /// SFV provides the volume names that older RAR4 headers omit. Match the
 /// complete file checksum, reject ambiguous mappings, then journal each rename.
 fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
-    let files = crate::namespace::files(dir)?;
+    let files = crate::namespace::files(dir).at("read directory", dir)?;
     let archives: Vec<_> = files
         .iter()
         .filter(|path| {
@@ -457,10 +615,10 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
                 .parent()
                 .is_some_and(|parent| unresolved.contains(parent))
     }) {
-        if std::fs::metadata(sfv)?.len() > 2 * 1024 * 1024 {
+        if std::fs::metadata(sfv).at("stat", sfv)?.len() > 2 * 1024 * 1024 {
             continue;
         }
-        let bytes = std::fs::read(sfv)?;
+        let bytes = std::fs::read(sfv).at("read", sfv)?;
         for raw in bytes.split(|byte| *byte == b'\n') {
             let raw = raw.trim_ascii();
             if raw.is_empty() || raw.starts_with(b";") {
@@ -480,7 +638,7 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
             let Ok(crc) = u32::from_str_radix(checksum, 16) else {
                 continue;
             };
-            let relative = crate::namespace::relative(name.trim())?;
+            let relative = crate::namespace::relative(name.trim()).map_err(PostError::Io)?;
             let extension = relative
                 .extension()
                 .unwrap_or_default()
@@ -499,9 +657,7 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
                 .insert(target, crc)
                 .is_some_and(|prior| prior != crc)
             {
-                return Err(PostError::Subprocess(
-                    "conflicting SFV archive names".into(),
-                ));
+                return Err(PostError::Identity("conflicting SFV archive names".into()));
             }
         }
     }
@@ -516,11 +672,15 @@ fn sfv_restore_archives(dir: &Path, custody: Custody<'_>) -> Renames {
         {
             continue;
         }
-        let mut input = nzbd_state::fileops::open(path).map_err(std::io::Error::other)?;
+        let mut input = nzbd_state::io_meter::Metered::new(
+            nzbd_state::fileops::open(path)
+                .map_err(std::io::Error::other)
+                .at("open", path)?,
+        );
         let mut digest = crc32fast::Hasher::new();
         let mut buffer = [0; 65536];
         loop {
-            let count = input.read(&mut buffer)?;
+            let count = input.read(&mut buffer).at("read", path)?;
             if count == 0 {
                 break;
             }

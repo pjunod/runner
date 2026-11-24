@@ -1,5 +1,5 @@
 import { JobSummary, SeedPolicy } from './api/types';
-import { formatDuration } from './api/format';
+import { formatDuration, isJobStopped } from './api/format';
 
 export type TorrentDisplayPhase =
   | 'fetching_source' | 'fetching_metadata' | 'queued' | 'checking'
@@ -28,7 +28,7 @@ export function torrentDisplayPhase(job: JobSummary): TorrentDisplayPhase | null
   if (phase === 'paused_download' && job.torrent_control_intent === 'running'
       && job.torrent_error === 'storage full') return 'storage_hold';
   const paused = job.torrent_control_intent
-    ? job.torrent_control_intent === 'paused' : job.status === 'paused';
+    ? job.torrent_control_intent === 'paused' : isJobStopped(job.status);
   if (job.ready) return paused ? 'paused_seed' : 'seeding';
   if (paused) return 'paused_download';
   if (job.torrent_control_intent === 'running' && phase === 'paused_download') return 'queued';
@@ -75,10 +75,10 @@ export interface TorrentAction { action: 'pause' | 'resume' | 'seed-options'; la
 export function torrentPrimaryAction(job: JobSummary): TorrentAction | null {
   const phase = torrentDisplayPhase(job);
   if (!phase || ['failed', 'storage_hold', 'unknown'].includes(phase)) return null;
-  if (phase === 'missing_files') return job.status === 'paused'
+  if (phase === 'missing_files') return isJobStopped(job.status)
     ? { action: 'resume', label: 'Re-download missing files' } : null;
   if (phase === 'paused_seed' && seedLimitReached(job)) return { action: 'seed-options', label: 'Seeding options' };
-  if (job.status === 'paused') return { action: 'resume', label: phase === 'paused_seed' ? 'Start seeding' : 'Resume' };
+  if (isJobStopped(job.status)) return { action: 'resume', label: phase === 'paused_seed' ? 'Start seeding' : 'Resume' };
   if (job.status === 'queued' || job.status === 'downloading') {
     return { action: 'pause', label: phase === 'seeding' ? 'Stop seeding' : 'Pause' };
   }

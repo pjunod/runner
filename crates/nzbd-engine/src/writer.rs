@@ -5,6 +5,7 @@ use crate::recovery::{self, ProvenRange, ValidationOutcome};
 use nzbd_state::artifacts::Identity;
 use nzbd_types::{FileId, JobId, ServerId};
 use std::{
+    collections::{BTreeMap, HashMap},
     io::SeekFrom,
     path::{Path, PathBuf},
 };
@@ -44,22 +45,31 @@ pub struct WriterHandle {
     pub generation: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct WriterScope {
     pub generation: u64,
     pub proven: Vec<ProvenRange>,
     pub expected_identity: Option<Identity>,
+    pub collect_naming: bool,
+    /// The owner discarded this file's ranges and proof after an identity
+    /// mismatch (no-wedge task 1): remove whatever sits at the file's
+    /// names in the job's own directory and start the file from empty.
+    pub discard_existing: bool,
+    pub naming_inventory: Option<std::sync::Arc<nzbd_state::artifacts::Inventory>>,
+    #[cfg(test)]
+    pub naming_test_hook: Option<std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
+    #[cfg(test)]
+    pub sync_test_hook: Option<std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
 }
 
 #[derive(Debug)]
 pub(crate) enum WriterFact {
+    /// One durability checkpoint: every segment here was written before the
+    /// shared `fdatasync` that preceded this fact, and all of them name the
+    /// same post-sync identity. The owner records the batch as one proof
+    /// update (one parse, one serialization, one totals pass).
     Written {
-        seg_number: u32,
-        offset: u64,
-        len: u32,
-        crc: u32,
-        file_size: u64,
-        server: ServerId,
+        segments: Vec<WrittenSegment>,
         identity: Identity,
     },
     Finalized {
@@ -67,10 +77,19 @@ pub(crate) enum WriterFact {
         final_path: Option<PathBuf>,
         combined_crc: Option<u32>,
         identity: Option<Identity>,
+        naming: Option<Box<nzbd_state::artifacts::writer_naming::PublishedProducerRead>>,
     },
     Error {
         error: String,
+        /// The hold the failing `io::Error` named by errno; `None` for a
+        /// refusal with no errno (an identity conflict, a bad range).
+        cause: Option<nzbd_types::HoldCause>,
     },
+    /// The file on disk is not the object its proof names (a replaced
+    /// inode, conflicting aliases, ranges incoherent with the recorded
+    /// size). Nothing was written. The owner discards this one file's
+    /// ranges and proof and re-downloads it, bounded.
+    IdentityMismatch { error: String },
     Rejected {
         seg_number: u32,
         server: ServerId,
@@ -78,9 +97,23 @@ pub(crate) enum WriterFact {
     },
 }
 
-const WRITER_QUEUE: usize = 8;
+/// Decoded segments buffered ahead of the writer. Sized so connections keep
+/// reading while a checkpoint sync is in progress instead of stalling their
+/// sockets behind one file's `fdatasync`.
+const WRITER_QUEUE: usize = 32;
 
-/// Compatibility entry point for direct callers without durable scoped evidence.
+/// Durability checkpoint cadence (ARCHITECTURE.md §8.4). A checkpoint is one
+/// `fdatasync` plus one acknowledgement of every segment written since the
+/// last one. It is taken when this many bytes are pending, when the file is
+/// fully covered (so the owner can finalize at once), when the oldest pending
+/// write is [`CHECKPOINT_AGE`] old, or before any control command. A crash
+/// loses at most one checkpoint of unacknowledged writes per file; those
+/// ranges are still Pending in the owner and are simply downloaded again.
+const CHECKPOINT_BYTES: u64 = 32 * 1024 * 1024;
+const CHECKPOINT_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Test support: an unscoped writer that reports plain `EngineMsg` facts.
+/// Every production writer is scoped ([`spawn_writer_scoped`]).
 #[cfg(test)]
 pub fn spawn_writer(
     tracker: &TaskTracker,
@@ -172,37 +205,50 @@ impl Reporter {
             }
         } else {
             match fact {
-                WriterFact::Written {
-                    seg_number,
-                    offset,
-                    len,
-                    crc,
-                    file_size,
-                    server,
-                    ..
-                } => EngineMsg::SegmentWritten {
-                    job: self.job,
-                    file: self.file,
-                    seg_number,
-                    offset,
-                    len,
-                    crc,
-                    file_size,
-                    server,
-                },
+                WriterFact::Written { segments, .. } => {
+                    // Test-only unscoped path: one plain message per segment.
+                    for segment in segments {
+                        let message = EngineMsg::SegmentWritten {
+                            job: self.job,
+                            file: self.file,
+                            seg_number: segment.seg_number,
+                            offset: segment.offset,
+                            len: segment.len,
+                            crc: segment.crc,
+                            file_size: segment.file_size,
+                            server: segment.server,
+                        };
+                        if self.tx.send(message).await.is_err() {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
                 WriterFact::Finalized {
                     ok,
                     final_path,
                     combined_crc,
+                    naming,
                     ..
-                } => EngineMsg::WriterFinalized {
+                } => {
+                    if naming.is_some() {
+                        let _ = tokio::task::spawn_blocking(move || drop(naming)).await;
+                    }
+                    EngineMsg::WriterFinalized {
+                        job: self.job,
+                        file: self.file,
+                        ok,
+                        final_path,
+                        combined_crc,
+                    }
+                }
+                WriterFact::Error { error, cause } => EngineMsg::WriterError {
                     job: self.job,
                     file: self.file,
-                    ok,
-                    final_path,
-                    combined_crc,
+                    error,
+                    cause,
                 },
-                WriterFact::Error { error } => EngineMsg::WriterError {
+                WriterFact::IdentityMismatch { error } => EngineMsg::WriterIdentityMismatch {
                     job: self.job,
                     file: self.file,
                     error,
@@ -211,17 +257,77 @@ impl Reporter {
                     job: self.job,
                     file: self.file,
                     error: reason,
+                    cause: None,
                 },
             }
         };
-        self.tx.send(message).await.is_ok()
+        match self.tx.send(message).await {
+            Ok(()) => true,
+            Err(error) => {
+                if let EngineMsg::ScopedWriter {
+                    fact:
+                        WriterFact::Finalized {
+                            naming: Some(naming),
+                            ..
+                        },
+                    ..
+                } = error.0
+                {
+                    let _ = tokio::task::spawn_blocking(move || drop(naming)).await;
+                }
+                false
+            }
+        }
     }
+    /// A refusal with no errno behind it: the job's terminal `failed/io`.
     async fn error(&self, error: impl ToString) {
         self.send(WriterFact::Error {
             error: error.to_string(),
+            cause: None,
         })
         .await;
     }
+    /// A failed filesystem call: the errno along its error chain decides
+    /// the hold ([`crate::error_hold_cause`]).
+    async fn io_error(
+        &self,
+        context: &str,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) {
+        let fact = WriterFact::Error {
+            error: format!("{context}: {error}"),
+            cause: crate::error_hold_cause(error),
+        };
+        self.send(fact).await;
+    }
+}
+
+/// Remove the file's three possible names inside the job's own directory
+/// (closed scope: everything in it came from this download). Only regular
+/// files are removed; anything else is left for `resolve_payload` to refuse.
+fn discard_payload(dir: &Path, file: FileId, publication_name: &str) -> std::io::Result<()> {
+    let mut names = vec![dir.join(format!(".runner-file-{}.part", file.0))];
+    if recovery::safe_name(publication_name) {
+        names.push(dir.join(format!("{publication_name}.part")));
+        names.push(dir.join(publication_name));
+    }
+    let mut removed = false;
+    for path in names {
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.is_file() => continue,
+            Ok(_) => {}
+        }
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => removed = true,
+        }
+    }
+    if removed {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 async fn file_identity(file: &File) -> std::io::Result<Identity> {
@@ -242,6 +348,8 @@ async fn ensure_open(
         if expected.is_none() {
             tokio::fs::create_dir_all(dir).await?;
         }
+        #[cfg(test)]
+        recovery::probe::opened(part);
         let descriptor =
             nzbd_state::fileops::writer(part, expected.is_none()).map_err(std::io::Error::other)?;
         let identity = recovery::capture_identity(&descriptor).map_err(std::io::Error::other)?;
@@ -256,6 +364,185 @@ async fn ensure_open(
         }
     }
     Ok(())
+}
+
+/// The writer's reserved ranges, indexed so each segment's duplicate and
+/// conflict checks are a lookup rather than a scan over every prior range
+/// (a large file holds tens of thousands). Reserved ranges never overlap, so
+/// only the last range starting before a candidate's end can overlap it. If
+/// the seed ever breaks that invariant the index falls back to the scan, so
+/// classification is identical either way.
+#[derive(Default)]
+struct RangeIndex {
+    ranges: Vec<ProvenRange>,
+    by_segment: HashMap<u32, usize>,
+    by_offset: BTreeMap<u64, usize>,
+    bytes: u64,
+    scan: bool,
+}
+
+impl RangeIndex {
+    fn new(seed: Vec<ProvenRange>) -> Self {
+        let mut index = Self::default();
+        for range in seed {
+            index.insert(range);
+        }
+        index
+    }
+
+    fn as_slice(&self) -> &[ProvenRange] {
+        &self.ranges
+    }
+
+    /// Distinct reserved bytes.
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    fn insert(&mut self, range: ProvenRange) {
+        if !self.scan && self.classify(&range).1 {
+            self.scan = true;
+        }
+        let slot = self.ranges.len();
+        self.bytes = self.bytes.saturating_add(u64::from(range.len));
+        if self.by_segment.insert(range.seg_number, slot).is_some()
+            || self.by_offset.insert(range.offset, slot).is_some()
+            || range.end().is_none()
+        {
+            self.scan = true;
+        }
+        self.ranges.push(range);
+    }
+
+    /// `(duplicate, conflict)` exactly as the scan defines them: a duplicate is
+    /// an identical reserved range; a conflict is a different range with the
+    /// same segment number or an overlapping extent.
+    fn classify(&self, range: &ProvenRange) -> (bool, bool) {
+        if self.scan {
+            let duplicate = self.ranges.contains(range);
+            let conflict = self.ranges.iter().any(|prior| {
+                (prior.seg_number == range.seg_number || prior.overlaps(range)) && prior != range
+            });
+            return (duplicate, conflict);
+        }
+        if let Some(&slot) = self.by_segment.get(&range.seg_number) {
+            let duplicate = self.ranges[slot] == *range;
+            // Non-overlapping, unique segment numbers: an identical prior is
+            // the only range this one can touch.
+            return (duplicate, !duplicate);
+        }
+        let Some(end) = range.end() else {
+            return (false, !self.ranges.is_empty());
+        };
+        let conflict = self
+            .by_offset
+            .range(..end)
+            .next_back()
+            .is_some_and(|(_, &slot)| self.ranges[slot].overlaps(range));
+        (false, conflict)
+    }
+}
+
+/// One segment acknowledged by a checkpoint. Pending facts carry no payload
+/// buffers: the bytes are already written, only the acknowledgement waits.
+#[derive(Debug, Clone)]
+pub(crate) struct WrittenSegment {
+    pub seg_number: u32,
+    pub offset: u64,
+    pub len: u32,
+    pub crc: u32,
+    pub file_size: u64,
+    pub server: ServerId,
+}
+
+#[derive(Default)]
+struct PendingWrites {
+    facts: Vec<WrittenSegment>,
+    /// Bytes written since the last checkpoint.
+    bytes: u64,
+    /// When the oldest pending write was accepted; bounds acknowledgement
+    /// latency while a file trickles in.
+    since: Option<tokio::time::Instant>,
+    dirty: bool,
+    #[cfg(test)]
+    sync_fault: Option<i32>,
+}
+
+impl PendingWrites {
+    fn push(&mut self, fact: WrittenSegment) {
+        self.bytes = self.bytes.saturating_add(u64::from(fact.len));
+        self.since.get_or_insert_with(tokio::time::Instant::now);
+        self.facts.push(fact);
+    }
+
+    /// The checkpoint is due without waiting for more segments.
+    fn due(&self, covered: &RangeIndex, file_size: u64) -> bool {
+        self.bytes >= CHECKPOINT_BYTES || (file_size > 0 && covered.bytes() >= file_size)
+    }
+
+    fn deadline(&self) -> tokio::time::Instant {
+        self.since.unwrap_or_else(tokio::time::Instant::now) + CHECKPOINT_AGE
+    }
+
+    async fn flush(
+        &mut self,
+        out: &Option<File>,
+        expected: &mut Option<Identity>,
+        report: &Reporter,
+        part_path: &Path,
+        #[cfg(test)] hook: Option<&std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
+    ) -> bool {
+        if self.facts.is_empty() {
+            return true;
+        }
+        let file = out.as_ref().expect("pending writes have an open file");
+        if self.dirty {
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook("before_sync");
+            }
+            let result = file.sync_data().await;
+            #[cfg(test)]
+            let result = if let Some(code) = self.sync_fault.take() {
+                Err(std::io::Error::from_raw_os_error(code))
+            } else {
+                result
+            };
+            if let Err(error) = result {
+                report
+                    .io_error(&format!("write {}", part_path.display()), &error)
+                    .await;
+                return false;
+            }
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook("after_sync");
+            }
+        }
+        let identity = match file_identity(file).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                report
+                    .io_error(&format!("identity {}", part_path.display()), &error)
+                    .await;
+                return false;
+            }
+        };
+        if expected.as_ref().is_some_and(|prior| *prior != identity) {
+            report.error(identity_error()).await;
+            return false;
+        }
+        *expected = Some(identity.clone());
+        // The batch names one post-sync identity. No member of a new batch is
+        // acknowledged before the shared durability boundary succeeds.
+        let segments = std::mem::take(&mut self.facts);
+        self.bytes = 0;
+        self.since = None;
+        self.dirty = false;
+        report
+            .send(WriterFact::Written { segments, identity })
+            .await
+    }
 }
 
 // The task owns one writer actor; keep its bounded plumbing explicit here.
@@ -280,73 +567,176 @@ async fn writer_task(
     };
     let part_path = dir.join(format!(".runner-file-{}.part", file_id.0));
     let mut final_path = dir.join(&final_name);
+    // The filesystem this job writes to, for the dashboard's I/O graph on
+    // filesystems the kernel keeps no counters for. Taken from the open
+    // file on the first write (the directory may not exist yet here).
+    let mut device: Option<u64> = None;
+    // No-wedge item 4: the lazy identity check of a restart happens here,
+    // at the first open of the one file being written. A failed stat (EIO,
+    // ENOTCONN, ...) is never proof that bytes are gone: it holds only this
+    // job on its storage cause. An identity mismatch (a replaced inode,
+    // conflicting aliases) is proof the recorded ranges are not on disk:
+    // the owner discards this one file's ranges and re-downloads it
+    // (no-wedge task 1), bounded, then `failed/identity`.
+    if scope.discard_existing {
+        if let Err(error) = discard_payload(&dir, file_id, &final_name) {
+            report.io_error("discard replaced payload", &error).await;
+            return;
+        }
+    }
     let resolved = match recovery::resolve_payload(&dir, file_id, &final_name) {
         Ok(payload) => payload,
-        Err(error) => {
+        Err(recovery::ResolveError::Unavailable { message, cause }) => {
             report
-                .error(format!("write admission / payload resolution: {error:?}"))
+                .send(WriterFact::Error {
+                    error: format!("write admission / payload resolution: {message}"),
+                    cause: Some(cause.unwrap_or(nzbd_types::HoldCause::StorageUnavailable)),
+                })
+                .await;
+            return;
+        }
+        Err(recovery::ResolveError::IdentityConflict) => {
+            report
+                .send(WriterFact::IdentityMismatch {
+                    error: "write admission / payload resolution: conflicting payload aliases"
+                        .into(),
+                })
                 .await;
             return;
         }
     };
     if let Some(payload) = &resolved {
+        // The same object, not the same size/mtime: a write the previous run
+        // made but never acknowledged (a kill between write and sync, or
+        // between sync and the owner's journal) legitimately grows or touches
+        // the file. Its ranges are still Pending and are simply rewritten;
+        // every acknowledged range was fsynced before it was recorded.
         if scope
             .expected_identity
             .as_ref()
-            .is_some_and(|saved| *saved != payload.identity)
+            .is_some_and(|saved| !saved.same_object(&payload.identity))
         {
-            report.error("writer identity conflict at admission").await;
+            report
+                .send(WriterFact::IdentityMismatch {
+                    error: "write admission: payload file identity changed (replaced inode)".into(),
+                })
+                .await;
             return;
         }
         if !payload.published && payload.path != part_path {
             if let Err(error) = nzbd_state::fileops::link(&payload.path, &part_path) {
-                report
-                    .error(format!("legacy partial migration: {error}"))
-                    .await;
+                report.io_error("legacy partial migration", &error).await;
                 return;
             }
         }
     }
+    // Finding 7: the proven ranges must fit the file as it is *now* (the one
+    // stat above), not as the proof recorded it: a same-inode file that was
+    // truncated, or is missing altogether, no longer holds them. That is
+    // proof the bytes are gone — the reset path re-downloads this one file.
+    let live_bytes = resolved.as_ref().map(|payload| payload.identity.bytes);
     if !scope.proven.is_empty()
         && (scope.expected_identity.is_none()
-            || !recovery::coherent_ranges(
-                &scope.proven,
-                scope.expected_identity.as_ref().unwrap().bytes,
-            ))
+            || live_bytes.is_none()
+            || !recovery::coherent_ranges(&scope.proven, live_bytes.unwrap()))
     {
-        report.error("writer proven range identity conflict").await;
+        report
+            .send(WriterFact::IdentityMismatch {
+                error: "writer proven range identity conflict".into(),
+            })
+            .await;
         return;
     }
     // Linking a legacy alias updates ctime. Refresh only the object just established.
     let mut expected = scope.expected_identity;
     if expected.is_some() {
         if let Some(payload) = &resolved {
+            #[cfg(test)]
+            recovery::probe::opened(&payload.path);
             let opened = match nzbd_state::fileops::open(&payload.path) {
                 Ok(opened) => opened,
                 Err(error) => {
-                    report.error(error).await;
+                    report.io_error("open partial", &error).await;
                     return;
                 }
             };
-            expected = match recovery::capture_identity(&opened) {
+            expected = match nzbd_state::fileops::identity(&opened) {
                 Ok(identity) => Some(identity),
                 Err(error) => {
-                    report.error(error).await;
+                    report.io_error("partial identity", &error).await;
                     return;
                 }
             };
         }
     }
     let published_only = resolved.as_ref().is_some_and(|payload| payload.published);
-    let mut ranges = scope.proven;
+    let mut ranges = RangeIndex::new(scope.proven);
     let mut out = None;
     let mut reservation = None;
     #[cfg(test)]
     let mut fault = None;
+    let mut pending = PendingWrites::default();
+    // The file's size as the latest segment states it (0 = unknown), for the
+    // full-coverage checkpoint.
+    let mut file_size_hint = 0u64;
+    let mut deferred = None;
     loop {
-        // Never cancel an in-flight seek/write/sync. Stop before the next command.
-        let cmd = tokio::select! { biased; _ = stop.cancelled() => break,
-        command = rx.recv() => match command { Some(command)=>command,None=>break } };
+        // Accumulate a contiguous run of segments into one checkpoint. A
+        // control command, a due checkpoint (bytes, full coverage or age),
+        // a closed queue or cancellation flushes the accepted run before
+        // another command can run.
+        let cmd = if !pending.facts.is_empty() {
+            let next = if stop.is_cancelled() || pending.due(&ranges, file_size_hint) {
+                None
+            } else {
+                match rx.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(mpsc::error::TryRecvError::Disconnected) => None,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // Never cancel an in-flight seek/write/sync: only this
+                        // receive waits, bounded by the checkpoint age.
+                        tokio::select! { biased;
+                            _ = stop.cancelled() => None,
+                            command = rx.recv() => command,
+                            _ = tokio::time::sleep_until(pending.deadline()) => None,
+                        }
+                    }
+                }
+            };
+            match next {
+                Some(command @ WriteCmd::Segment { .. }) => command,
+                other => {
+                    deferred = other;
+                    if !pending
+                        .flush(
+                            &out,
+                            &mut expected,
+                            &report,
+                            &part_path,
+                            #[cfg(test)]
+                            scope.sync_test_hook.as_ref(),
+                        )
+                        .await
+                    {
+                        return;
+                    }
+                    if stop.is_cancelled() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else if let Some(command) = deferred.take() {
+            if stop.is_cancelled() {
+                break;
+            }
+            command
+        } else {
+            // Never cancel an in-flight seek/write/sync. Only the next receive
+            // is cancellable, after any completed writes have been drained.
+            tokio::select! { biased; _ = stop.cancelled() => break,
+            command = rx.recv() => match command { Some(command)=>command,None=>break } }
+        };
         match cmd {
             #[cfg(test)]
             WriteCmd::InjectFailure(stage, code) => {
@@ -367,6 +757,9 @@ async fn writer_task(
                 file_size,
                 server,
             } => {
+                if file_size > 0 {
+                    file_size_hint = file_size;
+                }
                 let range = ProvenRange {
                     seg_number,
                     offset,
@@ -377,11 +770,21 @@ async fn writer_task(
                     || range.len == 0
                     || range.end().is_none()
                     || (file_size > 0 && range.end().is_some_and(|end| end > file_size));
-                let duplicate = ranges.contains(&range);
-                let conflict = ranges.iter().any(|prior| {
-                    (prior.seg_number == seg_number || prior.overlaps(&range)) && *prior != range
-                });
+                let (duplicate, conflict) = ranges.classify(&range);
                 if invalid || conflict {
+                    if !pending
+                        .flush(
+                            &out,
+                            &mut expected,
+                            &report,
+                            &part_path,
+                            #[cfg(test)]
+                            scope.sync_test_hook.as_ref(),
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     if !report
                         .send(WriterFact::Rejected {
                             seg_number,
@@ -396,18 +799,15 @@ async fn writer_task(
                 }
                 if let Err(error) = ensure_open(&dir, &part_path, &mut out, &expected).await {
                     report
-                        .error(format!("write {}: {error}", part_path.display()))
+                        .io_error(&format!("write {}", part_path.display()), &error)
                         .await;
                     return;
                 }
                 if !duplicate {
                     if reservation.is_none() && file_size > 0 {
-                        let done = ranges
-                            .iter()
-                            .map(|range| u64::from(range.len))
-                            .fold(0u64, u64::saturating_add)
-                            .min(file_size);
+                        let done = ranges.bytes().min(file_size);
                         let end = ranges
+                            .as_slice()
                             .iter()
                             .filter_map(ProvenRange::end)
                             .max()
@@ -419,7 +819,7 @@ async fn writer_task(
                             Ok(claim) => reservation = Some(claim),
                             Err(error) => {
                                 report
-                                    .error(format!("write admission {}: {error}", dir.display()))
+                                    .io_error(&format!("write admission {}", dir.display()), &error)
                                     .await;
                                 return;
                             }
@@ -427,66 +827,69 @@ async fn writer_task(
                     }
                     // Reserve before any mutation, including preallocation. A failed
                     // or uncertain write terminates this generation rather than releasing it.
-                    ranges.push(range.clone());
+                    ranges.insert(range.clone());
                     #[cfg(test)]
                     let injected = fault.take();
                     #[cfg(test)]
                     if let Some(("write", code)) = injected {
                         report
-                            .error(format!(
-                                "write: {}",
-                                std::io::Error::from_raw_os_error(code)
-                            ))
+                            .io_error("write", &std::io::Error::from_raw_os_error(code))
                             .await;
                         return;
                     }
                     let f = out.as_mut().unwrap();
                     let result = async {
-                        if file_size > 0 && f.metadata().await?.len() < file_size {
+                        // The length comes from the identity taken after the
+                        // previous write; only the first write of this open
+                        // file needs its own stat.
+                        let length = match (&expected, device) {
+                            (Some(identity), Some(_)) => identity.bytes,
+                            _ => {
+                                let metadata = f.metadata().await?;
+                                device = nzbd_state::io_meter::device_of_metadata(&metadata);
+                                metadata.len()
+                            }
+                        };
+                        if file_size > 0 && length < file_size {
                             f.set_len(file_size).await?;
                         }
                         f.seek(SeekFrom::Start(offset)).await?;
                         f.write_all(&data).await?;
-                        // Segment sync is the durability boundary for every acknowledgement.
-                        f.sync_data().await?;
+                        nzbd_state::io_meter::write(device, data.len() as u64);
+                        // Drain Tokio's buffered write before checking identity or
+                        // seeking for another member. Durability is shared below.
+                        f.flush().await?;
                         Ok::<_, std::io::Error>(())
                     }
                     .await;
                     #[cfg(test)]
-                    let result = if let Some(("sync", code)) = injected {
-                        Err(std::io::Error::from_raw_os_error(code))
-                    } else {
-                        result
-                    };
+                    if let Some(("sync", code)) = injected {
+                        pending.sync_fault = Some(code);
+                    }
                     if let Err(error) = result {
                         report
-                            .error(format!("write {}: {error}", part_path.display()))
+                            .io_error(&format!("write {}", part_path.display()), &error)
                             .await;
                         return;
                     }
+                    pending.dirty = true;
                 }
                 let identity = match file_identity(out.as_ref().unwrap()).await {
                     Ok(identity) => identity,
                     Err(error) => {
-                        report.error(error).await;
+                        report.io_error("write identity", &error).await;
                         return;
                     }
                 };
-                expected = Some(identity.clone());
-                if !report
-                    .send(WriterFact::Written {
-                        seg_number,
-                        offset,
-                        len: range.len,
-                        crc,
-                        file_size,
-                        server,
-                        identity,
-                    })
-                    .await
-                {
-                    return;
-                }
+                expected = Some(identity);
+                pending.push(WrittenSegment {
+                    seg_number,
+                    offset,
+                    len: range.len,
+                    crc,
+                    file_size,
+                    server,
+                });
             }
             WriteCmd::SealPartial {
                 file_size,
@@ -495,6 +898,7 @@ async fn writer_task(
                 let result = async {
                     if file_size == 0
                         || ranges
+                            .as_slice()
                             .iter()
                             .any(|range| range.end().is_none_or(|end| end > file_size))
                     {
@@ -521,10 +925,11 @@ async fn writer_task(
                                 final_path: Some(part_path.clone()),
                                 combined_crc: None,
                                 identity: Some(identity),
+                                naming: None,
                             })
                             .await;
                     }
-                    Err(error) => report.error(format!("seal partial: {error}")).await,
+                    Err(error) => report.io_error("seal partial", &error).await,
                 }
                 return;
             }
@@ -535,14 +940,11 @@ async fn writer_task(
                 #[cfg(test)]
                 if let Some(("finalize", code)) = fault.take() {
                     report
-                        .error(format!(
-                            "finalize: {}",
-                            std::io::Error::from_raw_os_error(code)
-                        ))
+                        .io_error("finalize", &std::io::Error::from_raw_os_error(code))
                         .await;
                     return;
                 }
-                if ranges.iter().any(|range| {
+                if ranges.as_slice().iter().any(|range| {
                     range
                         .end()
                         .is_none_or(|end| file_size > 0 && end > file_size)
@@ -558,24 +960,42 @@ async fn writer_task(
                     &final_path,
                     &mut out,
                     &expected,
-                    file_size,
-                    combined_crc,
+                    FinalizeOptions {
+                        file_size,
+                        combined_crc,
+                        collect_naming: scope.collect_naming,
+                        naming_inventory: scope.naming_inventory.clone(),
+                        cancellation: stop.clone(),
+                        #[cfg(test)]
+                        naming_test_hook: scope.naming_test_hook.clone(),
+                    },
                 )
                 .await;
+                if stop.is_cancelled() {
+                    if let Ok((_, Some(naming))) = result {
+                        if let Some(inventory) = scope.naming_inventory.as_ref() {
+                            inventory.discard_writer_naming(naming);
+                        } else {
+                            let _ = tokio::task::spawn_blocking(move || drop(naming)).await;
+                        }
+                    }
+                    return;
+                }
                 match result {
-                    Ok(identity) => {
+                    Ok((identity, naming)) => {
                         report
                             .send(WriterFact::Finalized {
                                 ok: true,
                                 final_path: Some(final_path.clone()),
                                 combined_crc,
                                 identity: Some(identity),
+                                naming: naming.map(Box::new),
                             })
                             .await;
                     }
                     Err(error) => {
                         report
-                            .error(format!("finalize identity/publication: {error}"))
+                            .io_error("finalize identity/publication", &error)
                             .await
                     }
                 }
@@ -600,15 +1020,101 @@ fn require_valid(
     }
 }
 
+struct FinalizeOptions {
+    file_size: u64,
+    combined_crc: Option<u32>,
+    collect_naming: bool,
+    naming_inventory: Option<std::sync::Arc<nzbd_state::artifacts::Inventory>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    naming_test_hook: Option<std::sync::Arc<dyn Fn(&'static str) + Send + Sync>>,
+}
+
+/// The writer owns and joins this worker before publishing its stopped fact.
+/// Naming digests share the mandatory CRC pass; publication still follows CRC.
+async fn verify_complete(
+    path: &Path,
+    identity: &Identity,
+    size: u64,
+    crc: u32,
+    options: &FinalizeOptions,
+) -> std::io::Result<Option<nzbd_state::artifacts::writer_naming::ProducerRead>> {
+    let path = path.to_owned();
+    let expected = identity.clone();
+    let cancel = options.cancellation.clone();
+    let collect = options.collect_naming;
+    let inventory = options.naming_inventory.clone();
+    #[cfg(test)]
+    let hook = options.naming_test_hook.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(inventory) = inventory {
+            inventory.prepare_writer_naming();
+        }
+        let file = nzbd_state::fileops::open(&path).map_err(std::io::Error::other)?;
+        if recovery::capture_identity(&file).map_err(std::io::Error::other)? != expected {
+            return Err(identity_error());
+        }
+        if size == 0 {
+            require_valid(&path, 0, 0, crc, Some(&expected))?;
+            return Ok(None);
+        }
+        let result = nzbd_state::artifacts::writer_naming::verify_producer_read(
+            file,
+            size,
+            crc,
+            collect,
+            &|| {
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    hook("scan");
+                }
+                if cancel.is_cancelled() {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        #[cfg(test)]
+        if result.as_ref().is_ok_and(|naming| naming.is_some()) {
+            if let Some(hook) = &hook {
+                hook("after_crc");
+            }
+        }
+        result
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+async fn publish_naming(
+    naming: Option<nzbd_state::artifacts::writer_naming::ProducerRead>,
+    path: &Path,
+    identity: &Identity,
+) -> Option<nzbd_state::artifacts::writer_naming::PublishedProducerRead> {
+    let naming = naming?;
+    let path = path.to_owned();
+    let identity = identity.clone();
+    // Optional locator checks and rejected descriptor closure stay off Tokio.
+    tokio::task::spawn_blocking(move || naming.published(&path, &identity))
+        .await
+        .ok()
+        .flatten()
+}
+
 async fn finalize(
     dir: &Path,
     part: &Path,
     final_path: &Path,
     out: &mut Option<File>,
     expected: &Option<Identity>,
-    file_size: u64,
-    combined_crc: Option<u32>,
-) -> std::io::Result<Identity> {
+    options: FinalizeOptions,
+) -> std::io::Result<(
+    Identity,
+    Option<nzbd_state::artifacts::writer_naming::PublishedProducerRead>,
+)> {
+    let file_size = options.file_size;
+    let combined_crc = options.combined_crc;
     if out.is_none() {
         match nzbd_state::fileops::writer(part, false) {
             Ok(file) => *out = Some(File::from_std(file)),
@@ -626,10 +1132,13 @@ async fn finalize(
                     return Err(identity_error());
                 }
                 if let Some(crc) = combined_crc {
-                    return require_valid(final_path, 0, file_size, crc, Some(&identity));
+                    let naming =
+                        verify_complete(final_path, &identity, file_size, crc, &options).await?;
+                    let naming = publish_naming(naming, final_path, &identity).await;
+                    return Ok((identity, naming));
                 }
                 if expected.is_some() {
-                    return Ok(identity);
+                    return Ok((identity, None));
                 }
                 return Err(identity_error());
             }
@@ -647,41 +1156,69 @@ async fn finalize(
     if file_size > 0 && identity.bytes != file_size {
         return Err(identity_error());
     }
-    if let Some(crc) = combined_crc {
-        require_valid(part, 0, file_size, crc, Some(&identity))?;
-    }
-    // Keep the writer descriptor alive while checking path and publishing.
-    let source = nzbd_state::fileops::open(part).map_err(std::io::Error::other)?;
-    if recovery::capture_identity(&source).map_err(std::io::Error::other)? != identity {
-        return Err(identity_error());
-    }
-    match nzbd_state::fileops::link(part, final_path) {
-        Ok(()) => {}
-        Err(nzbd_state::artifacts::Error::Io(error))
-            if error.kind() == std::io::ErrorKind::AlreadyExists =>
-        {
-            let target = nzbd_state::fileops::open(final_path).map_err(std::io::Error::other)?;
-            let target_identity =
-                recovery::capture_identity(&target).map_err(std::io::Error::other)?;
-            if !target_identity.same_object(&identity)
-                || target_identity.bytes != identity.bytes
-                || target_identity.modified != identity.modified
-            {
-                return Err(identity_error());
-            }
+    let naming = if let Some(crc) = combined_crc {
+        verify_complete(part, &identity, file_size, crc, &options).await?
+    } else {
+        None
+    };
+    let publication = async {
+        if options.cancellation.is_cancelled() {
+            return Err(std::io::ErrorKind::Interrupted.into());
         }
-        Err(error) => return Err(std::io::Error::other(error)),
+        // Keep the writer descriptor alive while checking path and publishing.
+        let source = nzbd_state::fileops::open(part).map_err(std::io::Error::other)?;
+        if recovery::capture_identity(&source).map_err(std::io::Error::other)? != identity {
+            return Err(identity_error());
+        }
+        match nzbd_state::fileops::link(part, final_path) {
+            Ok(()) => {}
+            Err(nzbd_state::artifacts::Error::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                let target =
+                    nzbd_state::fileops::open(final_path).map_err(std::io::Error::other)?;
+                let target_identity =
+                    recovery::capture_identity(&target).map_err(std::io::Error::other)?;
+                if !target_identity.same_object(&identity)
+                    || target_identity.bytes != identity.bytes
+                    || target_identity.modified != identity.modified
+                {
+                    return Err(identity_error());
+                }
+            }
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+        if let Some(parent) = final_path.parent() {
+            File::open(parent).await?.sync_all().await?;
+        }
+        tokio::fs::remove_file(part).await?;
+        if let Some(parent) = part.parent() {
+            File::open(parent).await?.sync_all().await?;
+        }
+        let identity = file_identity(out.as_ref().unwrap()).await?;
+        Ok::<_, std::io::Error>(identity)
     }
-    if let Some(parent) = final_path.parent() {
-        File::open(parent).await?.sync_all().await?;
-    }
-    tokio::fs::remove_file(part).await?;
-    if let Some(parent) = part.parent() {
-        File::open(parent).await?.sync_all().await?;
-    }
-    let identity = file_identity(out.as_ref().unwrap()).await?;
+    .await;
+    let identity = match publication {
+        Ok(identity) => identity,
+        Err(error) => {
+            // Even an optional read handle can block in close on the source
+            // filesystem. Join its disposal before reporting writer quiescence.
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(hook) = &options.naming_test_hook {
+                    hook("dispose");
+                }
+                drop(naming);
+            })
+            .await
+            .map_err(std::io::Error::other)?;
+            return Err(error);
+        }
+    };
+    let naming = publish_naming(naming, final_path, &identity).await;
     drop(out.take());
-    Ok(identity)
+    Ok((identity, naming))
 }
 
 #[cfg(test)]
@@ -708,9 +1245,10 @@ pub(crate) fn validate_range_checked(
     {
         return false;
     }
-    let Ok(mut file) = nzbd_state::fileops::open(path) else {
+    let Ok(file) = nzbd_state::fileops::open(path) else {
         return false;
     };
+    let mut file = nzbd_state::io_meter::Metered::new(file);
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return false;
     }
@@ -733,8 +1271,230 @@ pub(crate) fn validate_range_checked(
 
 #[cfg(test)]
 mod tests {
+
+    /// Deterministic xorshift for the range-index property checks.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn range_index_classifies_exactly_like_the_scan() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..300 {
+            let mut index = RangeIndex::default();
+            let mut scan: Vec<ProvenRange> = Vec::new();
+            for _ in 0..40 {
+                let candidate = ProvenRange {
+                    seg_number: (xorshift(&mut state) % 24) as u32,
+                    offset: xorshift(&mut state) % 200,
+                    len: (xorshift(&mut state) % 30) as u32,
+                    crc: (xorshift(&mut state) % 2) as u32,
+                };
+                let expected = (
+                    scan.contains(&candidate),
+                    scan.iter().any(|prior| {
+                        (prior.seg_number == candidate.seg_number || prior.overlaps(&candidate))
+                            && *prior != candidate
+                    }),
+                );
+                assert_eq!(
+                    index.classify(&candidate),
+                    expected,
+                    "{candidate:?} vs {scan:?}"
+                );
+                // The writer inserts only accepted, non-duplicate, non-empty
+                // ranges; seed arbitrary ones too so the scan fallback is hit.
+                if !expected.0 && (!expected.1 || xorshift(&mut state).is_multiple_of(8)) {
+                    index.insert(candidate.clone());
+                    scan.push(candidate);
+                }
+                assert_eq!(
+                    index.bytes(),
+                    scan.iter().map(|r| u64::from(r.len)).sum::<u64>()
+                );
+            }
+        }
+    }
     use super::*;
     use tokio::sync::mpsc::channel;
+
+    async fn naming_writer_event(events: &mut mpsc::Receiver<EngineMsg>) -> Option<EngineMsg> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("writer must report within the fixture deadline")
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_publication_failure_join_naming_workers_before_stopped() {
+        for boundary in ["scan", "after_crc", "collision"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let tracker = TaskTracker::new();
+            let (tx, mut events) = channel(8);
+            let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocked = std::sync::Mutex::new(blocked);
+            let hook = std::sync::Arc::new(move |stage| {
+                let wait = match boundary {
+                    "scan" => stage == "scan",
+                    "after_crc" => matches!(stage, "after_crc" | "dispose"),
+                    _ => stage == "dispose",
+                };
+                if wait {
+                    entered_tx.send(stage).unwrap();
+                    blocked.lock().unwrap().recv().unwrap();
+                }
+            });
+            let mut writer = spawn_writer_scoped(
+                &tracker,
+                JobId(1),
+                FileId(2),
+                tmp.path().into(),
+                "done".into(),
+                tx,
+                WriterScope {
+                    collect_naming: true,
+                    naming_test_hook: Some(hook),
+                    ..Default::default()
+                },
+            );
+            let bytes = b"mandatory CRC and optional naming";
+            writer
+                .tx
+                .send(WriteCmd::Segment {
+                    seg_number: 1,
+                    offset: 0,
+                    data: bytes.to_vec(),
+                    crc: crc32fast::hash(bytes),
+                    file_size: bytes.len() as u64,
+                    server: ServerId(1),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                naming_writer_event(&mut events).await,
+                Some(EngineMsg::ScopedWriter {
+                    fact: WriterFact::Written { .. },
+                    ..
+                })
+            ));
+            if boundary == "collision" {
+                std::fs::write(tmp.path().join("done"), b"unrelated existing destination").unwrap();
+            }
+            writer
+                .tx
+                .send(WriteCmd::Finalize {
+                    file_size: bytes.len() as u64,
+                    combined_crc: Some(crc32fast::hash(bytes)),
+                })
+                .await
+                .unwrap();
+            let stage = tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stage,
+                if boundary == "collision" {
+                    "dispose"
+                } else {
+                    boundary
+                }
+            );
+            if boundary != "collision" {
+                writer.stop.cancel();
+            }
+            // This current-thread runtime can still run while the worker is
+            // blocked. Cancellation alone cannot announce writer quiescence.
+            tokio::task::yield_now().await;
+            assert!(!*writer.stopped.borrow());
+            release.send(()).unwrap();
+            if boundary == "after_crc" {
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), entered.recv())
+                        .await
+                        .unwrap(),
+                    Some("dispose")
+                );
+                assert!(!*writer.stopped.borrow());
+                release.send(()).unwrap();
+            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                writer.stopped.wait_for(|done| *done),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                std::fs::read(tmp.path().join(".runner-file-2.part")).unwrap(),
+                bytes
+            );
+            if boundary == "collision" {
+                assert_eq!(
+                    std::fs::read(tmp.path().join("done")).unwrap(),
+                    b"unrelated existing destination"
+                );
+            } else {
+                assert!(!tmp.path().join("done").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_without_combined_crc_publishes_without_naming_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tracker = TaskTracker::new();
+        let (tx, mut events) = channel(8);
+        let writer = spawn_writer_scoped(
+            &tracker,
+            JobId(1),
+            FileId(2),
+            tmp.path().into(),
+            "done".into(),
+            tx,
+            WriterScope {
+                collect_naming: true,
+                ..Default::default()
+            },
+        );
+        writer
+            .tx
+            .send(WriteCmd::Segment {
+                seg_number: 1,
+                offset: 0,
+                data: b"data".to_vec(),
+                crc: crc32fast::hash(b"data"),
+                file_size: 4,
+                server: ServerId(1),
+            })
+            .await
+            .unwrap();
+        naming_writer_event(&mut events).await.unwrap();
+        writer
+            .tx
+            .send(WriteCmd::Finalize {
+                file_size: 4,
+                combined_crc: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            naming_writer_event(&mut events).await,
+            Some(EngineMsg::ScopedWriter {
+                fact: WriterFact::Finalized {
+                    ok: true,
+                    naming: None,
+                    combined_crc: None,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(tmp.path().join("done")).unwrap(), b"data");
+    }
 
     /// Writes segments out of order with a gap, finalizes, and checks the
     /// assembled bytes (gap zero-filled, exact final size, `.part` renamed).
@@ -1016,7 +1776,9 @@ mod tests {
             .await
             .unwrap();
         match engine_rx.recv().await {
-            Some(EngineMsg::WriterError { job, file, error }) => {
+            Some(EngineMsg::WriterError {
+                job, file, error, ..
+            }) => {
                 assert_eq!(job, JobId(1));
                 assert_eq!(file, FileId(2));
                 assert!(error.contains("write admission"));
@@ -1076,7 +1838,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             engine_rx.recv().await,
-            Some(EngineMsg::WriterFinalized { ok: false, .. } | EngineMsg::WriterError { .. })
+            Some(
+                EngineMsg::WriterFinalized { ok: false, .. }
+                    | EngineMsg::WriterError { .. }
+                    | EngineMsg::WriterIdentityMismatch { .. }
+            )
         ));
     }
     #[tokio::test]
@@ -1213,9 +1979,9 @@ mod tests {
             rx.recv().await,
             Some(EngineMsg::ScopedWriter {
                 generation: 9,
-                fact: WriterFact::Written { seg_number: 1, .. },
+                fact: WriterFact::Written { ref segments, .. },
                 ..
-            })
+            }) if segments.len() == 1 && segments[0].seg_number == 1
         ));
         assert!(matches!(
             rx.recv().await,
@@ -1227,9 +1993,9 @@ mod tests {
         assert!(matches!(
             rx.recv().await,
             Some(EngineMsg::ScopedWriter {
-                fact: WriterFact::Written { seg_number: 1, .. },
+                fact: WriterFact::Written { ref segments, .. },
                 ..
-            })
+            }) if segments.len() == 1 && segments[0].seg_number == 1
         ));
         assert_eq!(
             std::fs::read(dir.path().join(".runner-file-2.part")).unwrap(),
@@ -1238,6 +2004,62 @@ mod tests {
         writer.stop.cancel();
         let mut stopped = writer.stopped.clone();
         stopped.wait_for(|done| *done).await.unwrap();
+    }
+
+    /// Finding 7: the same inode truncated below its highest proven range
+    /// end (or gone) no longer holds those ranges: the writer reports an
+    /// identity mismatch (the owner's reset re-downloads that file) instead
+    /// of trusting the size the proof recorded.
+    #[tokio::test]
+    async fn a_same_inode_file_truncated_below_its_proof_is_a_mismatch() {
+        for remove in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(".runner-file-2.part");
+            std::fs::write(&path, b"abcdefgh").unwrap();
+            let identity =
+                recovery::capture_identity(&nzbd_state::fileops::open(&path).unwrap()).unwrap();
+            if remove {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(3)
+                    .unwrap();
+            }
+            let tracker = TaskTracker::new();
+            let (tx, mut rx) = channel(8);
+            let _writer = spawn_writer_scoped(
+                &tracker,
+                JobId(1),
+                FileId(2),
+                dir.path().to_path_buf(),
+                "out".into(),
+                tx,
+                WriterScope {
+                    generation: 4,
+                    proven: vec![ProvenRange {
+                        seg_number: 1,
+                        offset: 4,
+                        len: 4,
+                        crc: 42,
+                    }],
+                    expected_identity: Some(identity),
+                    ..WriterScope::default()
+                },
+            );
+            assert!(
+                matches!(
+                    rx.recv().await,
+                    Some(EngineMsg::ScopedWriter {
+                        fact: WriterFact::IdentityMismatch { .. },
+                        ..
+                    })
+                ),
+                "removed={remove}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1265,6 +2087,7 @@ mod tests {
                     crc: 42,
                 }],
                 expected_identity: Some(identity),
+                ..WriterScope::default()
             },
         );
         for (seg_number, crc) in [(2, 42), (1, 43)] {
@@ -1304,5 +2127,458 @@ mod tests {
             })
         ));
         assert_eq!(std::fs::read(path).unwrap(), b"abcd");
+    }
+
+    fn batch_segment(number: u32, offset: u64, bytes: &[u8], size: u64) -> WriteCmd {
+        WriteCmd::Segment {
+            seg_number: number,
+            offset,
+            data: bytes.to_vec(),
+            crc: crc32fast::hash(bytes),
+            file_size: size,
+            server: ServerId(1),
+        }
+    }
+
+    fn queued_writer(
+        dir: &Path,
+        commands: Vec<WriteCmd>,
+        scope: WriterScope,
+    ) -> (
+        mpsc::Receiver<EngineMsg>,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = channel(WRITER_QUEUE);
+        for command in commands {
+            tx.try_send(command).unwrap();
+        }
+        drop(tx);
+        let (events, received) = channel(32);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(writer_task(
+            JobId(1),
+            FileId(2),
+            dir.into(),
+            "out".into(),
+            rx,
+            events,
+            stop.clone(),
+            scope,
+            true,
+        ));
+        (received, stop, task)
+    }
+
+    /// Writer facts as the tests read them: a checkpoint is one entry per
+    /// segment it acknowledged, each carrying the checkpoint's shared
+    /// identity; every other fact is passed through.
+    #[derive(Debug)]
+    enum Seen {
+        Written { seg_number: u32, identity: Identity },
+        Other(WriterFact),
+    }
+
+    async fn batch_facts(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<Seen> {
+        checkpoints(events)
+            .await
+            .into_iter()
+            .flat_map(|fact| match fact {
+                WriterFact::Written { segments, identity } => segments
+                    .into_iter()
+                    .map(|segment| Seen::Written {
+                        seg_number: segment.seg_number,
+                        identity: identity.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+                other => vec![Seen::Other(other)],
+            })
+            .collect()
+    }
+
+    async fn checkpoints(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<WriterFact> {
+        let mut facts = Vec::new();
+        while let Some(message) = naming_writer_event(events).await {
+            match message {
+                EngineMsg::ScopedWriter { fact, .. } => facts.push(fact),
+                _ => panic!("scoped writer must retain its generation envelope"),
+            }
+        }
+        facts
+    }
+
+    /// A writer whose input queue stays open, so only the checkpoint's own
+    /// triggers (bytes, coverage, age) can flush it.
+    fn open_writer(
+        dir: &Path,
+    ) -> (
+        mpsc::Sender<WriteCmd>,
+        mpsc::Receiver<EngineMsg>,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = channel(WRITER_QUEUE);
+        let (events, received) = channel(32);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(writer_task(
+            JobId(1),
+            FileId(2),
+            dir.into(),
+            "out".into(),
+            rx,
+            events,
+            stop.clone(),
+            WriterScope::default(),
+            true,
+        ));
+        (tx, received, stop, task)
+    }
+
+    async fn next_checkpoint(events: &mut mpsc::Receiver<EngineMsg>) -> Vec<WrittenSegment> {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), events.recv()).await {
+            Ok(Some(EngineMsg::ScopedWriter {
+                fact: WriterFact::Written { segments, .. },
+                ..
+            })) => segments,
+            other => panic!("expected a checkpoint, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_uncovered_file_is_acknowledged_by_the_checkpoint_age() {
+        // Unknown size (0) and a known size the segments do not cover: only
+        // the age deadline can acknowledge these, and it must.
+        for file_size in [0, 64] {
+            let temp = tempfile::tempdir().unwrap();
+            let (tx, mut events, stop, task) = open_writer(temp.path());
+            let started = tokio::time::Instant::now();
+            tx.send(batch_segment(1, 0, b"ab", file_size))
+                .await
+                .unwrap();
+            tx.send(batch_segment(2, 2, b"cd", file_size))
+                .await
+                .unwrap();
+            let segments = next_checkpoint(&mut events).await;
+            assert!(
+                started.elapsed() >= CHECKPOINT_AGE - std::time::Duration::from_millis(50),
+                "acknowledged only once the checkpoint aged (file_size {file_size})"
+            );
+            assert_eq!(
+                segments.iter().map(|s| s.seg_number).collect::<Vec<_>>(),
+                [1, 2],
+                "both writes share the aged checkpoint (file_size {file_size})"
+            );
+            stop.cancel();
+            drop(tx);
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_bytes_bound_the_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, mut events, stop, task) = open_writer(temp.path());
+        let mib = vec![7u8; 1024 * 1024];
+        let count = (CHECKPOINT_BYTES / mib.len() as u64) as u32 + 1;
+        let file_size = 2 * CHECKPOINT_BYTES;
+        let sender = tokio::spawn(async move {
+            for n in 0..count {
+                tx.send(batch_segment(
+                    n + 1,
+                    u64::from(n) * mib.len() as u64,
+                    &mib,
+                    file_size,
+                ))
+                .await
+                .unwrap();
+            }
+            tx
+        });
+        let first = next_checkpoint(&mut events).await;
+        assert_eq!(
+            first.len() as u64,
+            CHECKPOINT_BYTES / (1024 * 1024),
+            "the checkpoint is due once its pending bytes reach the bound"
+        );
+        assert_eq!(next_checkpoint(&mut events).await.len(), 1);
+        let tx = sender.await.unwrap();
+        stop.cancel();
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_segments_share_one_sync_and_post_sync_identity() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let observed = syncs.clone();
+        let commands = (1..=WRITER_QUEUE)
+            .map(|n| batch_segment(n as u32, (n - 1) as u64, &[n as u8], WRITER_QUEUE as u64))
+            .collect();
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            ..Default::default()
+        };
+        let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert_eq!(facts.len(), WRITER_QUEUE);
+        assert_eq!(
+            syncs.load(Ordering::SeqCst),
+            1,
+            "an already queued prefix shares one durable flush"
+        );
+        let mut first = None;
+        for (index, fact) in facts.iter().enumerate() {
+            let Seen::Written {
+                seg_number,
+                identity,
+            } = fact
+            else {
+                panic!("every valid segment is acknowledged");
+            };
+            assert_eq!(*seg_number, index as u32 + 1);
+            if let Some(expected) = &first {
+                assert_eq!(identity, expected);
+            } else {
+                first = Some(identity.clone());
+            }
+        }
+        assert_eq!(
+            std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
+            (1..=WRITER_QUEUE as u8).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_drains_written_batch_only_after_shared_sync() {
+        use std::sync::{Arc, Mutex};
+        let temp = tempfile::tempdir().unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let entered = Mutex::new(Some(entered));
+        let (release, gate) = std::sync::mpsc::channel();
+        let gate = Mutex::new(gate);
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    if let Some(signal) = entered.lock().unwrap().take() {
+                        let _ = signal.send(());
+                    }
+                    let _ = gate.lock().unwrap().recv();
+                }
+            })),
+            ..Default::default()
+        };
+        let mut commands = (1..=4)
+            .map(|n| batch_segment(n, u64::from(n - 1), &[n as u8], 4))
+            .collect::<Vec<_>>();
+        commands.push(WriteCmd::Finalize {
+            file_size: 4,
+            combined_crc: Some(crc32fast::hash(&[1, 2, 3, 4])),
+        });
+        let (mut events, stop, task) = queued_writer(temp.path(), commands, scope);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        let early = events.try_recv().is_ok();
+        stop.cancel();
+        release.send(()).unwrap();
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert!(
+            !early,
+            "no batch acknowledgement may precede the shared durable flush"
+        );
+        assert_eq!(facts.len(), 4);
+        assert!(facts
+            .iter()
+            .all(|fact| matches!(fact, Seen::Written { .. })));
+        assert!(
+            !temp.path().join("out").exists(),
+            "cancelled queued Finalize must not publish"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
+            [1, 2, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_shared_sync_acknowledges_none_and_retains_all_written_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut commands = vec![WriteCmd::InjectFailure("sync", 28)];
+        commands.extend((1..=4).map(|n| batch_segment(n, u64::from(n - 1), &[n as u8], 4)));
+        let (mut events, _, task) = queued_writer(temp.path(), commands, WriterScope::default());
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            matches!(&facts[0], Seen::Other(WriterFact::Error { error, cause: Some(nzbd_types::HoldCause::Capacity) }) if error.contains("os error 28")),
+            "a failed shared sync on a full volume holds for capacity, not failed/io: {facts:?}"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
+            [1, 2, 3, 4]
+        );
+        assert!(!temp.path().join("out").exists());
+    }
+
+    #[tokio::test]
+    async fn publication_name_and_finalize_do_not_overtake_a_pending_batch() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let observed = syncs.clone();
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            ..Default::default()
+        };
+        let commands = vec![
+            batch_segment(1, 0, b"a", 2),
+            WriteCmd::PublicationName("published.bin".into()),
+            batch_segment(2, 1, b"b", 2),
+            WriteCmd::Finalize {
+                file_size: 2,
+                combined_crc: Some(crc32fast::hash(b"ab")),
+            },
+        ];
+        let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert_eq!(
+            syncs.load(Ordering::SeqCst),
+            2,
+            "a publication command separates durable prefixes"
+        );
+        assert!(matches!(
+            &facts[..],
+            [
+                Seen::Written { seg_number: 1, .. },
+                Seen::Written { seg_number: 2, .. },
+                Seen::Other(WriterFact::Finalized { ok: true, .. })
+            ]
+        ));
+        assert_eq!(
+            std::fs::read(temp.path().join("published.bin")).unwrap(),
+            b"ab"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_rejected_overlap_preserve_batch_acknowledgement_order() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let observed = syncs.clone();
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            })),
+            ..Default::default()
+        };
+        let commands = vec![
+            batch_segment(1, 0, b"ab", 4),
+            batch_segment(1, 0, b"ab", 4),
+            batch_segment(9, 1, b"xx", 4),
+            batch_segment(2, 2, b"cd", 4),
+        ];
+        let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert_eq!(syncs.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            &facts[..],
+            [
+                Seen::Written { seg_number: 1, .. },
+                Seen::Written { seg_number: 1, .. },
+                Seen::Other(WriterFact::Rejected { seg_number: 9, .. }),
+                Seen::Written { seg_number: 2, .. }
+            ]
+        ));
+        assert_eq!(
+            std::fs::read(temp.path().join(".runner-file-2.part")).unwrap(),
+            b"abcd"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_mutation_during_shared_sync_is_not_acknowledged() {
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join(".runner-file-2.part");
+        let changed = part.clone();
+        let scope = WriterScope {
+            sync_test_hook: Some(Arc::new(move |stage| {
+                if stage == "before_sync" {
+                    std::fs::write(&changed, b"foreign mutation").unwrap();
+                }
+            })),
+            ..Default::default()
+        };
+        let commands = vec![batch_segment(1, 0, b"ab", 4), batch_segment(2, 2, b"cd", 4)];
+        let (mut events, _, task) = queued_writer(temp.path(), commands, scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert!(
+            matches!(&facts[..], [Seen::Other(WriterFact::Error { error, cause: None })] if error.contains("identity"))
+        );
+        assert_eq!(std::fs::read(part).unwrap(), b"foreign mutation");
+        assert!(!temp.path().join("out").exists());
+    }
+
+    #[tokio::test]
+    async fn conflicting_aliases_are_an_identity_mismatch_and_discard_starts_fresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join(".runner-file-2.part");
+        std::fs::write(&part, b"old partial").unwrap();
+        std::fs::write(temp.path().join("out"), b"a different object").unwrap();
+        let commands = || vec![batch_segment(1, 0, b"ab", 2)];
+        let (mut events, _, task) = queued_writer(temp.path(), commands(), WriterScope::default());
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert!(
+            matches!(&facts[..], [Seen::Other(WriterFact::IdentityMismatch { error })] if error.contains("aliases")),
+            "{facts:?}"
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), b"old partial");
+
+        let scope = WriterScope {
+            discard_existing: true,
+            ..Default::default()
+        };
+        let (mut events, _, task) = queued_writer(temp.path(), commands(), scope);
+        let facts = batch_facts(&mut events).await;
+        task.await.unwrap();
+        assert!(
+            matches!(&facts[0], Seen::Written { seg_number: 1, .. }),
+            "{facts:?}"
+        );
+        assert!(
+            !temp.path().join("out").exists()
+                || std::fs::read(temp.path().join("out")).unwrap() == b"ab"
+        );
+        let partial = std::fs::read(&part).unwrap_or_default();
+        assert!(!partial.starts_with(b"old"), "the discarded object is gone");
     }
 }

@@ -4,32 +4,104 @@ use std::io::{Read, Seek};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Relocation {
-    source: Artifact,
-    destination: PathBuf,
+    pub(super) source: Artifact,
+    pub(super) destination: PathBuf,
     #[serde(default)]
-    requested_destination: Option<PathBuf>,
-    destination_root: Identity,
-    scratch: Option<Artifact>,
+    pub(super) requested_destination: Option<PathBuf>,
+    pub(super) destination_root: Identity,
+    pub(super) scratch: Option<Artifact>,
     #[serde(default)]
-    registry: bool, // legacy journals only
+    pub(super) registry: bool, // legacy journals only
     #[serde(default)]
-    publication: Option<super::publication::PublishedDirectory>,
+    pub(super) publication: Option<super::publication::PublishedDirectory>,
     #[serde(default)]
-    publication_key: Option<String>,
+    pub(super) publication_key: Option<String>,
     #[serde(default)]
-    cleanup_done: bool,
+    pub(super) cleanup_done: bool,
     #[serde(default)]
-    defer_source_retirement: bool,
-    /// When present, publish this verified subset from a private scratch tree
-    /// while retaining the complete source snapshot for Runner cleanup.
+    pub(super) cleanup: CleanupSchedule,
     #[serde(default)]
-    publication_files: Option<Vec<FileEntry>>,
+    pub(super) defer_source_retirement: bool,
+    /// When present, publish only this verified subset (per file, under the
+    /// journaled `intent`); the rest of the source stays Runner's.
     #[serde(default)]
-    file_outcomes: Vec<DeliveryFileOutcome>,
+    pub(super) publication_files: Option<Vec<FileEntry>>,
     #[serde(default)]
-    source_cleanup_removed: Vec<String>,
+    pub(super) file_outcomes: Vec<DeliveryFileOutcome>,
     #[serde(default)]
-    source_cleanup_current: Option<String>,
+    pub(super) source_cleanup_removed: Vec<String>,
+    #[serde(default)]
+    pub(super) source_cleanup_current: Option<String>,
+    /// Contract §2.5: the `relocation_intents` generation journaling this
+    /// selected publication's per-file move. Set for every selected
+    /// publication since M3; legacy journals have none.
+    #[serde(default)]
+    pub(super) intent: Option<String>,
+    /// Contract §2.6: the destination root could not be created. The move
+    /// has not started; this journal only carries the failure's retry ladder
+    /// (visible with the artifact) until the same request succeeds.
+    #[serde(default)]
+    pub(super) root_pending: bool,
+}
+
+/// How long a missing directory must stay missing before a failed job's
+/// generation is settled gone (`settle_vanished_failed_source`).
+pub const VANISHED_CONFIRM_SECONDS: i64 = 600;
+const VANISHED_REASON: &str = "missing from its verified root";
+
+/// Timed re-verifications a blocked relocation cleanup gets before its
+/// retained source is parked (`exit_blocked_relocation_cleanups`).
+pub(super) const BLOCKED_CLEANUP_ROUNDS: u32 = 6;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(super) struct CleanupSchedule {
+    #[serde(default)]
+    state: CleanupState,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    next_retry: i64,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    wake_revision: u64,
+    #[serde(default)]
+    retry_on_release: bool,
+    /// When the cleanup last became `Blocked` (0: before 0.9.1).
+    #[serde(default)]
+    blocked_at: i64,
+    /// How many timed re-verifications a blocked cleanup has had.
+    #[serde(default)]
+    blocked_rounds: u32,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CleanupState {
+    #[default]
+    Pending,
+    Running,
+    Retry,
+    Blocked,
+    Succeeded,
+}
+
+/// A pre-publication source a failed job's disposition superseded, and
+/// what became of it (`Inventory::retire_superseded_publication_sources`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupersededSource {
+    pub path: PathBuf,
+    pub outcome: SupersededOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SupersededOutcome {
+    /// Removed by closed scope.
+    Retired,
+    /// Parked where it is with the failed TTL (a Park disposition, or a
+    /// blocked retirement): its retention deletion is its exit.
+    Parked(String),
+    /// Still on the relocation's cleanup ladder.
+    Pending(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,12 +124,21 @@ thread_local! { pub(super) static FAULTS: std::cell::RefCell<std::collections::H
 #[cfg(test)]
 thread_local! { pub(super) static FAIL_SOURCE_UNLINK_REFRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
-type CopyGate = Option<(
+type RefreshHook = Box<dyn FnMut(&str)>;
+#[cfg(test)]
+thread_local! {
+    pub(super) static COPY_CHUNK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static CLEANUP_SETTLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static DELIVERY_SETTLE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static REFRESH_FILE_HOOK: std::cell::RefCell<Option<RefreshHook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+type CopyGate = (
     Identity,
     std::sync::Arc<(std::sync::Barrier, std::sync::Barrier)>,
-)>;
+);
 #[cfg(test)]
-pub(super) static COPY_GATE: std::sync::Mutex<CopyGate> = std::sync::Mutex::new(None);
+pub(super) static COPY_GATE: std::sync::Mutex<Vec<CopyGate>> = std::sync::Mutex::new(Vec::new());
 #[cfg(feature = "test-support")]
 static SHARED_TEST_FAULTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<(String, String), i32>>,
@@ -80,7 +161,17 @@ impl Inventory {
         stage: &str,
         errno: i32,
     ) -> Result<RelocationTestFault> {
-        if !matches!(stage, "copy_chunk" | "before_commit") {
+        if !matches!(
+            stage,
+            "copy_chunk"
+                | "before_commit"
+                | "after_first_rename"
+                | "after_rename_before_journal"
+                | "after_last_rename"
+                | "after_manifest"
+                | "after_delivery"
+                | "move_file"
+        ) {
             return Err(Error::Conflict(
                 "unsupported relocation test boundary".into(),
             ));
@@ -95,7 +186,13 @@ impl Inventory {
         Ok(RelocationTestFault { key })
     }
 }
-fn boundary(stage: &'static str, scope: Option<&Identity>) -> Result<()> {
+pub(super) fn boundary(stage: &'static str, scope: Option<&Identity>) -> Result<()> {
+    #[cfg(test)]
+    if stage == "copy_chunk" {
+        if let Some(hook) = COPY_CHUNK_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
     #[cfg(feature = "test-support")]
     if let Some(identity) = scope {
         if let Some(errno) = SHARED_TEST_FAULTS
@@ -112,17 +209,24 @@ fn boundary(stage: &'static str, scope: Option<&Identity>) -> Result<()> {
         return Err(std::io::Error::from_raw_os_error(code).into());
     }
     #[cfg(test)]
-    if matches!(stage, "copy_chunk" | "before_source_cleanup") {
+    if matches!(
+        stage,
+        "copy_chunk" | "move_file" | "before_source_cleanup" | "refresh_file"
+    ) {
         let gate = {
             let mut configured = COPY_GATE.lock().unwrap();
-            if configured
-                .as_ref()
-                .is_some_and(|(expected, _)| scope.is_some_and(|scope| scope == expected))
-            {
-                configured.take().map(|(_, gate)| gate)
-            } else {
-                None
-            }
+            configured
+                .iter()
+                .position(|(expected, _)| {
+                    scope.is_some_and(|scope| {
+                        if stage == "refresh_file" {
+                            scope.same_object(expected)
+                        } else {
+                            scope == expected
+                        }
+                    })
+                })
+                .map(|index| configured.swap_remove(index).1)
         };
         if let Some(gate) = gate {
             gate.0.wait();
@@ -133,9 +237,9 @@ fn boundary(stage: &'static str, scope: Option<&Identity>) -> Result<()> {
     let _ = scope;
     Ok(())
 }
-struct RelocationLease<'a> {
-    inventory: &'a Inventory,
-    id: String,
+pub(super) struct RelocationLease<'a> {
+    pub(super) inventory: &'a Inventory,
+    pub(super) id: String,
 }
 impl Drop for RelocationLease<'_> {
     fn drop(&mut self) {
@@ -200,7 +304,14 @@ impl Inventory {
             let Some(source) = self.for_job(job)? else {
                 return Ok(());
             };
-            let pending = self.pending_relocations(&source.id)?;
+            let mut pending = self.pending_relocations(&source.id)?;
+            // A root-pending journal moved nothing; the retried move itself
+            // supersedes it.
+            pending.retain(|op| {
+                serde_json::from_str::<Relocation>(&op.request)
+                    .map(|movement| !movement.root_pending)
+                    .unwrap_or(true)
+            });
             if pending.is_empty() {
                 return Ok(());
             }
@@ -337,10 +448,17 @@ impl Inventory {
             {
                 continue;
             }
-            let publication_key = movement.publication_key.as_deref().ok_or_else(|| {
-                Error::Conflict("selected publication has no operation key".into())
-            })?;
-            let files = self.selected_publication_file_digests(publication_key)?;
+            let files = match (&movement.intent, movement.publication_key.as_deref()) {
+                (Some(generation), _) => self.intent_delivery_files(generation)?,
+                (None, Some(publication_key)) => {
+                    self.selected_publication_file_digests(publication_key)?
+                }
+                (None, None) => {
+                    return Err(Error::Conflict(
+                        "selected publication has no operation key".into(),
+                    ))
+                }
+            };
             return Ok(Some(SelectedPublication {
                 path: artifact.path,
                 generation: artifact.generation,
@@ -416,10 +534,6 @@ impl Inventory {
     /// could overwrite its tombstone with a stale move's review state. Restore
     /// the journal's result before interpreting any unfinished operations;
     /// never inspect or delete the bytes now occupying the old pathname.
-    #[cfg(test)]
-    pub(super) fn reconcile_deleted_artifacts(&self) -> Result<()> {
-        self.reconcile_deleted_artifacts_snapshot(None)
-    }
     pub(super) fn reconcile_deleted_artifacts_snapshot(
         &self,
         snapshot: Option<&StartupReconciliation>,
@@ -501,7 +615,11 @@ impl Inventory {
     /// Revisions may advance during PP/review, but an operation only owns its
     /// original generation and location while that generation remains live.
     /// Both commit and error handling must obey the same authority check.
-    fn relocation_source(&self, op: &Operation, movement: &Relocation) -> Result<Option<Artifact>> {
+    pub(super) fn relocation_source(
+        &self,
+        op: &Operation,
+        movement: &Relocation,
+    ) -> Result<Option<Artifact>> {
         let persisted = self.operation(&op.id)?;
         let current = self.get(&op.artifact)?;
         let source = &movement.source;
@@ -575,8 +693,8 @@ impl Inventory {
         self.relocate_checked_mode(job, destination, checkpoint, true)
     }
 
-    /// Publish only a verified selected manifest. The source tree is retained
-    /// until the durable Delivery record authorizes its independent cleanup.
+    /// Publish only a verified selected manifest. What is left of the source
+    /// (unselected siblings) retires once the durable Delivery record exists.
     pub fn publish_selected_for_delivery_checked(
         &self,
         job: u32,
@@ -585,13 +703,14 @@ impl Inventory {
         file_outcomes: Vec<DeliveryFileOutcome>,
         checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> Result<RelocationResult> {
-        self.relocate_selected_checked_mode(
+        self.publish_selected_with_transfer(
             job,
             destination,
-            checkpoint,
             selected_files,
             file_outcomes,
+            None,
             true,
+            checkpoint,
         )
     }
 
@@ -606,13 +725,40 @@ impl Inventory {
         file_outcomes: Vec<DeliveryFileOutcome>,
         checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> Result<RelocationResult> {
+        self.publish_selected_with_transfer(
+            job,
+            destination,
+            selected_files,
+            file_outcomes,
+            None,
+            false,
+            checkpoint,
+        )
+    }
+
+    /// Contract §2.5: publish the selected files one by one under a journaled
+    /// intent, manifest last. `transfer` (curator's token) is written into
+    /// `.runner-manifest.json`; `defer_source_retirement` keeps the rest of
+    /// the source until the delivery row exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_selected_with_transfer(
+        &self,
+        job: u32,
+        destination: &Path,
+        selected_files: Vec<FileEntry>,
+        file_outcomes: Vec<DeliveryFileOutcome>,
+        transfer: Option<&str>,
+        defer_source_retirement: bool,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> Result<RelocationResult> {
         self.relocate_selected_checked_mode(
             job,
             destination,
             checkpoint,
             selected_files,
             file_outcomes,
-            false,
+            defer_source_retirement,
+            transfer,
         )
     }
 
@@ -630,9 +776,11 @@ impl Inventory {
             defer_source_retirement,
             None,
             Vec::new(),
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn relocate_selected_checked_mode(
         &self,
         job: u32,
@@ -641,6 +789,7 @@ impl Inventory {
         selected_files: Vec<FileEntry>,
         file_outcomes: Vec<DeliveryFileOutcome>,
         defer_source_retirement: bool,
+        transfer: Option<&str>,
     ) -> Result<RelocationResult> {
         if selected_files.is_empty() || selected_files.iter().any(|entry| entry.identity.directory)
         {
@@ -655,6 +804,7 @@ impl Inventory {
             defer_source_retirement,
             Some(selected_files),
             file_outcomes,
+            transfer,
         )
     }
 
@@ -680,6 +830,7 @@ impl Inventory {
             return Err(Error::Conflict("relocation scratch root changed".into()));
         }
         let mut directories = std::collections::BTreeSet::new();
+        let mut copy_digests = std::collections::BTreeMap::new();
         for entry in copy_files {
             if !source.files.iter().any(|known| known == entry) {
                 return Err(Error::Conflict("relocation source manifest changed".into()));
@@ -729,6 +880,7 @@ impl Inventory {
                     loop {
                         checkpoint()?;
                         let count = file.read(&mut buffer)?;
+                        crate::fileops::payload_read(count);
                         if count == 0 {
                             break;
                         }
@@ -736,12 +888,23 @@ impl Inventory {
                     }
                     Ok(hasher.finalize().to_vec())
                 };
+                let source_hash = digest(&source_file)?;
+                let target_hash = digest(&target_file)?;
                 let equal = target_identity.bytes == entry.identity.bytes
-                    && digest(&source_file)? == digest(&target_file)?
+                    && source_hash == target_hash
                     && fs::identity_for_file(&source_file)? == entry.identity
                     && fs::identity_for_file(&target_file)? == target_identity;
                 if equal {
                     target_file.sync_all()?;
+                    // Replay may retain the conservative double validation;
+                    // the fresh path below never rereads its source.
+                    copy_digests.insert(
+                        entry.path.clone(),
+                        target_hash
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                    );
                     continue;
                 }
                 // The final pathname is never replaced based on a path-only
@@ -789,34 +952,22 @@ impl Inventory {
             let mut output = fs::create_file_exclusive_at(&scratch_root, temp_path)?;
             let created_identity = fs::identity_for_file(&output)?;
             let mut bytes = 0u64;
+            let mut source_digest = Sha256::new();
             let mut buffer = [0u8; 65_536];
             loop {
                 checkpoint()?;
                 let count = input.read(&mut buffer)?;
+                crate::fileops::payload_read(count);
                 if count == 0 {
                     break;
                 }
                 checkpoint()?;
                 output.write_all(&buffer[..count])?;
+                source_digest.update(&buffer[..count]);
                 boundary("copy_chunk", source.identity.as_ref())?;
                 bytes += count as u64;
             }
             output.sync_all()?;
-            let digest = |file: &File| -> Result<Vec<u8>> {
-                let mut file = file.try_clone()?;
-                file.rewind()?;
-                let mut hasher = Sha256::new();
-                let mut buffer = [0u8; 65_536];
-                loop {
-                    checkpoint()?;
-                    let count = file.read(&mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..count]);
-                }
-                Ok(hasher.finalize().to_vec())
-            };
             drop(output);
             // create_file_exclusive_at intentionally returns a write-only
             // descriptor. Reopen the private temporary file read-only before
@@ -826,7 +977,6 @@ impl Inventory {
             let reopened_identity = fs::identity_for_file(&output)?;
             if !created_identity.same_object(&reopened_identity)
                 || bytes != entry.identity.bytes
-                || digest(&input)? != digest(&output)?
                 || fs::identity_for_file(&input)? != entry.identity
                 || fs::identity_for_file(&output)? != reopened_identity
             {
@@ -838,6 +988,10 @@ impl Inventory {
             checkpoint()?;
             fs::rename_exclusive(&scratch.path.join(&temp_name), &scratch.path.join(relative))?;
             fs::sync_directory(&target_parent)?;
+            copy_digests.insert(
+                entry.path.clone(),
+                format!("{:x}", source_digest.finalize()),
+            );
         }
         for directory in directories.iter().rev() {
             let relative = directory.to_str().ok_or_else(|| {
@@ -847,6 +1001,9 @@ impl Inventory {
         }
         fs::sync_directory(&scratch_root)?;
         scratch.files = fs::manifest(&scratch_root, 100_000)?;
+        for file in &mut scratch.files {
+            file.digest = copy_digests.remove(&file.path);
+        }
         let mut expected_paths: std::collections::BTreeSet<String> = copy_files
             .iter()
             .filter(|entry| !entry.identity.directory)
@@ -875,6 +1032,80 @@ impl Inventory {
         Ok(())
     }
 
+    /// Record a destination root that could not be created as a `relocate`
+    /// operation in `retry` (or `review` for an unsupported error) with the
+    /// ladder and the error, and note it on the source artifact.
+    #[allow(clippy::too_many_arguments)]
+    fn journal_root_failure(
+        &self,
+        key: &str,
+        source: &Artifact,
+        destination: &Path,
+        defer_source_retirement: bool,
+        publication_files: &Option<Vec<FileEntry>>,
+        file_outcomes: &[DeliveryFileOutcome],
+        prior_attempts: u32,
+        error: &std::io::Error,
+    ) -> Result<()> {
+        let unsupported = matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        );
+        let attempts = prior_attempts.saturating_add(1);
+        let movement = Relocation {
+            source: source.clone(),
+            destination: destination.into(),
+            requested_destination: Some(destination.into()),
+            // Never read for a root-pending journal: the root does not exist.
+            destination_root: source.root_identity.clone(),
+            scratch: None,
+            registry: false,
+            publication: None,
+            publication_key: None,
+            cleanup_done: false,
+            cleanup: CleanupSchedule::default(),
+            defer_source_retirement,
+            publication_files: publication_files.clone(),
+            file_outcomes: file_outcomes.to_vec(),
+            source_cleanup_removed: Vec::new(),
+            source_cleanup_current: None,
+            intent: None,
+            root_pending: true,
+        };
+        let message = format!(
+            "destination root {} could not be created: {error}",
+            destination.parent().unwrap_or(destination).display()
+        );
+        let op = Operation {
+            id: key.into(),
+            artifact: source.id.clone(),
+            kind: "relocate".into(),
+            state: if unsupported { "review" } else { "retry" }.into(),
+            request: serde_json::to_string(&movement)?,
+            created_at: now(),
+            not_before: 0,
+            attempts,
+            next_retry: if unsupported {
+                0
+            } else {
+                now().saturating_add(retry_delay(attempts))
+            },
+            error: Some(message.clone()),
+        };
+        let _guard = self.mutation_guard()?;
+        let mut current = self.get(&source.id)?;
+        current.error = Some(message);
+        current.updated_at = now();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_operation(&tx, &op)?;
+        save_artifact(&tx, &current)?;
+        event(&tx, &source.id, "relocation_root_unavailable", key)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn relocate_checked_mode_inner(
         &self,
         job: u32,
@@ -883,6 +1114,7 @@ impl Inventory {
         defer_source_retirement: bool,
         publication_files: Option<Vec<FileEntry>>,
         file_outcomes: Vec<DeliveryFileOutcome>,
+        transfer: Option<&str>,
     ) -> Result<RelocationResult> {
         // An explicit same-attempt publication retry may bypass its old I/O
         // deadline. Verify the immutable request before admitting that replay.
@@ -918,10 +1150,25 @@ impl Inventory {
         self.reconcile_relocations_filtered(true, requested_artifact.as_deref())?;
         checkpoint()?;
         let mut source = self.for_job(job)?.ok_or(Error::NotFound)?;
+        if publication_files.is_some() {
+            if let Some(unwound) = self.unwound_intent(&source.id, &source.generation)? {
+                // Contract §2.5: reconciliation unwound this generation's
+                // move because the source was no longer complete. That is an
+                // I/O failure of runner's own storage (`failed/io`, parked).
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "publication unwound: {}",
+                        unwound.evidence.unwrap_or_default()
+                    ),
+                )));
+            }
+        }
         let baseline = source.clone();
         let mut lease = self
             .reserve_processing_mutation(std::slice::from_ref(&source))?
             .ok_or_else(|| Error::Conflict("source namespace custody has not quiesced".into()))?;
+        self.invalidate_writer_naming(job);
         // A committed generation is stable even when its physical path differs
         // from the caller's ordinary destination. Revalidate before reuse.
         let completed = {
@@ -969,6 +1216,42 @@ impl Inventory {
                 published_path: source.path,
             });
         }
+        // A previous attempt of this same request that could not create its
+        // destination root is superseded by this one, which inherits its
+        // attempt count so the ladder keeps climbing.
+        let root_key = format!(
+            "move-root-{}-{}-{:x}",
+            source.id,
+            source.generation,
+            Sha256::digest(destination.as_os_str().as_encoded_bytes())
+        );
+        let prior_root_attempts = match self.operation(&root_key) {
+            Ok(mut prior) if !matches!(prior.state.as_str(), "succeeded" | "cancelled") => {
+                let attempts = prior.attempts;
+                prior.state = "cancelled".into();
+                prior.error = Some("superseded by a retry of the same move".into());
+                let _guard = self.mutation_guard()?;
+                let mut current = self.get(&source.id)?;
+                let mut db = self.db.lock().unwrap();
+                let tx = db.transaction()?;
+                save_operation(&tx, &prior)?;
+                if current
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with("destination root "))
+                {
+                    current.error = None;
+                    save_artifact(&tx, &current)?;
+                }
+                tx.commit()?;
+                drop(db);
+                source.error = current.error;
+                attempts
+            }
+            Ok(prior) => prior.attempts,
+            Err(Error::NotFound) => 0,
+            Err(error) => return Err(error),
+        };
         // The exact-generation namespace lease serializes claims. Revisions are not generations:
         // a review outcome cannot authorize a fresh scratch copy.
         let unresolved: i64 = self.db.lock().unwrap().query_row(
@@ -1000,7 +1283,23 @@ impl Inventory {
         let root = destination
             .parent()
             .ok_or_else(|| Error::Conflict("missing destination root".into()))?;
-        std::fs::create_dir_all(root)?;
+        if let Err(error) = std::fs::create_dir_all(root) {
+            // Contract §2.6: root creation is the move's first filesystem
+            // step, so its failure is journaled like any later one — on the
+            // operation's own retry ladder, visible with the artifact —
+            // instead of vanishing before an operation exists.
+            self.journal_root_failure(
+                &root_key,
+                &source,
+                destination,
+                defer_source_retirement,
+                &publication_files,
+                &file_outcomes,
+                prior_root_attempts,
+                &error,
+            )?;
+            return Err(error.into());
+        }
         let root_dir = fs::open_dir(root)?;
         if destination.try_exists()? {
             return Err(Error::Conflict("move destination already exists".into()));
@@ -1022,11 +1321,39 @@ impl Inventory {
             publication: None,
             publication_key: None,
             cleanup_done: false,
+            cleanup: CleanupSchedule::default(),
             defer_source_retirement,
             publication_files: publication_files.clone(),
             file_outcomes,
             source_cleanup_removed: Vec::new(),
             source_cleanup_current: None,
+            intent: None,
+            root_pending: false,
+        };
+        // Contract §2.5: a selected publication moves file by file under a
+        // journaled intent, inserted with the operation, before any rename.
+        // Review #283-5: a cross-volume move's capacity reservation is held
+        // until the move returns, not dropped once granted.
+        let mut _capacity = None;
+        let intent = match &publication_files {
+            Some(selected) => {
+                let intent = self.new_relocation_intent(
+                    &key,
+                    &source,
+                    selected,
+                    &relocation.file_outcomes,
+                    destination,
+                    &relocation.destination_root,
+                    transfer,
+                )?;
+                relocation.intent = Some(intent.generation.clone());
+                if intent.cross_volume {
+                    let bytes = intent.files.iter().map(|file| file.bytes).sum();
+                    _capacity = Some(crate::capacity::reserve(root, bytes)?);
+                }
+                Some(intent)
+            }
+            None => None,
         };
         let mut op = Operation {
             id: key.clone(),
@@ -1063,6 +1390,9 @@ impl Inventory {
             let tx = db.transaction()?;
             save_artifact(&tx, &source)?;
             save_operation(&tx, &op)?;
+            if let Some(intent) = &intent {
+                super::intents::insert_intent(&tx, intent)?;
+            }
             tx.commit()?;
         }
         let result = (|| {
@@ -1071,6 +1401,14 @@ impl Inventory {
             let destination = relocation.destination.clone();
             boundary("before_move", source.identity.as_ref())?;
             checkpoint()?;
+            if let Some(intent) = intent.clone() {
+                // Only the selected files move; the processing directory,
+                // now holding only unselected siblings, stays runner's.
+                std::fs::create_dir(&destination)?;
+                fs::sync_directory(&root_dir)?;
+                self.finish_intent(intent, checkpoint, source.identity.as_ref())?;
+                return Ok(());
+            }
             let direct_key = format!("{key}-direct");
             let initial = {
                 let mut guard = None;
@@ -1078,11 +1416,13 @@ impl Inventory {
                     .ok_or_else(|| Error::Conflict("relocation authority revoked".into()))?;
                 self.verify(&relocation.source)?;
                 checkpoint()?;
-                if defer_source_retirement || publication_files.is_some() {
-                    // Delivery handoff and selected publication must leave
-                    // the complete processing source intact. A selected tree
-                    // is always staged privately, even on the same volume,
-                    // so unresolved siblings never enter the completed path.
+                if defer_source_retirement
+                    || source.identity.as_ref().is_some_and(|identity| {
+                        identity.device != relocation.destination_root.device
+                    })
+                {
+                    // A whole-directory delivery handoff leaves the complete
+                    // processing source intact; so does a cross-volume move.
                     Err(Error::Io(std::io::Error::from(
                         std::io::ErrorKind::CrossesDevices,
                     )))
@@ -1165,13 +1505,14 @@ impl Inventory {
                         })?;
                         self.verify(&scratch)?;
                         checkpoint()?;
-                        self.publish_directory_unlocked_checked(
+                        self.publish_directory_with_copy_digests_checked(
                             &mut guard,
                             &scratch_path,
                             &destination,
                             &source.id,
                             &copy_key,
                             checkpoint,
+                            Some(&scratch.files),
                         )?
                     };
                     relocation.publication = Some(published);
@@ -1184,6 +1525,12 @@ impl Inventory {
             boundary("before_commit", source.identity.as_ref())?;
             self.commit_relocation_mode(&mut op, &mut relocation, true)
         })();
+        let result = match result {
+            // Test support: the process "died" at an injected crash point;
+            // the journal stays exactly as a crash would leave it.
+            Err(error) if super::intents::take_injected_crash() => return Err(error),
+            other => other,
+        };
         // Validate the old location without the coordinator even on errors.
         let source_available = result.is_err() && self.verify(&relocation.source).is_ok();
         let guard = self.mutation_guard()?;
@@ -1194,7 +1541,7 @@ impl Inventory {
             }
             let unsupported = matches!(&e, Error::Io(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)));
             if matches!(e, Error::Io(_)) && !unsupported {
-                let delay = [30, 60, 120, 300][op.attempts.saturating_sub(1).min(3) as usize];
+                let delay = retry_delay(op.attempts);
                 op.state = "retry".into();
                 op.next_retry = now().saturating_add(delay);
             } else {
@@ -1213,7 +1560,10 @@ impl Inventory {
             }
             // Keep the source identity at its known location when publication
             // did not happen, allowing PP to report retained files accurately.
-            if source_available {
+            // An open per-file intent keeps the source `transitioning`: some
+            // files may already be in the target, and only reconciliation
+            // (finish or unwind) may hand it back.
+            if source_available && intent.is_none() {
                 let mut retained = self.get(&relocation.source.id)?;
                 retained.state = "active".into();
                 retained.error = Some(e.to_string());
@@ -1252,6 +1602,14 @@ impl Inventory {
             .same_object(&fs::identity_for_file(&root_dir)?)
         {
             return Err(Error::Conflict("move destination root changed".into()));
+        }
+        if movement.scratch.is_some() {
+            let source = self.verify(&movement.source)?;
+            if fs::manifest(&source, 100_000)? != movement.source.files {
+                return Err(Error::Conflict(
+                    "source changed before relocation commit".into(),
+                ));
+            }
         }
         boundary("registry_commit", None)?;
         let target = fs::open_dir(&movement.destination)?;
@@ -1357,6 +1715,9 @@ impl Inventory {
         current.identity = Some(target_identity);
         current.files = files;
         current.state = "active".into();
+        // An earlier attempt's failure (a full volume, a refused rename) is
+        // history once the move commits; the row must not keep showing it.
+        current.error = None;
         current.revision += 2;
         self.sidecar(&current)?;
         let mut db = self.db.lock().unwrap();
@@ -1442,9 +1803,10 @@ impl Inventory {
                 ));
             }
         }
+        self.invalidate_source_writer_naming(&source.artifact, &source.generation);
         let ids = {
             let db = self.db.lock().unwrap();
-            let mut statement = db.prepare("SELECT id FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.id')=?1 AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 ORDER BY rowid")?;
+            let mut statement = db.prepare(operation_queries::COMPLETED_RELOCATIONS)?;
             let rows = statement.query_map(params![source.artifact, source.generation], |row| {
                 row.get::<_, String>(0)
             })?;
@@ -1462,12 +1824,713 @@ impl Inventory {
             {
                 continue;
             }
+            if movement.cleanup.state == CleanupState::Retry && movement.cleanup.retry_on_release {
+                let _guard = self.mutation_guard()?;
+                let mut operation = self.operation(&id)?;
+                let mut movement: Relocation = serde_json::from_str(&operation.request)?;
+                if movement.cleanup.state == CleanupState::Retry
+                    && movement.cleanup.retry_on_release
+                {
+                    movement.cleanup.state = CleanupState::Pending;
+                    movement.cleanup.next_retry = 0;
+                    movement.cleanup.retry_on_release = false;
+                    operation.request = serde_json::to_string(&movement)?;
+                    let mut db = self.db.lock().unwrap();
+                    let tx = db.transaction()?;
+                    save_operation(&tx, &operation)?;
+                    tx.execute("INSERT INTO meta(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1", [format!("cleanup-wake:{id}")])?;
+                    tx.execute("UPDATE deliveries SET cleanup_next_retry_at=0 WHERE artifact=?1 AND generation=?2 AND cleanup_status='retry'", params![source.artifact, source.generation])?;
+                    tx.commit()?;
+                }
+            }
             self.retire_relocation_source(&id)?;
         }
         Ok(())
     }
 
+    /// The durable failure a deferred publication move (source retained
+    /// "until the delivery row exists") ended in instead of a delivery — a
+    /// `publish` failure after the bytes were copied out — when its
+    /// remainder may follow the failure's disposition: terminal emitted,
+    /// salvage settled, no open intent, and neither the job, the move's
+    /// source nor the current row keeps its failure.
+    fn failed_publication_remainder(&self, movement: &Relocation) -> Result<Option<Artifact>> {
+        if !movement.defer_source_retirement
+            || movement.cleanup_done
+            || movement.source.keep
+            || movement.source.keep_on_failure
+        {
+            return Ok(None);
+        }
+        let Some(job) = movement.source.job else {
+            return Ok(None);
+        };
+        let Some(terminal) = self.terminal(job)? else {
+            return Ok(None);
+        };
+        if terminal.outcome != nzbd_types::TerminalOutcome::Failed
+            || terminal.keep_on_failure
+            || !terminal.emitted
+            || terminal.salvage == SalvageState::Pending
+            || self.open_intent_for_job(job)?
+        {
+            return Ok(None);
+        }
+        let current = match self.get(&movement.source.id) {
+            Ok(current) => current,
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if current.keep
+            || current.keep_on_failure
+            || current.hold.is_some()
+            || current.generation != movement.source.generation
+            || current.path == movement.source.path
+        {
+            return Ok(None);
+        }
+        Ok(Some(current))
+    }
+
+    /// Closed scope (W4) for a failed publication's remainder is granted
+    /// only by a **Delete** disposition: the published generation itself
+    /// was deleted (`deleted`, by a succeeded delete operation of this
+    /// artifact). A Park disposition keeps payload for recovery — PAR
+    /// volumes, unextracted archives — so it never grants it
+    /// (`park_superseded_publication_sources` parks the remainder instead).
+    /// A merely terminal row (`source_gone`) is not proof of a deletion.
+    pub(super) fn publication_superseded_by_failure(&self, movement: &Relocation) -> Result<bool> {
+        let Some(current) = self.failed_publication_remainder(movement)? else {
+            return Ok(false);
+        };
+        if current.state != "deleted" {
+            return Ok(false);
+        }
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='delete')",
+            [&current.id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The published generation was relocated onward from the move's
+    /// destination by a committed relocation (a Park disposition).
+    fn publication_relocated_onward(
+        &self,
+        movement: &Relocation,
+        current: &Artifact,
+    ) -> Result<bool> {
+        if current.path == movement.destination || current.terminal() {
+            return Ok(false);
+        }
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM operations WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='relocate'",
+            )?;
+            let rows = statement.query_map([&movement.source.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in raws {
+            let op: Operation = serde_json::from_str(&raw)?;
+            let Ok(onward) = serde_json::from_str::<Relocation>(&op.request) else {
+                continue;
+            };
+            if onward.source.path == movement.destination && onward.destination == current.path {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The job's deferred publication moves that have not retired their
+    /// source, oldest first.
+    fn deferred_publication_moves(&self, job: u32) -> Result<Vec<(String, Relocation)>> {
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT o.id FROM operations o JOIN artifacts a ON a.id=o.artifact WHERE a.job=?1 AND o.state='succeeded' AND json_extract(o.data,'$.kind')='relocate' ORDER BY o.rowid",
+            )?;
+            let rows = statement.query_map([job], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut moves = Vec::new();
+        for key in raws {
+            let movement: Relocation = serde_json::from_str(&self.operation(&key)?.request)?;
+            if movement.defer_source_retirement && !movement.cleanup_done {
+                moves.push((key, movement));
+            }
+        }
+        Ok(moves)
+    }
+
+    /// Delete disposition: retire every pre-publication source of `job`
+    /// that the deletion superseded (`publication_superseded_by_failure`),
+    /// by closed scope on its relocation's own cleanup ladder. A retirement
+    /// the cleanup blocks is parked in place with the failed TTL — its
+    /// retention deletion re-snapshots the closed scope — so it never waits
+    /// on a person.
+    pub fn retire_superseded_publication_sources(&self, job: u32) -> Result<Vec<SupersededSource>> {
+        let mut sources = Vec::new();
+        for (key, movement) in self.deferred_publication_moves(job)? {
+            if !self.publication_superseded_by_failure(&movement)? {
+                continue;
+            }
+            let path = movement.source.path.clone();
+            let attempt = self.retire_relocation_source(&key);
+            let after: Relocation = serde_json::from_str(&self.operation(&key)?.request)?;
+            let outcome = if after.cleanup_done {
+                SupersededOutcome::Retired
+            } else if after.cleanup.state == CleanupState::Blocked {
+                let reason = after.cleanup.error.unwrap_or_default();
+                self.park_publication_remainder(&key, &reason)?;
+                SupersededOutcome::Parked(format!("retirement blocked ({reason})"))
+            } else {
+                SupersededOutcome::Pending(match attempt {
+                    Err(error) => error.to_string(),
+                    Ok(()) => after
+                        .cleanup
+                        .error
+                        .unwrap_or_else(|| "source cleanup is pending".into()),
+                })
+            };
+            sources.push(SupersededSource { path, outcome });
+        }
+        Ok(sources)
+    }
+
+    /// Park disposition: the published generation was parked onward, and the
+    /// pre-publication remainder (PAR volumes, archives, anything the
+    /// publication did not take) is parked where it is with the failed TTL,
+    /// under Runner's custody, instead of retiring by closed scope. Its
+    /// retention TTL is its exit; nothing is deleted now.
+    pub fn park_superseded_publication_sources(&self, job: u32) -> Result<Vec<SupersededSource>> {
+        let mut sources = Vec::new();
+        for (key, movement) in self.deferred_publication_moves(job)? {
+            let Some(current) = self.failed_publication_remainder(&movement)? else {
+                continue;
+            };
+            if !self.publication_relocated_onward(&movement, &current)? {
+                continue;
+            }
+            let path = movement.source.path.clone();
+            let outcome = match self
+                .park_publication_remainder(&key, "the publication was parked")?
+            {
+                Some(_) => SupersededOutcome::Parked("parked in place with the failed TTL".into()),
+                None => SupersededOutcome::Retired,
+            };
+            sources.push(SupersededSource { path, outcome });
+        }
+        Ok(sources)
+    }
+
+    /// A failed (or cancelled) job's current generation whose directory is
+    /// missing from its verified root (nuc4 job 2710: parked, then removed
+    /// outside Runner) can never be moved or deleted; every disposal attempt
+    /// failed ENOENT. Absence is proven, not assumed: under the mutation
+    /// coordinator the root verifies, the root directory can be listed, and
+    /// `fstatat` relative to the root descriptor finds no entry — on two
+    /// passes at least [`VANISHED_CONFIRM_SECONDS`] apart (the first records
+    /// `first_missing_at`; an entry that reappears clears it). Nothing may
+    /// be in flight: no queued/running operation of any kind on the
+    /// artifact, no open intent for the job, and a `transitioning` row only
+    /// once its transforms have ended. Then, in one transaction, the row is
+    /// settled `source_gone` (its inventory kept, `gone_reason`: gone, not
+    /// removed by Runner) and each pre-publication remainder of the job —
+    /// the job's original download, nothing else depends on it — is parked
+    /// in place with the failed TTL. A row already settled this way with a
+    /// remainder still unparked (a crash between) resumes. Returns the
+    /// disposal note when settled.
+    pub fn settle_vanished_failed_source(&self, job: u32) -> Result<Option<String>> {
+        let Some(terminal) = self.terminal(job)? else {
+            return Ok(None);
+        };
+        if !matches!(
+            terminal.outcome,
+            nzbd_types::TerminalOutcome::Failed | nzbd_types::TerminalOutcome::Cancelled
+        ) || !terminal.emitted
+            || terminal.salvage == SalvageState::Pending
+        {
+            return Ok(None);
+        }
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let _guard = self.mutation_guard()?;
+        let Some(current) = self.for_job(job)? else {
+            return Ok(None);
+        };
+        let resuming = current.state == "source_gone"
+            && current.gone_reason.as_deref() == Some(VANISHED_REASON);
+        if !resuming {
+            if !current.owned
+                || !matches!(
+                    current.state.as_str(),
+                    "active" | "transitioning" | "retained" | "parked_failed"
+                )
+                || self.artifact_in_use(&current)?
+                || self.open_intent_for_job(job)?
+            {
+                return Ok(None);
+            }
+            let db = self.db.lock().unwrap();
+            let in_flight: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state IN ('queued','running'))",
+                [&current.id],
+                |row| row.get(0),
+            )?;
+            let transforms_open: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE artifact=?1 AND state NOT IN ('succeeded','cancelled','failed','transferred') AND json_extract(data,'$.kind') IN ('par_restore','par_repair','extract'))",
+                [&current.id],
+                |row| row.get(0),
+            )?;
+            drop(db);
+            if in_flight || (current.state == "transitioning" && transforms_open) {
+                return Ok(None);
+            }
+            // Proven absence: the root verifies and can be listed, and the
+            // name is absent relative to the root descriptor.
+            let Ok(root) = self.verify_root(&current) else {
+                return Ok(None);
+            };
+            let Some(name) = current
+                .path
+                .strip_prefix(&current.root)
+                .ok()
+                .filter(|relative| relative.components().count() == 1)
+                .map(|relative| relative.as_os_str().to_owned())
+            else {
+                return Ok(None);
+            };
+            if fs::names(&root).is_err() {
+                return Ok(None);
+            }
+            let key = format!("vanished:{}:{}", current.id, current.generation);
+            let missing = match fs::entry_missing_at(&root, &name) {
+                Ok(missing) => missing,
+                Err(_) => return Ok(None),
+            };
+            let db = self.db.lock().unwrap();
+            if !missing {
+                db.execute("DELETE FROM meta WHERE key=?1", [&key])?;
+                return Ok(None);
+            }
+            let first: Option<i64> = db
+                .query_row(
+                    "SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(first) = first else {
+                db.execute(
+                    "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+                    params![key, now().to_string()],
+                )?;
+                return Ok(None);
+            };
+            if now() < first.saturating_add(VANISHED_CONFIRM_SECONDS) {
+                return Ok(None);
+            }
+        }
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        if !resuming {
+            let mut gone = current.clone();
+            gone.state = "source_gone".into();
+            gone.hold = None;
+            gone.gone_reason = Some(VANISHED_REASON.into());
+            gone.revision += 1;
+            gone.updated_at = now();
+            save_artifact(&tx, &gone)?;
+            event(
+                &tx,
+                &gone.id,
+                "source_gone",
+                "directory missing from its verified root on two passes; not removed by Runner",
+            )?;
+            tx.execute(
+                "DELETE FROM meta WHERE key=?1",
+                [format!("vanished:{}:{}", current.id, current.generation)],
+            )?;
+        }
+        let keys = {
+            let mut statement = tx.prepare(
+                "SELECT o.id FROM operations o WHERE o.artifact=?1 AND o.state='succeeded' AND json_extract(o.data,'$.kind')='relocate' ORDER BY o.rowid",
+            )?;
+            let rows = statement.query_map([&current.id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut parked = Vec::new();
+        for key in keys {
+            let raw: String =
+                tx.query_row("SELECT data FROM operations WHERE id=?1", [&key], |row| {
+                    row.get(0)
+                })?;
+            let op: Operation = serde_json::from_str(&raw)?;
+            let movement: Relocation = serde_json::from_str(&op.request)?;
+            if !movement.defer_source_retirement || movement.cleanup_done {
+                continue;
+            }
+            let row: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM artifacts WHERE id=?1",
+                    [format!("source-{key}")],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(row) = row else {
+                continue;
+            };
+            let mut row: Artifact = serde_json::from_str(&row)?;
+            if row.terminal() || row.state == "parked_failed" || row.keep || row.keep_on_failure {
+                continue;
+            }
+            row.hold = None;
+            row.owned = true;
+            row.state = "parked_failed".into();
+            row.automatic_cleanup_eligible = true;
+            row.retention_seconds = ttl.max(1) as u64;
+            row.deadline = Some(now().saturating_add(ttl.max(0)));
+            row.revision += 1;
+            row.updated_at = now();
+            save_artifact(&tx, &row)?;
+            event(
+                &tx,
+                &row.id,
+                "publication_remainder_parked",
+                "the job's original download, parked with the failed TTL: its published copy is gone",
+            )?;
+            parked.push(row.path.display().to_string());
+        }
+        tx.commit()?;
+        for path in &parked {
+            tracing::info!(job, path = %path, "failed job's original download parked with the failed TTL (its published copy is gone)");
+        }
+        let gone = format!(
+            "gone: {} (missing from its verified root; not removed by Runner)",
+            current.path.display()
+        );
+        Ok(Some(if parked.is_empty() {
+            gone
+        } else {
+            format!(
+                "{gone}; original download parked with the failed TTL at {}",
+                parked.join(", ")
+            )
+        }))
+    }
+
+    /// Park a relocation's retained source row (`source-<op>`) in place with
+    /// the failed TTL. `None` when it is already gone; idempotent.
+    fn park_publication_remainder(&self, key: &str, why: &str) -> Result<Option<Artifact>> {
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let _guard = self.mutation_guard()?;
+        let mut row = match self.get(&format!("source-{key}")) {
+            Ok(row) => row,
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if row.terminal() {
+            return Ok(None);
+        }
+        if row.state == "parked_failed" {
+            return Ok(Some(row));
+        }
+        row.hold = None;
+        row.owned = true;
+        row.state = "parked_failed".into();
+        row.automatic_cleanup_eligible = true;
+        row.retention_seconds = ttl.max(1) as u64;
+        row.deadline = Some(now().saturating_add(ttl.max(0)));
+        row.revision += 1;
+        row.updated_at = now();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_artifact(&tx, &row)?;
+        event(
+            &tx,
+            &row.id,
+            "publication_remainder_parked",
+            &format!("failed publication's remainder parked with the failed TTL: {why}"),
+        )?;
+        tx.commit()?;
+        Ok(Some(row))
+    }
+
+    /// Timed exit of a blocked relocation cleanup (no-wedge rule: nothing
+    /// waits on a person). A blocked cleanup older than `cutoff` is
+    /// re-verified on a backoff — its cleanup goes back to `retry` (a
+    /// delivery's cleanup with it) so the normal drivers re-snapshot and
+    /// retry it; identities that only moved with a remount rebind
+    /// (`Identity::same_object`). After `BLOCKED_CLEANUP_ROUNDS` the
+    /// retained source row is parked: for a delivered success, or a failure
+    /// whose publication a Delete removed, with an immediate deadline
+    /// (closed-scope removal by retention); otherwise with the failed TTL.
+    /// Once that row is gone the cleanup is closed. Returns how many
+    /// cleanups moved.
+    pub(super) fn exit_blocked_relocation_cleanups(&self, cutoff: i64) -> Result<usize> {
+        let raws = {
+            let db = self.db.lock().unwrap();
+            let mut statement = db.prepare(
+                "SELECT data FROM operations WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.cleanup.state')='blocked' AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.blocked_at'),0)<=?1 ORDER BY rowid LIMIT 200",
+            )?;
+            let rows = statement.query_map([cutoff], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let ttl = i64::from(self.settings()?.failed_retention_days) * 86400;
+        let mut moved = 0;
+        for raw in raws {
+            let snapshot: Operation = serde_json::from_str(&raw)?;
+            let _guard = self.mutation_guard()?;
+            let mut op = self.operation(&snapshot.id)?;
+            if op.request != snapshot.request {
+                continue;
+            }
+            let mut movement: Relocation = serde_json::from_str(&op.request)?;
+            let source_row = match self.get(&format!("source-{}", op.id)) {
+                Ok(row) => Some(row),
+                Err(Error::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            let delivered_success: bool = self.db.lock().unwrap().query_row(
+                "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2 AND json_extract(data,'$.terminalOutcome')='SUCCESS')",
+                params![movement.source.id, movement.source.generation],
+                |row| row.get(0),
+            )?;
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
+            if movement.cleanup.blocked_rounds < BLOCKED_CLEANUP_ROUNDS {
+                movement.cleanup.blocked_rounds += 1;
+                movement.cleanup.state = CleanupState::Retry;
+                // Round 1 retries now (the block already aged past the
+                // grace); later rounds back off 1 h, 2 h, … capped at a day.
+                let backoff = super::exits::HOLD_EXIT_SECONDS
+                    .saturating_mul((1i64 << (movement.cleanup.blocked_rounds - 1).min(6)) - 1)
+                    .min(86400);
+                movement.cleanup.next_retry = now().saturating_add(backoff);
+                tx.execute(
+                    "UPDATE deliveries SET cleanup_status='retry',cleanup_next_retry_at=?3 WHERE artifact=?1 AND generation=?2 AND cleanup_status='blocked'",
+                    params![movement.source.id, movement.source.generation, movement.cleanup.next_retry],
+                )?;
+            } else if let Some(mut row) = source_row.filter(|row| !row.terminal()) {
+                // Out of rounds: the retained source gets its timed exit.
+                if row.keep || row.keep_on_failure || !row.owned {
+                    // A person's or the job's Keep is the policy exit; the
+                    // cleanup stops asking.
+                    movement.cleanup.state = CleanupState::Retry;
+                    movement.cleanup.next_retry = i64::MAX / 2;
+                } else if row.state != "parked_failed" {
+                    let immediate =
+                        delivered_success || self.publication_superseded_by_failure(&movement)?;
+                    let wait = if immediate { 0 } else { ttl.max(0) };
+                    row.hold = None;
+                    row.state = "parked_failed".into();
+                    row.automatic_cleanup_eligible = true;
+                    row.retention_seconds = wait.max(1) as u64;
+                    row.deadline = Some(now().saturating_add(wait));
+                    row.revision += 1;
+                    row.updated_at = now();
+                    save_artifact(&tx, &row)?;
+                    event(
+                        &tx,
+                        &row.id,
+                        "automatic_exit",
+                        &format!(
+                            "source cleanup stayed blocked ({}); parked for retention",
+                            movement.cleanup.error.as_deref().unwrap_or("blocked")
+                        ),
+                    )?;
+                    movement.cleanup.state = CleanupState::Retry;
+                    movement.cleanup.next_retry =
+                        row.deadline.unwrap_or_default().saturating_add(60);
+                } else {
+                    movement.cleanup.state = CleanupState::Retry;
+                    movement.cleanup.next_retry =
+                        row.deadline.unwrap_or_default().saturating_add(60);
+                }
+            } else {
+                // The retained source is gone (retention removed it, or it
+                // never existed): nothing is left to retire.
+                movement.cleanup_done = true;
+                movement.cleanup.state = CleanupState::Succeeded;
+                movement.cleanup.error = None;
+                tx.execute(
+                    "UPDATE deliveries SET cleanup_status='succeeded',cleanup_error=NULL,cleanup_next_retry_at=NULL,cleanup_blocked_since=NULL WHERE artifact=?1 AND generation=?2",
+                    params![movement.source.id, movement.source.generation],
+                )?;
+            }
+            op.request = serde_json::to_string(&movement)?;
+            save_operation(&tx, &op)?;
+            tx.commit()?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
     fn retire_relocation_source(&self, key: &str) -> Result<()> {
+        let op = self.operation(key)?;
+        let movement: Relocation = serde_json::from_str(&op.request)?;
+        let delivery: Option<String> = self.db.lock().unwrap().query_row(
+            "SELECT id FROM deliveries WHERE artifact=?1 AND generation=?2 ORDER BY sequence DESC LIMIT 1",
+            params![movement.source.id, movement.source.generation], |r| r.get(0)
+        ).optional()?;
+        if let Some(id) = delivery {
+            self.retire_delivery_source(&id)?;
+            return Ok(());
+        }
+        match self.run_relocation_cleanup(key) {
+            Err(Error::CleanupBlocked(_)) => Ok(()),
+            result => result,
+        }
+    }
+
+    /// One durable claim governs sweeps, completion and explicit retries.
+    fn run_relocation_cleanup(&self, key: &str) -> Result<()> {
+        {
+            let _guard = self.mutation_guard()?;
+            let mut op = self.operation(key)?;
+            let mut movement: Relocation = serde_json::from_str(&op.request)?;
+            if op.state != "succeeded" || movement.cleanup_done {
+                return Ok(());
+            }
+            if movement.cleanup.state == CleanupState::Blocked {
+                return Err(Error::CleanupBlocked(
+                    movement.cleanup.error.unwrap_or_default(),
+                ));
+            }
+            if movement.cleanup.state == CleanupState::Running
+                || movement.cleanup.next_retry > now()
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into());
+            }
+            if movement.defer_source_retirement {
+                let ready: bool = self.db.lock().unwrap().query_row(
+                    "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2)",
+                    params![movement.source.id, movement.source.generation],
+                    |r| r.get(0),
+                )?;
+                if !ready
+                    && !self.cluster_retirement_accepted(
+                        &movement.source.id,
+                        &movement.source.generation,
+                    )?
+                    && !self.publication_superseded_by_failure(&movement)?
+                {
+                    return Ok(());
+                }
+            }
+            movement.cleanup.state = CleanupState::Running;
+            movement.cleanup.retry_on_release = false;
+            movement.cleanup.attempts = movement.cleanup.attempts.saturating_add(1);
+            movement.cleanup.wake_revision =
+                Self::cleanup_wake_revision(&self.db.lock().unwrap(), key)?;
+            op.request = serde_json::to_string(&movement)?;
+            save_operation(&self.db.lock().unwrap(), &op)?;
+        }
+        let result = self.retire_relocation_source_inner(key);
+        #[cfg(test)]
+        if let Some(hook) = CLEANUP_SETTLE_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        let _guard = self.mutation_guard()?;
+        let mut op = self.operation(key)?;
+        let mut movement: Relocation = serde_json::from_str(&op.request)?;
+        let wake_revision = Self::cleanup_wake_revision(&self.db.lock().unwrap(), key)?;
+        let result = if result.is_err() && wake_revision != movement.cleanup.wake_revision {
+            // Policy can change while the worker unwinds. Its independently
+            // persisted wake counter cannot be overwritten by copy checkpoints.
+            Err(Error::CleanupRetry {
+                next_retry: now(),
+                reason: "cleanup eligibility changed during the attempt".into(),
+            })
+        } else {
+            result
+        };
+        let result = match result {
+            Ok(()) => {
+                movement.cleanup.state = if movement.cleanup_done {
+                    CleanupState::Succeeded
+                } else {
+                    CleanupState::Pending
+                };
+                Ok(())
+            }
+            Err(error @ Error::CleanupRetry { .. }) => {
+                if let Error::CleanupRetry { next_retry, reason } = &error {
+                    movement.cleanup.state = CleanupState::Retry;
+                    movement.cleanup.next_retry = *next_retry;
+                    movement.cleanup.error = Some(reason.clone());
+                }
+                Err(error)
+            }
+            Err(error @ (Error::Io(_) | Error::Sql(_))) => {
+                movement.cleanup.state = CleanupState::Retry;
+                movement.cleanup.retry_on_release =
+                    matches!(&error,Error::Io(e) if e.kind()==std::io::ErrorKind::WouldBlock);
+                let delay = retry_delay(movement.cleanup.attempts);
+                movement.cleanup.next_retry = now().saturating_add(delay);
+                movement.cleanup.error = Some(error.to_string());
+                Err(error)
+            }
+            Err(error) => {
+                let message = error.to_string();
+                movement.cleanup.state = CleanupState::Blocked;
+                movement.cleanup.error = Some(message.clone());
+                movement.cleanup.blocked_at = now();
+                tracing::warn!(operation=%key, error=%message, "source cleanup blocked; waiting for policy change or explicit retry");
+                Err(Error::CleanupBlocked(message))
+            }
+        };
+        op.request = serde_json::to_string(&movement)?;
+        save_operation(&self.db.lock().unwrap(), &op)?;
+        result
+    }
+
+    fn cleanup_wake_revision(db: &Connection, key: &str) -> Result<u64> {
+        Ok(db
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1",
+                [format!("cleanup-wake:{key}")],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .max(0) as u64)
+    }
+
+    /// Wake permits re-evaluation, never new byte-deletion authority. The
+    /// caller holds its policy transaction and exact generation guard.
+    pub(super) fn wake_relocation_cleanup(
+        db: &Connection,
+        artifact: &str,
+        generation: &str,
+    ) -> Result<()> {
+        let raws = {
+            let mut statement = db.prepare(operation_queries::WAKE_RELOCATION_CLEANUP)?;
+            let rows = statement.query_map([generation], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for raw in raws {
+            let mut op: Operation = serde_json::from_str(&raw)?;
+            let mut movement: Relocation = serde_json::from_str(&op.request)?;
+            if !movement.cleanup_done
+                && (movement.source.id == artifact || format!("source-{}", op.id) == artifact)
+            {
+                db.execute("INSERT INTO meta(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",[format!("cleanup-wake:{}",op.id)])?;
+                if movement.cleanup.state != CleanupState::Running {
+                    movement.cleanup.state = CleanupState::Pending;
+                    movement.cleanup.next_retry = 0;
+                    movement.cleanup.error = None;
+                    op.request = serde_json::to_string(&movement)?;
+                    save_operation(db, &op)?;
+                }
+                db.execute("UPDATE deliveries SET cleanup_status='retry',cleanup_next_retry_at=0 WHERE artifact=?1 AND generation=?2 AND cleanup_status IN ('blocked','retry')", params![movement.source.id,movement.source.generation])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_relocation_source_inner(&self, key: &str) -> Result<()> {
         let mut op = self.operation(key)?;
         let mut movement: Relocation = serde_json::from_str(&op.request)?;
         if op.state != "succeeded" || movement.cleanup_done {
@@ -1488,23 +2551,44 @@ impl Inventory {
                 || self.cluster_retirement_accepted(
                     &movement.source.id,
                     &movement.source.generation,
-                )?;
+                )?
+                || self.publication_superseded_by_failure(&movement)?;
             if !ready || !movement.source.delivery_lifecycle {
                 return Err(Error::Conflict(
                     "deferred relocation source cannot retire before durable delivery".into(),
                 ));
             }
         }
+        // A per-file publication's processing directory is the same source
+        // generation a post-processing attempt may still hold: retire it only
+        // once that custody is released.
+        let _intent_lease = match movement.intent {
+            Some(_) => Some(
+                self.reserve_reconciliation(&[self.get(&op.artifact)?])?
+                    .ok_or_else(|| {
+                        Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                    })?,
+            ),
+            None => None,
+        };
         if let Some(scratch) = &movement.scratch {
             if let Some(publication_key) = &movement.publication_key {
                 let participants = [self.get(&op.artifact)?, self.get(&scratch.id)?];
                 let _lease = self.reserve_reconciliation(&participants)?.ok_or_else(|| {
-                    Error::Conflict("publication cleanup custody is already active".into())
+                    Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))
                 })?;
                 self.retire_publication_source_unlocked(&mut None, publication_key)?;
+                if movement
+                    .publication
+                    .as_ref()
+                    .is_some_and(|p| p.source_retained)
+                {
+                    self.refresh_hardlink_publication_after_source_unlink(&movement)?;
+                }
             }
         }
         let expected_source_record = movement.scratch.is_some()
+            || movement.intent.is_some()
             || movement
                 .publication
                 .as_ref()
@@ -1550,6 +2634,14 @@ impl Inventory {
                         };
                         let result = self.execute_delete(&deletion.id)?;
                         if result.state != "succeeded" {
+                            if matches!(result.state.as_str(), "retry" | "queued" | "running") {
+                                return Err(Error::CleanupRetry {
+                                    next_retry: result.next_retry.max(now()),
+                                    reason: result
+                                        .error
+                                        .unwrap_or_else(|| "source deletion is pending".into()),
+                                });
+                            }
                             return Err(Error::Conflict(format!(
                                 "source retirement {}: {}",
                                 result.state,
@@ -1571,11 +2663,10 @@ impl Inventory {
         // Source deletion and this manifest refresh are separate durable
         // writes. Re-run the digest-bound refresh even when the source row is
         // already terminal, covering a crash immediately after unlink.
-        if movement.scratch.is_none()
-            && movement
-                .publication
-                .as_ref()
-                .is_some_and(|publication| publication.source_retained)
+        if movement
+            .publication
+            .as_ref()
+            .is_some_and(|publication| publication.source_retained)
         {
             self.refresh_hardlink_publication_after_source_unlink(&movement)?;
         }
@@ -1606,9 +2697,25 @@ impl Inventory {
             return Err(std::io::Error::from_raw_os_error(libc::EIO).into());
         }
         let published = self.get(&movement.source.id)?;
+        // A failed job's disposition already took the publication (parked it
+        // onward, which re-snapshotted it, or deleted it): there is no
+        // hard-linked publication at the destination left to refresh.
+        // The publication no longer exists as this generation (deleted, or
+        // gone since), or the failed job's disposition parked it onward
+        // (which re-snapshotted it): there is no hard-linked publication at
+        // the destination left to refresh.
+        if published.generation == movement.source.generation
+            && ((published.terminal() && published.path != movement.source.path)
+                || self.publication_relocated_onward(movement, &published)?)
+        {
+            return Ok(());
+        }
         if published.generation != movement.source.generation
             || published.path != movement.destination
-            || published.state != "active"
+            || !matches!(
+                published.state.as_str(),
+                "active" | "completed" | "retained" | "transferred"
+            )
         {
             return Err(Error::Conflict(
                 "published generation changed during source unlink".into(),
@@ -1616,6 +2723,9 @@ impl Inventory {
         }
         let root = self.verify(&published)?;
         let observed = fs::manifest(&root, 100_000)?;
+        if observed == published.files {
+            return Ok(());
+        }
         if observed.len() != published.files.len() {
             return Err(Error::Conflict(
                 "published manifest changed during source unlink".into(),
@@ -1677,8 +2787,16 @@ impl Inventory {
                 }
                 let mut hasher = Sha256::new();
                 let mut buffer = [0u8; 64 * 1024];
+                #[cfg(test)]
+                REFRESH_FILE_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook(&actual.path);
+                    }
+                });
+                boundary("refresh_file", Some(&actual.identity))?;
                 loop {
                     let read = file.read(&mut buffer)?;
+                    crate::fileops::payload_read(read);
                     if read == 0 {
                         break;
                     }
@@ -1695,10 +2813,18 @@ impl Inventory {
             }
         }
         let _guard = self.mutation_guard()?;
+        let rebound = fs::open_dir(&movement.destination)?;
+        if !fs::identity_for_file(&root)?.same_object(&fs::identity_for_file(&rebound)?)
+            || fs::manifest(&rebound, 100_000)? != observed
+        {
+            return Err(Error::Conflict(
+                "published manifest changed during cleanup verification".into(),
+            ));
+        }
         let mut current = self.get(&movement.source.id)?;
         if current.generation != published.generation
             || current.path != published.path
-            || current.state != "active"
+            || current.state != published.state
         {
             return Err(Error::Conflict(
                 "published generation changed while refreshing source-unlink identity".into(),
@@ -1715,6 +2841,75 @@ impl Inventory {
         current.files = observed;
         current.revision += 1;
         save_artifact(&self.db.lock().unwrap(), &current)
+    }
+
+    /// Remove everything under a closed-scope source root, deepest first,
+    /// by raw name under the verified root descriptor: no per-file identity or
+    /// classification (a PAR repair may have rewritten a part; NFS may have
+    /// moved a ctime), and nothing is retained for review. Records every
+    /// outcome `removed` on the operation and the delivery row.
+    fn remove_closed_scope_tree(
+        &self,
+        op: &mut Operation,
+        movement: &mut Relocation,
+        source: &mut Artifact,
+        root: &File,
+    ) -> Result<()> {
+        // Raw names, never followed, bottom-up, on the root's device only:
+        // a name a manifest refuses (symlink, special file, non-UTF-8,
+        // depth, count) must not block closed-scope cleanup forever.
+        let removal = fs::remove_tree_contents(root)?;
+        if removal.foreign_mounts > 0 {
+            tracing::warn!(
+                artifact = %source.id,
+                mounts = removal.foreign_mounts,
+                "closed-scope cleanup left mounted directories inside the source tree"
+            );
+        }
+        fs::sync_directory(root)?;
+        for outcome in &mut movement.file_outcomes {
+            outcome.source_cleanup_status = "removed".into();
+            if !movement
+                .source_cleanup_removed
+                .contains(&outcome.source_path)
+                && outcome.publication_path.is_none()
+            {
+                movement
+                    .source_cleanup_removed
+                    .push(outcome.source_path.clone());
+            }
+        }
+        movement.source_cleanup_current = None;
+        source.files.clear();
+        op.request = serde_json::to_string(movement)?;
+        let _coordinator = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        save_operation(&tx, op)?;
+        save_artifact(&tx, source)?;
+        if let Some(raw) = tx
+            .query_row(
+                "SELECT data FROM deliveries WHERE artifact=?1 AND generation=?2",
+                params![movement.source.id, movement.source.generation],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let mut delivery: crate::artifacts::Delivery = serde_json::from_str(&raw)?;
+            for row in &mut delivery.file_outcomes {
+                row.source_cleanup_status = "removed".into();
+            }
+            tx.execute(
+                "UPDATE deliveries SET data=?3 WHERE artifact=?1 AND generation=?2",
+                params![
+                    movement.source.id,
+                    movement.source.generation,
+                    super::delivery::delivery_row_json(&delivery)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn retire_selected_source_entries(
@@ -1740,9 +2935,7 @@ impl Inventory {
         }
         let _lease = self
             .reserve_reconciliation_locked(std::slice::from_ref(&current), None, &coordinator)?
-            .ok_or_else(|| {
-                Error::Conflict("selected source cleanup custody is already active".into())
-            })?;
+            .ok_or_else(|| Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))?;
         source = current;
         let successful: bool = self.db.lock().unwrap().query_row(
             "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2 AND json_extract(data,'$.terminalOutcome')='SUCCESS')",
@@ -1770,7 +2963,27 @@ impl Inventory {
             return Ok(true);
         }
         let root = self.verify(&source)?;
-        let observed = fs::manifest(&root, 100_000)?;
+        // Closed scope (W4, Paul): every file of a job's source came from its
+        // own download. Once the delivery is a success — or a failure the job
+        // does not keep — whatever the publication did not take is garbage:
+        // the tree is removed by root identity, not classified file by file.
+        let delivered: bool = self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM deliveries WHERE artifact=?1 AND generation=?2)",
+            params![movement.source.id, movement.source.generation],
+            |row| row.get(0),
+        )?;
+        // A publication the failed job's own disposition superseded never
+        // becomes a delivery; that durable failure stands in for it.
+        let delivered = delivered || self.publication_superseded_by_failure(movement)?;
+        let closed_scope = (delivered || successful) && (successful || !source.keep_on_failure);
+        if closed_scope {
+            self.remove_closed_scope_tree(op, movement, &mut source, &root)?;
+        }
+        let observed = if closed_scope {
+            Vec::new()
+        } else {
+            fs::manifest(&root, 100_000)?
+        };
         for entry in &observed {
             if !movement.source.files.iter().any(|expected| {
                 expected.path == entry.path
@@ -1787,7 +3000,7 @@ impl Inventory {
             .source
             .files
             .iter()
-            .filter(|entry| !entry.identity.directory)
+            .filter(|entry| !closed_scope && !entry.identity.directory)
         {
             let Some(outcome_index) = movement
                 .file_outcomes
@@ -1801,6 +3014,14 @@ impl Inventory {
             };
             let outcome = movement.file_outcomes[outcome_index].outcome.as_str();
             let resolved = matches!(outcome, "published" | "consumed");
+            let present = observed.iter().find(|entry| entry.path == expected.path);
+            let moved_away = present.is_none()
+                && movement
+                    .intent
+                    .as_deref()
+                    .map(|generation| self.intent_moved_away(generation, &expected.path))
+                    .transpose()?
+                    .unwrap_or(false);
             let recoverable = matches!(
                 outcome,
                 "retained_processing"
@@ -1810,9 +3031,10 @@ impl Inventory {
                     | "assessment_retry"
             );
             let repair_dependency = movement.file_outcomes[outcome_index].repair_dependency;
-            if repair_dependency
-                || recoverable
-                || (source.keep_on_failure && !successful && !resolved)
+            if !moved_away
+                && (repair_dependency
+                    || recoverable
+                    || (source.keep_on_failure && !successful && !resolved))
             {
                 movement.file_outcomes[outcome_index].source_cleanup_status = if repair_dependency {
                     "retained_repair_dependency".into()
@@ -1831,8 +3053,10 @@ impl Inventory {
             if movement.file_outcomes[outcome_index].source_cleanup_status == "removed" {
                 continue;
             }
-            let present = observed.iter().find(|entry| entry.path == expected.path);
-            if let Some(actual) = present {
+            if moved_away {
+                // Renamed into the publication (contract §2.5): the source
+                // no longer holds it, so there is nothing to unlink.
+            } else if let Some(actual) = present {
                 if actual != expected {
                     return Err(Error::Conflict(format!(
                         "source file identity changed: {}",
@@ -1898,13 +3122,17 @@ impl Inventory {
                     params![
                         movement.source.id,
                         movement.source.generation,
-                        serde_json::to_string(&delivery)?
+                        super::delivery::delivery_row_json(&delivery)?
                     ],
                 )?;
             }
             tx.commit()?;
         }
-        let mut remaining = fs::manifest(&root, 100_000)?;
+        let mut remaining = if closed_scope {
+            Vec::new()
+        } else {
+            fs::manifest(&root, 100_000)?
+        };
         remaining.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
         for directory in remaining.iter().filter(|entry| entry.identity.directory) {
             if movement.file_outcomes.iter().any(|outcome| {
@@ -2029,6 +3257,7 @@ impl Inventory {
                 "source retirement is not authorized for this delivery cohort".into(),
             ));
         }
+        self.invalidate_source_writer_naming(artifact_id, generation);
         let ids = {
             let db = self.db.lock().unwrap();
             let mut statement = db.prepare(
@@ -2049,8 +3278,9 @@ impl Inventory {
                 && movement.defer_source_retirement
                 && movement.destination == publication_path
             {
-                self.retire_relocation_source(&id)?;
-                return Ok(true);
+                self.run_relocation_cleanup(&id)?;
+                let finished: Relocation = serde_json::from_str(&self.operation(&id)?.request)?;
+                return Ok(finished.cleanup_done);
             }
         }
         if !source_relocation_seen && published.origin_path == publication_path {
@@ -2155,6 +3385,24 @@ impl Inventory {
             &delivery.publication_generation,
             Path::new(&delivery.publication_path),
         );
+        #[cfg(test)]
+        if let Some(hook) = DELIVERY_SETTLE_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        // Both durable ledgers settle under the policy writer's guard. A wake
+        // after inner settlement must not be overwritten by this stale result.
+        let _guard = self.mutation_guard()?;
+        let woke: bool = self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations o WHERE artifact=?1 AND state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.generation')=?2 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='cleanup-wake:'||o.id),0)<>COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup.wake_revision'),0))",
+            params![delivery.artifact_id,delivery.publication_generation], |r|r.get(0))?;
+        let result = if woke {
+            Err(Error::CleanupRetry {
+                next_retry: now(),
+                reason: "cleanup eligibility changed before delivery settlement".into(),
+            })
+        } else {
+            result
+        };
         match result {
             Ok(true) => {
                 self.finish_cleanup_attempt(delivery_id, attempt, "succeeded", None)?;
@@ -2186,7 +3434,7 @@ impl Inventory {
             }
             Err(error) => {
                 let message = error.to_string();
-                if message.starts_with("blocked:") {
+                if matches!(error, Error::CleanupBlocked(_)) {
                     self.finish_cleanup_attempt(delivery_id, attempt, "blocked", Some(&message))?;
                     self.db.lock().unwrap().execute(
                         "UPDATE deliveries SET cleanup_status='blocked',cleanup_error=?2,cleanup_next_retry_at=NULL,cleanup_blocked_since=COALESCE(cleanup_blocked_since,?3) WHERE id=?1",
@@ -2205,7 +3453,11 @@ impl Inventory {
                     3 => 120,
                     _ => 300,
                 };
-                let next_retry = now().saturating_add(delay);
+                let next_retry = if let Error::CleanupRetry { next_retry, .. } = error {
+                    next_retry
+                } else {
+                    now().saturating_add(delay)
+                };
                 self.finish_cleanup_attempt(delivery_id, attempt, "retry", Some(&message))?;
                 self.db.lock().unwrap().execute(
                     "UPDATE deliveries SET cleanup_status='retry',cleanup_error=?2,cleanup_next_retry_at=?3,cleanup_blocked_since=COALESCE(cleanup_blocked_since,?4) WHERE id=?1",
@@ -2237,10 +3489,17 @@ impl Inventory {
         &self,
         delivery_id: &str,
     ) -> Result<crate::artifacts::Delivery> {
-        let changed = self.db.lock().unwrap().execute(
-            "UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('blocked','retry')",
-            [delivery_id],
-        )?;
+        let delivery = self.delivery(delivery_id)?;
+        let changed = {
+            let _guard = self.mutation_guard()?;
+            let db = self.db.lock().unwrap();
+            Self::wake_relocation_cleanup(
+                &db,
+                &delivery.artifact_id,
+                &delivery.publication_generation,
+            )?;
+            db.execute("UPDATE deliveries SET cleanup_status='retry',cleanup_error=NULL,cleanup_next_retry_at=0 WHERE id=?1 AND cleanup_status IN ('blocked','retry')",[delivery_id])?
+        };
         if changed == 0 {
             return self.delivery(delivery_id);
         }
@@ -2306,6 +3565,9 @@ impl Inventory {
         retire_sources: bool,
     ) -> Result<()> {
         checkpoint()?;
+        // Contract §2.5: per-file publication intents are finished or unwound
+        // first, from their own journal; their operations are skipped below.
+        self.reconcile_open_intents(Some(root), artifact, snapshot, checkpoint)?;
         // Root/generation custody leases replace the global payload mutex.
         let mut guard = None;
         let raws = {
@@ -2348,6 +3610,11 @@ impl Inventory {
                 }
             }
             let mut movement: Relocation = serde_json::from_str(&op.request)?;
+            if movement.intent.is_some() || movement.root_pending {
+                // Intents reconcile from their own journal; a root-pending
+                // journal holds no moved bytes and is retried by its request.
+                continue;
+            }
             let source = {
                 let _coordinator = self.mutation_guard()?;
                 let Some(source) = self.relocation_source(&op, &movement)? else {
@@ -2508,13 +3775,14 @@ impl Inventory {
                         drop(db);
                         lease.extend_locked(&scratch, &coordinator)?;
                         drop(coordinator);
-                        let published = self.publish_directory_unlocked_checked(
+                        let published = self.publish_directory_with_copy_digests_checked(
                             &mut guard,
                             &scratch.path,
                             &movement.destination,
                             &op.artifact,
                             &publication_key,
                             checkpoint,
+                            Some(&scratch.files),
                         )?;
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
@@ -2682,14 +3950,16 @@ impl Inventory {
                         lease.extend_locked(&scratch, &coordinator)?;
                         drop(coordinator);
                         let publication_key = format!("{}-copy", op.id);
-                        movement.publication = Some(self.publish_directory_unlocked_checked(
-                            &mut guard,
-                            &scratch.path,
-                            &movement.destination,
-                            &op.artifact,
-                            &publication_key,
-                            checkpoint,
-                        )?);
+                        movement.publication =
+                            Some(self.publish_directory_with_copy_digests_checked(
+                                &mut guard,
+                                &scratch.path,
+                                &movement.destination,
+                                &op.artifact,
+                                &publication_key,
+                                checkpoint,
+                                Some(&scratch.files),
+                            )?);
                         let current_op = self.operation(&op.id)?;
                         if current_op.request != op.request
                             || !matches!(current_op.state.as_str(), "running" | "review" | "retry")
@@ -2725,7 +3995,7 @@ impl Inventory {
                 }
                 if matches!(e, Error::Io(_)) {
                     op.attempts = op.attempts.saturating_add(1);
-                    let delay = [30, 60, 120, 300][op.attempts.saturating_sub(1).min(3) as usize];
+                    let delay = retry_delay(op.attempts);
                     op.state = "retry".into();
                     op.next_retry = now().saturating_add(delay);
                 } else {
@@ -2767,7 +4037,7 @@ impl Inventory {
         }
         let cleanup = {
             let db = self.db.lock().unwrap();
-            let mut stmt = db.prepare("SELECT data FROM operations o WHERE state='succeeded' AND json_extract(data,'$.kind')='relocate' AND json_extract(json_extract(data,'$.request'),'$.source.root')=?1 AND COALESCE(json_extract(json_extract(data,'$.request'),'$.cleanup_done'),0)=0 AND json_extract(json_extract(data,'$.request'),'$.source.automatic_cleanup_eligible')=1 AND (COALESCE(json_extract(json_extract(data,'$.request'),'$.defer_source_retirement'),0)=0 OR json_extract(json_extract(data,'$.request'),'$.publication_files') IS NOT NULL OR EXISTS (SELECT 1 FROM deliveries d WHERE d.artifact=o.artifact AND d.generation=json_extract(json_extract(o.data,'$.request'),'$.source.generation'))) LIMIT 25")?;
+            let mut stmt = db.prepare(operation_queries::RELOCATION_CLEANUP_CANDIDATES)?;
             let rows =
                 stmt.query_map([root.to_string_lossy().as_ref()], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -2853,6 +4123,22 @@ impl Inventory {
             .reserve_reconciliation_locked(std::slice::from_ref(&source), None, &guard)?
             .ok_or_else(|| Error::Conflict("relocation custody is already active".into()))?;
         drop(guard);
+        if let Some(intent) = movement.intent.as_deref() {
+            // Contract §2.5 per-file move (review #283-4): abandoning it
+            // unwinds the journaled move under the same single flight as
+            // restart reconciliation.
+            if !self.relocation_active.lock().unwrap().insert(op.id.clone()) {
+                return Err(Error::Conflict(
+                    "relocation custody is already active".into(),
+                ));
+            }
+            let _flight = RelocationLease {
+                inventory: self,
+                id: op.id.clone(),
+            };
+            self.abandon_intent(intent)?;
+            return self.get(&op.artifact);
+        }
         let baseline = source.clone();
         let root = self.verify(&source)?;
         let actual_files = fs::manifest(&root, 100_000)?;
@@ -2942,8 +4228,12 @@ impl Inventory {
 #[cfg(test)]
 mod lease_replay_tests {
     use super::*;
+    /// A post-processing grant that expires between two per-file moves stops
+    /// the move there (contract §2.5): the moved file stays in the target,
+    /// the rest in the source, the intent open. The same attempt's retry
+    /// finishes it; nothing is ever in two places.
     #[test]
-    fn checked_relocation_stops_on_midcopy_lease_expiry_then_recovers_same_attempt() {
+    fn checked_publication_stops_between_files_on_lease_expiry_then_recovers_same_attempt() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("working");
         let completed = temporary.path().join("completed");
@@ -2956,108 +4246,416 @@ mod lease_replay_tests {
             .allocate_for_delivery(19, &root, &source, true, true)
             .unwrap();
         let bytes = vec![9u8; 256 * 1024];
-        std::fs::write(source.join("episode.mkv"), &bytes).unwrap();
+        for name in ["a.mkv", "b.mkv"] {
+            std::fs::write(source.join(name), &bytes).unwrap();
+        }
         let artifact = inventory.finish(19, &source, &root, "active").unwrap();
-        let outcomes = vec![DeliveryFileOutcome {
-            source_path: "episode.mkv".into(),
-            publication_path: Some("episode.mkv".into()),
-            classification: "media".into(),
-            outcome: "published".into(),
-            reason: None,
-            repair_dependency: false,
-            source_cleanup_status: "pending".into(),
-        }];
-        FAULTS.with(|faults| faults.borrow_mut().insert("copy_chunk", libc::ENOSPC));
-        assert!(inventory
-            .publish_selected_for_delivery_checked(
-                19,
-                &target,
-                artifact.files,
-                outcomes,
-                &|| Ok(())
-            )
-            .is_err());
-        let operation = inventory
-            .pending_relocations(&artifact.id)
-            .unwrap()
-            .pop()
-            .unwrap();
-        let movement: Relocation = serde_json::from_str(&operation.request).unwrap();
-        let scratch = movement.scratch.unwrap().path;
-        let armed = std::cell::Cell::new(false);
-        let expired = std::cell::Cell::new(false);
+        let outcomes = ["a.mkv", "b.mkv"]
+            .iter()
+            .map(|name| DeliveryFileOutcome {
+                source_path: (*name).into(),
+                publication_path: Some((*name).into()),
+                classification: "media".into(),
+                outcome: "published".into(),
+                reason: None,
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            })
+            .collect::<Vec<_>>();
         let checkpoint = || {
-            if expired.get() {
+            if target.join("a.mkv").exists() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
-                    "lease expired during resumed relocation",
+                    "lease expired during publication",
                 ));
-            }
-            for entry in std::fs::read_dir(&scratch)?.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".runner-copy-")
-                {
-                    let length = entry.metadata()?.len();
-                    if length == 0 {
-                        armed.set(true);
-                    }
-                    if armed.get() && length >= 65536 {
-                        expired.set(true);
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "lease expired during resumed relocation",
-                        ));
-                    }
-                }
             }
             Ok(())
         };
         assert!(inventory
-            .prepare_post_retry_checked(19, &checkpoint)
+            .publish_selected_for_delivery_checked(
+                19,
+                &target,
+                artifact.files.clone(),
+                outcomes,
+                &checkpoint
+            )
             .is_err());
-        assert!(
-            expired.get(),
-            "grant expires after the new copy wrote its first chunk"
-        );
-        assert!(
-            !target.exists(),
-            "expired grant cannot publish or commit its partial copy"
-        );
-        assert_eq!(std::fs::read(source.join("episode.mkv")).unwrap(), bytes);
+        assert_eq!(std::fs::read(target.join("a.mkv")).unwrap(), bytes);
+        assert!(!source.join("a.mkv").exists());
+        assert!(source.join("b.mkv").exists(), "no move after expiry");
+        assert!(!target.join("b.mkv").exists());
+        assert!(!target.join(super::super::RUNNER_MANIFEST_NAME).exists());
+        assert!(inventory.open_intent_for_job(19).unwrap());
         let pending = inventory.pending_relocations(&artifact.id).unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, operation.id);
         assert_eq!(pending[0].state, "retry");
+        let operation = pending[0].clone();
         assert!(inventory.for_job(19).unwrap().unwrap().hold.is_none());
-        let copied = std::fs::read_dir(&scratch)
-            .unwrap()
-            .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".runner-copy-")
-            })
-            .map(|entry| entry.metadata().unwrap().len())
-            .sum::<u64>();
-        assert_eq!(
-            copied, 65536,
-            "no later chunk is written after authority expiry"
-        );
+
         let recovered = inventory
             .prepare_post_retry_checked(19, &|| Ok(()))
             .unwrap();
         assert_eq!(recovered.path, target);
+        assert!(!inventory.open_intent_for_job(19).unwrap());
         let delivery = inventory
             .create_delivery(19, true, Some("same-acquisition-token"))
             .unwrap();
-        assert_eq!(delivery.files.len(), 1);
-        assert_eq!(std::fs::read(target.join("episode.mkv")).unwrap(), bytes);
+        assert_eq!(delivery.files.len(), 2);
+        for name in ["a.mkv", "b.mkv"] {
+            assert_eq!(std::fs::read(target.join(name)).unwrap(), bytes);
+            assert!(!source.join(name).exists());
+        }
         assert_eq!(
             inventory.operation(&operation.id).unwrap().state,
             "succeeded"
         );
+    }
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    fn setup() -> (tempfile::TempDir, Inventory, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("processing");
+        std::fs::create_dir(&root).unwrap();
+        let db = Inventory::open(&tmp.path().join("state")).unwrap();
+        (tmp, db, root)
+    }
+    fn publish(
+        db: &Inventory,
+        root: &Path,
+        completed: &Path,
+        job: u32,
+        retained: bool,
+    ) -> RelocationResult {
+        let source = root.join(format!("job-{job}"));
+        db.allocate_for_delivery(job, root, &source, true, true)
+            .unwrap();
+        std::fs::write(source.join("media.mkv"), vec![23; 131073]).unwrap();
+        if retained {
+            // Only a kept failure retains anything after its delivery
+            // (closed scope, W4); that is the shape these tests block on.
+            db.set_keep_on_failure(job, true).unwrap();
+            std::fs::write(source.join("unresolved.rar"), b"keep this").unwrap();
+        }
+        let a = db.refresh_for_delivery(job).unwrap();
+        let selected = a
+            .files
+            .iter()
+            .filter(|f| f.path == "media.mkv")
+            .cloned()
+            .collect();
+        let outcomes = a
+            .files
+            .iter()
+            .map(|f| DeliveryFileOutcome {
+                source_path: f.path.clone(),
+                publication_path: (f.path == "media.mkv").then(|| f.path.clone()),
+                classification: if f.path == "media.mkv" {
+                    "video"
+                } else {
+                    "archive_input"
+                }
+                .into(),
+                outcome: if f.path == "media.mkv" {
+                    "published"
+                } else {
+                    "retained_processing"
+                }
+                .into(),
+                reason: None,
+                repair_dependency: false,
+                source_cleanup_status: "pending".into(),
+            })
+            .collect();
+        db.publish_selected_for_delivery_checked(
+            job,
+            &completed.join(format!("job-{job}")),
+            selected,
+            outcomes,
+            &|| Ok(()),
+        )
+        .unwrap()
+    }
+
+    /// The delivery of a kept failure: its unresolved inputs stay.
+    fn kept_failure_delivery(db: &Inventory, job: u32, token: &str) -> Delivery {
+        db.create_delivery_with_outcome_and_keep(
+            job,
+            true,
+            Some(token),
+            "UNPACK_FAILURE",
+            Some("unpack"),
+            Some("archive failed"),
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn per_file_publication_reads_each_file_once_and_cleanup_reads_nothing() {
+        let (tmp, db, root) = setup();
+        let completed = tmp.path().join("completed");
+        crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.set(0));
+        let moved = publish(&db, &root, &completed, 1, false);
+        assert_eq!(
+            crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.get()),
+            131073,
+            "one read pass: the digest, before the rename"
+        );
+        let delivery = db.create_delivery(1, true, Some("performance-1")).unwrap();
+        let cleanup = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+        assert_eq!(
+            cleanup.source_cleanup.status, "succeeded",
+            "{:?}",
+            cleanup.source_cleanup
+        );
+        assert_eq!(
+            crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.get()),
+            131073,
+            "the delivery and the source cleanup read no payload"
+        );
+        assert!(moved.published_path.join("media.mkv").exists());
+    }
+
+    #[test]
+    fn blocked_delivery_sweeps_do_not_retry_or_read_payload() {
+        let (tmp, db, root) = setup();
+        let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
+        let delivery = kept_failure_delivery(&db, 1, "performance-block");
+        let blocked = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+        assert_eq!(blocked.source_cleanup.status, "blocked");
+        let operation = db.operation(&moved.operation_id).unwrap();
+        let schedule: Relocation = serde_json::from_str(&operation.request).unwrap();
+        assert_eq!(schedule.cleanup.state, CleanupState::Blocked);
+        crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.set(0));
+        for _ in 0..3 {
+            db.reconcile_relocations().unwrap();
+            db.retry_delivery_cleanup().unwrap();
+        }
+        let after: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(after.cleanup.attempts, schedule.cleanup.attempts);
+        assert_eq!(crate::fileops::PAYLOAD_READ_BYTES.with(|n| n.get()), 0);
+        assert!(root.join("job-1/unresolved.rar").exists());
+    }
+
+    #[test]
+    fn blocked_batch_does_not_starve_later_due_cleanup() {
+        let (tmp, db, root) = setup();
+        let completed = tmp.path().join("completed");
+        for job in 1..=25 {
+            publish(&db, &root, &completed, job, true);
+            let delivery = kept_failure_delivery(&db, job, &format!("blocked-{job}"));
+            assert_eq!(
+                db.retire_delivery_source(&delivery.delivery_id)
+                    .unwrap()
+                    .source_cleanup
+                    .status,
+                "blocked"
+            );
+        }
+        publish(&db, &root, &completed, 26, false);
+        let due = db.create_delivery(26, true, Some("due-26")).unwrap();
+        db.reconcile_relocations().unwrap();
+        assert_eq!(
+            db.delivery(&due.delivery_id).unwrap().source_cleanup.status,
+            "succeeded"
+        );
+        assert!(root.join("job-1/unresolved.rar").exists());
+    }
+
+    #[test]
+    fn transient_cleanup_deadline_is_shared_with_relocation_sweeps() {
+        let (tmp, db, root) = setup();
+        let moved = publish(&db, &root, &tmp.path().join("completed"), 1, false);
+        let delivery = db.create_delivery(1, true, Some("transient-1")).unwrap();
+        FAULTS.with(|faults| {
+            faults
+                .borrow_mut()
+                .insert("before_source_cleanup", libc::EIO);
+        });
+        assert_eq!(
+            db.retire_delivery_source(&delivery.delivery_id)
+                .unwrap()
+                .source_cleanup
+                .status,
+            "retry"
+        );
+        let before: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert!(before.cleanup.next_retry > now());
+        db.reconcile_relocations().unwrap();
+        let after: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(before.cleanup.attempts, after.cleanup.attempts);
+    }
+
+    #[test]
+    fn explicit_retry_during_running_cleanup_is_not_lost_when_attempt_blocks() {
+        let (tmp, db, root) = setup();
+        let db = std::sync::Arc::new(db);
+        let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
+        let delivery = kept_failure_delivery(&db, 1, "wake-during-settle");
+        let other = db.clone();
+        let id = delivery.delivery_id.clone();
+        CLEANUP_SETTLE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                other.retry_delivery_source_cleanup(&id).unwrap();
+            }))
+        });
+        assert_eq!(
+            db.retire_delivery_source(&delivery.delivery_id)
+                .unwrap()
+                .source_cleanup
+                .status,
+            "retry"
+        );
+        let movement: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(movement.cleanup.state, CleanupState::Retry);
+        assert!(root.join("job-1/unresolved.rar").exists());
+    }
+
+    #[test]
+    fn explicit_retry_between_inner_and_delivery_settlement_remains_due() {
+        let (tmp, db, root) = setup();
+        let db = std::sync::Arc::new(db);
+        let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
+        let delivery = kept_failure_delivery(&db, 1, "wake-between-ledgers");
+        let other = db.clone();
+        let id = delivery.delivery_id.clone();
+        DELIVERY_SETTLE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                other.retry_delivery_source_cleanup(&id).unwrap();
+            }))
+        });
+        let after = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+        assert_eq!(after.source_cleanup.status, "retry");
+        let movement: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(movement.cleanup.state, CleanupState::Pending);
+        assert!(root.join("job-1/unresolved.rar").exists());
+    }
+
+    #[test]
+    fn custody_release_between_cleanup_ledgers_keeps_delivery_due() {
+        let (tmp, db, root) = setup();
+        let db = std::sync::Arc::new(db);
+        publish(&db, &root, &tmp.path().join("completed"), 1, false);
+        let custody = db.acquire_attempt_use(1).unwrap().unwrap();
+        let generation = custody.source().clone();
+        let delivery = db
+            .create_delivery(1, true, Some("release-between-ledgers"))
+            .unwrap();
+        let other = db.clone();
+        DELIVERY_SETTLE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                drop(custody);
+                other.retire_completed_relocations(&generation).unwrap();
+            }));
+        });
+        let after = db.retire_delivery_source(&delivery.delivery_id).unwrap();
+        assert_eq!(after.source_cleanup.status, "retry");
+        assert!(after.source_cleanup.next_retry_at.unwrap() <= now());
+        assert!(root.join("job-1").exists(), "the source waits for release");
+        db.reconcile_relocations().unwrap();
+        assert_eq!(
+            db.delivery(&delivery.delivery_id)
+                .unwrap()
+                .source_cleanup
+                .status,
+            "succeeded"
+        );
+        assert!(!root.join("job-1").exists());
+    }
+
+    #[test]
+    fn deferred_moves_without_delivery_do_not_occupy_cleanup_batch() {
+        let (tmp, db, root) = setup();
+        let completed = tmp.path().join("completed");
+        for job in 1..=25 {
+            publish(&db, &root, &completed, job, false);
+        }
+        publish(&db, &root, &completed, 26, false);
+        let delivery = db
+            .create_delivery(26, true, Some("ready-after-deferred"))
+            .unwrap();
+        db.reconcile_relocations().unwrap();
+        assert_eq!(
+            db.delivery(&delivery.delivery_id)
+                .unwrap()
+                .source_cleanup
+                .status,
+            "succeeded"
+        );
+        assert!(root.join("job-1").exists(), "no delivery yet: source kept");
+        assert!(completed.join("job-1/media.mkv").exists());
+    }
+
+    #[test]
+    fn transient_delete_operation_remains_a_retry_with_its_original_deadline() {
+        let (tmp, db, root) = setup();
+        let source = root.join("job");
+        db.allocate_for_delivery(1, &root, &source, true, false)
+            .unwrap();
+        // The fault fires after one successful unlink; keep a second file
+        // to demonstrate that retry scheduling preserves unfinished work.
+        std::fs::write(source.join("first.txt"), b"first unlink").unwrap();
+        std::fs::write(source.join("media.mkv"), b"original").unwrap();
+        fs::RENAME_FAILURE.with(|failure| failure.set(Some(libc::EXDEV)));
+        super::super::DELETE_FAIL_AFTER.with(|failure| failure.set(Some(0)));
+        let moved = db
+            .relocate(1, &tmp.path().join("completed/release"))
+            .unwrap();
+        let movement: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        let deletion = db
+            .operation(&format!("retire-{}", moved.operation_id))
+            .unwrap();
+        assert_eq!(deletion.state, "retry");
+        assert_eq!(movement.cleanup.state, CleanupState::Retry);
+        assert_eq!(movement.cleanup.next_retry, deletion.next_retry);
+        assert!(deletion.next_retry > now());
+        let not_due = db.retire_completed_relocations(&SourceGeneration {
+            artifact: movement.source.id.clone(),
+            generation: movement.source.generation.clone(),
+        });
+        assert!(
+            matches!(not_due, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        let after: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(after.cleanup.state, CleanupState::Retry);
+        assert_eq!(after.cleanup.next_retry, movement.cleanup.next_retry);
+        assert_eq!(
+            std::fs::read(source.join("media.mkv")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(moved.published_path.join("media.mkv")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn interrupted_cleanup_claim_reopens_as_a_string_journal_and_is_due() {
+        let (tmp, db, root) = setup();
+        let moved = publish(&db, &root, &tmp.path().join("completed"), 1, true);
+        let mut operation = db.operation(&moved.operation_id).unwrap();
+        let mut movement: Relocation = serde_json::from_str(&operation.request).unwrap();
+        movement.cleanup.state = CleanupState::Running;
+        movement.cleanup.next_retry = i64::MAX;
+        operation.request = serde_json::to_string(&movement).unwrap();
+        save_operation(&db.db.lock().unwrap(), &operation).unwrap();
+        db.close().unwrap();
+        drop(db);
+        let db = Inventory::open(&tmp.path().join("state")).unwrap();
+        let recovered: Relocation =
+            serde_json::from_str(&db.operation(&moved.operation_id).unwrap().request).unwrap();
+        assert_eq!(recovered.cleanup.state, CleanupState::Retry);
+        assert_eq!(recovered.cleanup.next_retry, 0);
     }
 }

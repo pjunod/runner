@@ -276,13 +276,39 @@ pub async fn ping() {}
 mod tests {
     use super::{
         ApiStreamResponse, ApiStreamResponsePayload, WsWriteMsg, api_response_writer,
-        ensure_ready_member, write_api_response_frame,
+        ensure_ready_member, wait_for_raft_stop, write_api_response_frame,
     };
     use crate::Node;
     use crate::network::serialize_network;
     use fastwebsockets::Role;
     use openraft::{Membership, ServerState, StoredMembership};
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[tokio::test]
+    async fn api_stream_stop_watch_ignores_live_updates_and_observes_terminal_states() {
+        for terminal in [0, 1, 2] {
+            let (sender, receiver) =
+                tokio::sync::watch::channel(openraft::RaftMetrics::<u64, Node>::new_initial(1));
+            let waiter = tokio::spawn(wait_for_raft_stop(receiver));
+            sender.send_modify(|metrics| metrics.current_term += 1);
+            tokio::task::yield_now().await;
+            assert!(
+                !waiter.is_finished(),
+                "a live Raft update must keep the socket open"
+            );
+            match terminal {
+                0 => sender.send_modify(|metrics| metrics.state = ServerState::Shutdown),
+                1 => sender.send_modify(|metrics| {
+                    metrics.running_state = Err(openraft::error::Fatal::Stopped)
+                }),
+                _ => drop(sender),
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("terminal Raft state closes an existing API stream")
+                .unwrap();
+        }
+    }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
@@ -452,7 +478,7 @@ pub async fn stream(
     let task_status = state.snapshot_transport.clone();
     tokio::task::spawn(async move {
         let _task_guard = task_status.owned_async_task();
-        if let Err(err) = handle_socket_concurrent(state, socket).await {
+        if let Err(err) = handle_socket_concurrent(state, socket, raft_type).await {
             error!("Error in websocket connection: {}", err);
         }
     });
@@ -543,6 +569,7 @@ pub(crate) enum WsWriteMsg {
 async fn handle_socket_concurrent(
     state: AppStateExt,
     socket: upgrade::UpgradeFut,
+    raft_type: RaftType,
 ) -> Result<(), fastwebsockets::WebSocketError> {
     let mut ws = socket.await?;
     ws.set_auto_close(true);
@@ -557,6 +584,13 @@ async fn handle_socket_concurrent(
         }
     };
 
+    let metrics = match raft_type {
+        #[cfg(feature = "sqlite")]
+        RaftType::Sqlite => state.raft_db.raft.metrics(),
+        #[cfg(feature = "cache")]
+        RaftType::Cache => state.raft_cache.raft.metrics(),
+        RaftType::Unknown => return Ok(()),
+    };
     let (tx_write, rx_write) = flume::bounded::<WsWriteMsg>(1);
     // The compatibility harness disables only the new marker interception on
     // one voter. This per-connection latch makes its follow-up ordinary query
@@ -640,10 +674,16 @@ async fn handle_socket_concurrent(
         let _ = tx_reader_finished.send(outcome);
     });
 
+    // Existing upgraded sockets outlive the HTTP listener. Close them when
+    // their Raft group stops, otherwise peers can remain pinned to a stopped
+    // leader and receive fatal responses forever instead of reconnecting.
+    let raft_stopped = wait_for_raft_stop(metrics);
+    tokio::pin!(raft_stopped);
     let mut writer_failed = false;
     loop {
         let req = tokio::select! {
             biased;
+            _ = &mut raft_stopped => break,
             writer = &mut rx_writer_finished => {
                 match writer {
                     Ok(Ok(())) => error!("API server WebSocket writer exited while connected"),
@@ -1014,6 +1054,18 @@ async fn handle_socket_concurrent(
     debug!("handle_socket_concurrent exiting");
 
     Ok(())
+}
+
+async fn wait_for_raft_stop(mut metrics: watch::Receiver<openraft::RaftMetrics<u64, Node>>) {
+    loop {
+        let stopped = {
+            let current = metrics.borrow();
+            current.running_state.is_err() || current.state == ServerState::Shutdown
+        };
+        if stopped || metrics.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn write_api_response_frame<S>(

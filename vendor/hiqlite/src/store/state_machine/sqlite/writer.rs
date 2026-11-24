@@ -246,7 +246,7 @@ CREATE TABLE IF NOT EXISTS _metadata
                             #[cfg(debug_assertions)]
                             check_stmt_params_count(&stmt, &q.params, &q.sql);
 
-                            let columns = match ColumnOwned::mapping_cols_from_stmt(stmt.columns())
+                            let columns = match ColumnOwned::mapping_cols_from_stmt(stmt.columns().collect())
                             {
                                 Ok(c) => c,
                                 Err(err) => {

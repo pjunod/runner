@@ -120,7 +120,7 @@ export class NzbdClient {
     return this.json<LogsPage>(`/api/v1/logs?${query.toString()}`);
   }
 
-  async queueAction(action: 'pause' | 'resume'): Promise<void> {
+  async queueAction(action: 'pause' | 'resume' | 'pause-post' | 'resume-post'): Promise<void> {
     await this.json(`/api/v1/queue/actions/${action}`, { method: 'POST' });
   }
 
@@ -134,8 +134,12 @@ export class NzbdClient {
       | 'move-top'
       | 'move-up'
       | 'move-down'
-      | 'move-bottom',
+      | 'move-bottom'
+      | 'retry-fetch',
   ): Promise<{ ok: boolean; parked?: boolean }> {
+    // "Retry now" for an NZB fetch waiting out an indexer refusal: the same
+    // per-job retry endpoint the web UI's button uses.
+    if (action === 'retry-fetch') return this.json(`/api/v1/jobs/${id}/retry`, { method: 'POST' });
     return this.json(`/api/v1/jobs/${id}/actions/${action}`, { method: 'POST' });
   }
 
@@ -198,7 +202,8 @@ export class NzbdClient {
   }
 
   async openEventStream(signal: AbortSignal, lastEventId?: string): Promise<Response> {
-    return fetch(`${this.config.baseUrl}/api/v1/events`, {
+    // storage_io: per-filesystem throughput for the Storage block's graphs.
+    return fetch(`${this.config.baseUrl}/api/v1/events?storage_io=1`, {
       method: 'GET',
       headers: this.headers({
         accept: 'text/event-stream',

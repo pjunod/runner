@@ -174,16 +174,42 @@ pub(super) fn allocate_imported_payload(
             .allocate(record.id.0, &allocation.root, &allocation.path)
             .map_err(failure)?;
     } else {
+        // Review #283-1: behind a restart's reconciliation pass on this
+        // source (its publication move being finished), not against it.
         let _custody = inventory
-            .acquire_terminal_use(record.id.0, &|| Ok(()))
+            .acquire_terminal_use_after_reconciliation(record.id.0, &|| Ok(()))
             .map_err(failure)?
             .ok_or_else(|| failure("retained allocation has no custody evidence"))?;
     }
     Ok(allocation)
 }
 
+/// This classification is used only after journal replay and fresh allocation
+/// reconciliation. A display byte counter is never sufficient evidence.
+fn pristine_download(job: &Job) -> bool {
+    matches!(
+        job.status,
+        JobStatus::Queued | JobStatus::Paused | JobStatus::Held
+    ) && job.stages.is_empty()
+        && !job.files.iter().any(|file| {
+            file.finalized
+                || file.crc32.is_some()
+                || file
+                    .segments
+                    .iter()
+                    .any(|segment| matches!(segment.state, SegmentState::Done { .. }))
+        })
+        && !job.params.iter().any(|(key, _)| {
+            key.starts_with("*File:proof:")
+                || key.starts_with("*File:retired-proof:")
+                || key.starts_with("*File:publication:")
+                || key.starts_with("*Recovery:publication-repair")
+        })
+}
+
 fn needs_payload(job: &Job) -> bool {
     job.torrent.is_none()
+        && !failed_cleanup_only(job)
         && !job.files.is_empty()
         && !job
             .params
@@ -191,13 +217,199 @@ fn needs_payload(job: &Job) -> bool {
             .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
         && job.status != JobStatus::Deleted
 }
+
+/// Remove `.runner-file-<id>.part` names left behind by a finalize that
+/// published the file (link, then unlink of the partial) but was killed
+/// before the unlink. A partial is removed only when its file is finalized
+/// and the published name is the *same object* (device + inode), so the
+/// removal drops a second name and never the only copy of the payload.
+/// Every other partial — unfinalized, unknown to the job, or a different
+/// object than the publication — stays for the job's own lifecycle
+/// (resume, salvage, closed-scope cleanup or disposal).
+pub(super) fn sweep_stale_parts(dir: &std::path::Path, finalized: &HashMap<u32, String>) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".runner-file-"))
+            .and_then(|rest| rest.strip_suffix(".part"))
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(published) = finalized.get(&id) else {
+            continue;
+        };
+        if !crate::recovery::safe_name(published) {
+            continue;
+        }
+        let (Ok(part), Ok(publication)) = (
+            std::fs::symlink_metadata(entry.path()),
+            std::fs::symlink_metadata(dir.join(published)),
+        ) else {
+            continue;
+        };
+        if !part.is_file()
+            || !publication.is_file()
+            || part.dev() != publication.dev()
+            || part.ino() != publication.ino()
+        {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(path = %entry.path().display(), "removed the leftover partial name of a published file");
+            }
+            Err(error) => {
+                tracing::warn!(path = %entry.path().display(), %error, "leftover partial name remains");
+            }
+        }
+    }
+    removed
+}
+
+pub(super) fn failed_cleanup_only(job: &Job) -> bool {
+    job.params
+        .iter()
+        .any(|(key, _)| key == "*Recovery:failed-cleanup")
+}
+
+fn failed_cleanup_marker(proof: &nzbd_state::artifacts::FailedCleanupProof) -> String {
+    serde_json::to_string(&(
+        proof.source().artifact.as_str(),
+        proof.source().generation.as_str(),
+        proof.operation_id(),
+    ))
+    .unwrap()
+}
+
+fn failed_cleanup_marker_matches(
+    job: &Job,
+    proof: &nzbd_state::artifacts::FailedCleanupProof,
+) -> bool {
+    let markers = job
+        .params
+        .iter()
+        .filter(|(key, _)| key == "*Recovery:failed-cleanup")
+        .collect::<Vec<_>>();
+    markers.is_empty() || (markers.len() == 1 && markers[0].1 == failed_cleanup_marker(proof))
+}
+
+fn failed_cleanup_record(job: &Job) -> bool {
+    job.kind == JobKind::Nzb
+        && job.status == JobStatus::Failed
+        && !job.held()
+        && job
+            .params
+            .iter()
+            .filter(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+            .all(|(_, value)| failed_cleanup_only(job) && value.starts_with("FAILURE/"))
+        && ["*PP:failure-at", "*PP:failure-disposition-attempts"]
+            .iter()
+            .all(|name| {
+                job.params
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .and_then(|(_, value)| value.parse::<u64>().ok())
+                    .is_some_and(|value| value > 0)
+            })
+}
+
+fn cleanup_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        nzbd_types::PP_DONE_PARAM
+            | "*PP:history-seq"
+            | "*PP:failure-disposition-attempts"
+            | "Failure:Stage"
+            | "Failure:Reason"
+            | "Failure:KeepOnFailure"
+            | "Failure:Files"
+            | "Artifact:Id"
+            | "Artifact:Generation"
+            | "Artifact:Custody"
+            | "*PP:selected-publication-outcome"
+            | "*PP:selected-publication-failure-cause"
+    )
+}
+
+fn cleanup_update_matches(
+    previous: &Job,
+    candidate: &Job,
+    proof: &nzbd_state::artifacts::FailedCleanupProof,
+) -> bool {
+    if previous.status != JobStatus::Failed
+        || candidate.status != JobStatus::Failed
+        || candidate
+            .params
+            .iter()
+            .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && !value.starts_with("FAILURE/"))
+    {
+        return false;
+    }
+    if candidate
+        .params
+        .iter()
+        .any(|(key, value)| match key.as_str() {
+            "Artifact:Id" => value != &proof.source().artifact,
+            "Artifact:Generation" => value != &proof.source().generation,
+            "Artifact:Custody" => !matches!(
+                value.as_str(),
+                "runner_owned" | "kept_by_user" | "deleted_by_runner"
+            ),
+            "*PP:selected-publication-outcome" | "*PP:selected-publication-failure-cause" => {
+                !previous.params.contains(&(key.clone(), value.clone()))
+            }
+            _ => false,
+        })
+    {
+        return false;
+    }
+    let attempts = |row: &Job| {
+        row.params
+            .iter()
+            .find(|(key, _)| key == "*PP:failure-disposition-attempts")
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+    };
+    if !attempts(previous)
+        .zip(attempts(candidate))
+        .is_some_and(|(old, new)| new >= old)
+    {
+        return false;
+    }
+    let mut previous = previous.clone();
+    let mut candidate = candidate.clone();
+    candidate.category = previous.category.clone();
+    candidate.priority = previous.priority;
+    candidate
+        .params
+        .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+    previous
+        .params
+        .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+    previous
+        .params
+        .retain(|(key, _)| !cleanup_metadata_key(key));
+    candidate
+        .params
+        .retain(|(key, _)| !cleanup_metadata_key(key));
+    serde_json::to_value(previous).ok() == serde_json::to_value(candidate).ok()
+}
 fn preserve_user_intent(old: &mut Job, current: &Job) {
     old.category = current.category.clone();
     old.priority = current.priority;
     if let Some(control) = current.control() {
         old.set_control(&control);
     }
-    if current.status == JobStatus::Paused || current.held() {
+    if current.held() {
+        old.status = JobStatus::Held;
+    } else if current.status == JobStatus::Paused {
         old.status = JobStatus::Paused;
     }
     for file in &mut old.files {
@@ -234,7 +446,10 @@ pub(super) fn preserve_intent_changes(restored: &mut Job, current: &Job, provisi
         restored.status = current.status;
     }
     if restored.held() {
-        restored.status = JobStatus::Paused;
+        restored.status = JobStatus::Held;
+    } else {
+        // The durable row's hold may have been released since.
+        restored.normalize_hold_status();
     }
     for file in &mut restored.files {
         if let Some((current, provisional)) = current
@@ -292,12 +507,112 @@ pub(super) struct StartupRoot {
 }
 
 impl Owner {
+    pub(super) fn begin_failed_cleanup_admission_then(
+        &mut self,
+        job: JobId,
+        callback: impl FnOnce(&mut Owner, Option<crate::FailedCleanupAdmission>) + Send + 'static,
+    ) {
+        if self.cancel.is_cancelled()
+            || !self.persist
+            || self.persistence_fenced
+            || !self.state.job(job).is_some_and(failed_cleanup_record)
+            || self.post_admissions.contains_key(&job)
+            || self.allocating_jobs.contains(&job)
+            || self.pending_control_commits.contains(&job)
+            || self.record_transitions.contains(&job)
+            || self.projection_transition
+            || self.retiring_writers.contains_key(&job)
+            || self
+                .verification
+                .get(&job)
+                .is_some_and(|state| state.running)
+            || self.state.job(job).is_some_and(|record| {
+                record.files.iter().any(|file| {
+                    self.pending_writer_birth.contains_key(&file.id)
+                        || self
+                            .writers
+                            .get(&file.id)
+                            .is_some_and(|writer| !*writer.stopped.borrow())
+                })
+            })
+        {
+            callback(self, None);
+            return;
+        }
+        let generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        let control_revision = self.control_epochs.get(&job).copied();
+        self.record_transitions.insert(job);
+        self.pending_control_commits.insert(job);
+        let inventory = self.artifacts.clone();
+        self.io_then(
+            move || inventory.failed_cleanup_proof(job.0).map_err(failure),
+            move |owner, proof| {
+                owner.record_transitions.remove(&job);
+                owner.pending_control_commits.remove(&job);
+                let proof = match proof {
+                    Ok(Some(proof))
+                        if owner.job_epochs.get(&job) == Some(&generation)
+                            && owner.control_epochs.get(&job).copied() == control_revision
+                            && owner.state.job(job).is_some_and(failed_cleanup_record)
+                            && owner
+                                .state
+                                .job(job)
+                                .is_some_and(|row| failed_cleanup_marker_matches(row, &proof))
+                            && !owner.cancel.is_cancelled()
+                            && owner.persist
+                            && !owner.persistence_fenced
+                            && !owner.post_admissions.contains_key(&job)
+                            && owner.persist_guard.as_ref().is_none_or(|guard| guard()) =>
+                    {
+                        proof
+                    }
+                    _ => {
+                        owner.drain_replacements();
+                        callback(owner, None);
+                        return;
+                    }
+                };
+                let cancellation = owner.cancel.child_token();
+                let files = owner
+                    .state
+                    .job(job)
+                    .unwrap()
+                    .files
+                    .iter()
+                    .map(|file| file.id)
+                    .collect::<Vec<_>>();
+                for file in files {
+                    owner.writer_epochs.remove(&file);
+                    owner.writers.remove(&file);
+                }
+                let admission = crate::PostAdmission {
+                    job,
+                    generation,
+                    cancellation: cancellation.clone(),
+                };
+                owner.post_admissions.insert(job, generation);
+                owner.post_cancellations.insert(job, cancellation);
+                owner.failed_cleanup_admissions.insert(job, proof.clone());
+                let row = owner.state.job(job).unwrap().clone();
+                callback(
+                    owner,
+                    Some(crate::FailedCleanupAdmission {
+                        admission,
+                        job: row,
+                        cleanup: proof,
+                    }),
+                );
+            },
+        );
+    }
+
     pub(super) fn materialize_generation_then(
         &mut self,
         request: GenerationMaterialization,
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         let job = request.job.id;
+        self.boot_jobs.remove(&job);
         if !self.persist
             || self.cancel.is_cancelled()
             || self.allocating_jobs.contains(&job)
@@ -461,6 +776,67 @@ impl Owner {
     pub(super) fn apply_post_record_proven(
         &mut self,
         admission: crate::PostAdmission,
+        candidate: Job,
+        require_snapshot: bool,
+        completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
+        if let Some(proof) = self.failed_cleanup_admissions.get(&admission.job).cloned() {
+            let inventory = self.artifacts.clone();
+            let custody = candidate
+                .params
+                .iter()
+                .find(|(key, _)| key == "Artifact:Custody")
+                .map(|(_, value)| value.clone());
+            self.io_then(
+                move || {
+                    inventory
+                        .validate_failed_cleanup_proof(&proof)
+                        .map_err(failure)?;
+                    let source = inventory.get(&proof.source().artifact).map_err(failure)?;
+                    if custody.as_deref() == Some("deleted_by_runner")
+                        && !matches!(source.state.as_str(), "deleted" | "source_gone")
+                    {
+                        return Err(failure("failed cleanup source deletion is not recorded"));
+                    }
+                    if custody.as_deref() == Some("kept_by_user")
+                        && !source.keep
+                        && !source.keep_on_failure
+                    {
+                        return Err(failure(
+                            "failed cleanup source has no user retention choice",
+                        ));
+                    }
+                    Ok(())
+                },
+                move |owner, validated| {
+                    if validated.is_err() {
+                        callback(owner, false);
+                        return;
+                    }
+                    owner.apply_post_record_proven_ready(
+                        admission,
+                        candidate,
+                        require_snapshot,
+                        completion_proof,
+                        callback,
+                    );
+                },
+            );
+        } else {
+            self.apply_post_record_proven_ready(
+                admission,
+                candidate,
+                require_snapshot,
+                completion_proof,
+                callback,
+            );
+        }
+    }
+
+    fn apply_post_record_proven_ready(
+        &mut self,
+        admission: crate::PostAdmission,
         mut candidate: Job,
         require_snapshot: bool,
         completion_proof: Option<nzbd_state::artifacts::WorkerCompletionProof>,
@@ -493,6 +869,23 @@ impl Owner {
             callback(self, false);
             return;
         };
+        if let Some(proof) = self.failed_cleanup_admissions.get(&admission.job) {
+            if completion_proof.is_some() || !cleanup_update_matches(&previous, &candidate, proof) {
+                callback(self, false);
+                return;
+            }
+            candidate
+                .params
+                .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+            if let Some(control) = previous.control() {
+                candidate.set_control(&control);
+            }
+            set_owner_param(
+                &mut candidate.params,
+                "*Recovery:failed-cleanup",
+                Some(failed_cleanup_marker(proof)),
+            );
+        }
         if previous.kind != candidate.kind
             || job_dir_name(&previous) != job_dir_name(&candidate)
             || previous
@@ -558,23 +951,27 @@ impl Owner {
                 callback(owner, true);
                 return;
             }
-            if owner.job_epochs.get(&job) == Some(&lifetime) {
-                if let Some(current) = owner.state.job(job).cloned() {
-                    let mut restore = previous;
-                    preserve_intent_changes(&mut restore, &current, &provisional);
-                    *owner.state.job_mut(job).unwrap() = restore;
-                }
+            // The record transition still excludes replacements. Deferred
+            // removal/adoption may invalidate the admission's epoch, but the
+            // provisional row must still be rolled back before they run.
+            if let Some(current) = owner.state.job(job).cloned() {
+                let mut restore = previous;
+                preserve_intent_changes(&mut restore, &current, &provisional);
+                *owner.state.job_mut(job).unwrap() = restore;
+                owner.post_rollbacks.insert(
+                    job,
+                    PostRollback {
+                        generation: owner.job_epochs.get(&job).copied().unwrap_or(lifetime),
+                        control_revision: owner.control_epochs.get(&job).copied(),
+                        in_flight: false,
+                    },
+                );
                 owner.dirty = true;
-                owner.persist_then(move |owner, restored| {
-                    if restored {
-                        owner.pending_control_commits.remove(&job);
-                    }
-                    owner.record_transitions.remove(&job);
-                    owner.drain_replacements();
-                    owner.publish_now();
+                owner.persist_post_rollbacks_then(move |owner| {
                     callback(owner, false);
                 });
             } else {
+                owner.pending_control_commits.remove(&job);
                 owner.record_transitions.remove(&job);
                 owner.drain_replacements();
                 callback(owner, false);
@@ -582,18 +979,111 @@ impl Owner {
         });
     }
 
+    /// Failed rollback writes retain their operational fence until a later
+    /// snapshot acknowledges the restored row. Batch all waiting rows into
+    /// one document, and never enqueue another retry while one is in flight.
+    pub(super) fn persist_post_rollbacks_then(
+        &mut self,
+        callback: impl FnOnce(&mut Owner) + Send + 'static,
+    ) {
+        if self.projection_transition
+            || self.persistence_fenced
+            || (!self.persist && !self.worker_mode)
+        {
+            callback(self);
+            return;
+        }
+        let waiting = self
+            .post_rollbacks
+            .iter()
+            .filter_map(|(job, rollback)| (!rollback.in_flight).then_some(*job))
+            .collect::<Vec<_>>();
+        let mut dispatched = Vec::new();
+        for job in waiting {
+            let Some(generation) = self
+                .job_epochs
+                .get(&job)
+                .copied()
+                .filter(|_| self.state.job(job).is_some())
+            else {
+                self.post_rollbacks.remove(&job);
+                self.record_transitions.remove(&job);
+                self.pending_control_commits.remove(&job);
+                continue;
+            };
+            let fence = PostRollback {
+                generation,
+                control_revision: self.control_epochs.get(&job).copied(),
+                in_flight: true,
+            };
+            self.post_rollbacks.insert(job, fence);
+            dispatched.push((job, fence));
+        }
+        if dispatched.is_empty() {
+            callback(self);
+            return;
+        }
+        self.persist_then(move |owner, committed| {
+            let mut released = false;
+            for (job, fence) in dispatched {
+                if owner.post_rollbacks.get(&job) != Some(&fence) {
+                    continue;
+                }
+                let current = owner.job_epochs.get(&job) == Some(&fence.generation)
+                    && owner.control_epochs.get(&job).copied() == fence.control_revision;
+                if committed && current {
+                    owner.post_rollbacks.remove(&job);
+                    owner.record_transitions.remove(&job);
+                    owner.pending_control_commits.remove(&job);
+                    released = true;
+                } else if let Some(rollback) = owner.post_rollbacks.get_mut(&job) {
+                    rollback.in_flight = false;
+                }
+            }
+            owner.drain_replacements();
+            owner.publish_now();
+            if released {
+                owner.bump_epoch();
+            }
+            callback(owner);
+        });
+    }
+
+    pub(super) fn settled_post_rollback(&self, job: JobId) -> bool {
+        self.post_rollbacks
+            .get(&job)
+            .is_some_and(|rollback| !rollback.in_flight)
+    }
+
+    /// Authority replacement can supersede a failed local rollback, but only
+    /// its own durable acknowledgment can release the inherited barriers.
+    fn clear_post_rollback_barriers(&mut self) {
+        for (job, _) in self.post_rollbacks.drain() {
+            self.record_transitions.remove(&job);
+            self.pending_control_commits.remove(&job);
+        }
+    }
+
     pub(super) fn finish_post_admission(
         &mut self,
         admission: crate::PostAdmission,
         callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
-        if !self.post_scope_current(&admission) {
+        if !self.post_scope_current(&admission)
+            || self.failed_cleanup_admissions.contains_key(&admission.job)
+        {
             callback(self, false);
             return;
         }
         // Manager sends this only after its actual tool/reader worker drain.
         self.post_admissions.remove(&admission.job);
         self.post_cancellations.remove(&admission.job);
+        if self.job_disposing(admission.job) {
+            self.publish_now();
+            self.bump_epoch();
+            callback(self, true);
+            return;
+        }
         if !self.remove_job_silent(admission.job) {
             callback(self, false);
             return;
@@ -706,9 +1196,9 @@ impl Owner {
                     Ok(Some(checkpoint)) => {
                         worker_control_restored = true;
                         job.set_control(&checkpoint.control);
-                        job.status = if checkpoint.control.lifecycle == "held"
-                            || checkpoint.control.manual_pause
-                        {
+                        job.status = if checkpoint.control.lifecycle == "held" {
+                            JobStatus::Held
+                        } else if checkpoint.control.manual_pause {
                             JobStatus::Paused
                         } else if matches!(
                             checkpoint.control.previous_status,
@@ -750,7 +1240,7 @@ impl Owner {
         {
             // Remote/exported legacy snapshots cannot erase a newer local fence.
             job.set_control(&control);
-            job.status = JobStatus::Paused;
+            job.status = JobStatus::Held;
             job.params.retain(|(k, _)| k != nzbd_types::PP_DONE_PARAM);
         }
         Ok((false, preserve_publication))
@@ -788,11 +1278,16 @@ impl Owner {
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         let job = candidate.id;
+        // An imported row's ranges were not written by this boot's
+        // snapshot: they are verified, never stamped (no-wedge item 5).
+        self.boot_jobs.remove(&job);
+        // An imported row may come from a 0.5.0 node (a hold as `paused`).
+        crate::normalize_stored_hold_status(&mut candidate, "imported job");
         if require_existing && self.state.job(job).is_none() {
             callback(self, Err(failure("replacement target no longer exists")));
             return;
         }
-        if require_snapshot && !self.persist && !self.worker_mode {
+        if require_snapshot && !self.persist {
             callback(
                 self,
                 Err(failure("replacement requires durable queue ownership")),
@@ -852,6 +1347,7 @@ impl Owner {
             self.writers.remove(&file.id);
         }
         let old_allocation = self.allocation_cache.remove(&job);
+        self.artifacts.invalidate_writer_naming(job.0);
         if preserve_publication {
             if let Some(allocation) = old_allocation.as_ref() {
                 self.allocation_cache.insert(job, allocation.clone());
@@ -986,11 +1482,21 @@ impl Owner {
     pub(super) fn replace_projection_then(
         &mut self,
         mut jobs: Vec<Job>,
+        adopted_speed: Option<(u64, Option<u64>)>,
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
+        // Replicated rows are verified, never stamped (no-wedge item 5).
+        self.boot_jobs.clear();
+        // Replicated rows may come from a 0.5.0 node (a hold as `paused`).
+        for job in &mut jobs {
+            crate::normalize_stored_hold_status(job, "replicated authority");
+        }
         if !self.post_admissions.is_empty()
             || !self.allocating_jobs.is_empty()
-            || !self.record_transitions.is_empty()
+            || self
+                .record_transitions
+                .iter()
+                .any(|job| !self.settled_post_rollback(*job))
             || self.projection_transition
             || !self.retiring_writers.is_empty()
             || self.verification.values().any(|state| state.running)
@@ -1015,6 +1521,14 @@ impl Owner {
             );
             return;
         }
+        let previous_speed = self.state.speed_limit_bps;
+        self.artifacts.invalidate_all_writer_naming();
+        let speed_revision = adopted_speed
+            .filter(|(revision, _)| *revision == self.speed_limit_revision)
+            .map(|(revision, speed)| {
+                self.state.speed_limit_bps = speed;
+                revision
+            });
         self.projection_transition = true;
         let previous = self.state.jobs.clone();
         let old_delegated = std::mem::take(&mut self.delegated);
@@ -1078,12 +1592,22 @@ impl Owner {
                 .iter()
                 .all(|(job, epoch)| owner.job_epochs.get(job) == Some(epoch));
             if !current {
-                owner.projection_transition = false;
-                owner.drain_replacements();
-                callback(owner, Err(failure("authority projection was superseded")));
+                if speed_revision == Some(owner.speed_limit_revision) {
+                    owner.state.speed_limit_bps = previous_speed;
+                }
+                owner.persist_then(move |owner, _| {
+                    owner.projection_transition = false;
+                    owner.drain_replacements();
+                    callback(owner, Err(failure("authority projection was superseded")));
+                });
                 return;
             }
             if !committed {
+                // Restore rate intent before serializing the rollback snapshot.
+                // A later operator edit owns its own revision and survives.
+                if speed_revision == Some(owner.speed_limit_revision) {
+                    owner.state.speed_limit_bps = previous_speed;
+                }
                 let mut restored = previous;
                 for old in &mut restored {
                     if let Some((current, provisional)) = owner
@@ -1118,6 +1642,7 @@ impl Owner {
                 }
                 owner.persist_then(move |owner, restored| {
                     if restored {
+                        owner.clear_post_rollback_barriers();
                         for (job, _) in &fence {
                             owner.pending_control_commits.remove(job);
                         }
@@ -1129,6 +1654,9 @@ impl Owner {
                     owner.projection_transition = false;
                     owner.drain_replacements();
                     owner.publish_now();
+                    if restored {
+                        owner.bump_epoch();
+                    }
                     callback(
                         owner,
                         Err(failure(
@@ -1138,7 +1666,14 @@ impl Owner {
                 });
                 return;
             }
+            if speed_revision.is_some() {
+                owner.applied_usenet_limit = None;
+                owner.applied_torrent_limit = None;
+                let rate = owner.shared.load().download_rate_bps;
+                owner.rebalance_download_budget(rate);
+            }
             owner.projection_transition = false;
+            owner.clear_post_rollback_barriers();
             for (job, _) in &fence {
                 owner.pending_control_commits.remove(job);
             }
@@ -1153,9 +1688,17 @@ impl Owner {
         });
     }
 
-    /// Enumerate lifecycle roots on the state lane, then reconcile each root
-    /// ahead of its allocation and verification workers. Orphan-only roots are
-    /// included so interrupted lifecycle operations cannot be skipped forever.
+    /// Enumerate lifecycle roots and open lifecycle intents on the state
+    /// lane (metadata only), classify every recovered job, then reconcile
+    /// each root in the background.
+    ///
+    /// No-wedge (Paul, 2026-11-11): the only file that may need anything at
+    /// a restart is the one being written; resume or re-fetch it and keep
+    /// moving. Until classification lands every job holds a "loading"
+    /// ticket (one SQLite pass). Then a job keeps its ticket only for
+    /// unproven ranges, an identity conflict or an open lifecycle intent;
+    /// every other job — proven, paused, legacy — is released untouched and
+    /// checked lazily at writer spawn or post-processing admission.
     pub(super) fn schedule_startup_reconciliation(&mut self) {
         if self.startup_roots_loading
             || self.startup_roots_ready
@@ -1172,22 +1715,53 @@ impl Owner {
             .filter(|job| needs_payload(job))
             .map(|job| job.id)
             .collect::<Vec<_>>();
-        for job in jobs {
-            self.queue_verification(job);
-            if let Some(state) = self.verification.get_mut(&job) {
+        // One snapshot publication for the whole queue, not one per job.
+        self.publish_batched = true;
+        for job in &jobs {
+            self.queue_verification(*job);
+            if let Some(state) = self.verification.get_mut(job) {
                 state.phase = "loading".into();
             }
         }
+        self.publish_batched = false;
+        self.publish_now();
         let snapshot = self.startup_snapshot.clone();
-        self.io_then(move || Ok::<_, nzbd_state::StateError>(snapshot.roots().to_vec()), move |owner, result| {
+        let inventory = self.artifacts.clone();
+        let candidates = jobs.iter().map(|job| job.0).collect::<Vec<_>>();
+        self.io_then(move || {
+            let roots = snapshot.roots().to_vec();
+            let mut intents = inventory
+                .open_relocation_intents()
+                .map_err(failure)?
+                .into_iter()
+                .map(|intent| intent.job)
+                .collect::<HashSet<u32>>();
+            for job in candidates {
+                if inventory.has_transform_custody(job).map_err(failure)? {
+                    intents.insert(job);
+                }
+            }
+            Ok::<_, nzbd_state::StateError>((roots, intents))
+        }, move |owner, result| {
             owner.startup_roots_loading = false;
             match result {
-                Ok(mut roots) => {
+                Ok((mut roots, intents)) => {
                     roots.push(owner.dest_dir.clone());
+                    roots.push(owner.artifacts.workspace_dir());
+                    roots.extend(owner.configured_payload_roots.iter().cloned());
                     roots.extend(owner.allocation_cache.values().map(|allocation| allocation.root.clone()));
                     roots.sort();
                     roots.dedup();
+                    owner.startup_intent_jobs = intents.into_iter().map(JobId).collect();
+                    // A retiring, retained or still-allocating allocation is
+                    // an open lifecycle intent of its own.
+                    owner.startup_intent_jobs.extend(
+                        owner.allocation_cache.iter()
+                            .filter(|(_, allocation)| allocation.state != "active")
+                            .map(|(job, _)| *job),
+                    );
                     owner.startup_roots_ready = true;
+                    owner.classify_startup_jobs();
                     for root in roots { owner.reconcile_payload_root(root); }
                 }
                 Err(error) => {
@@ -1199,6 +1773,51 @@ impl Owner {
                 }
             }
         });
+    }
+
+    /// Release every startup ticket the job does not need; hand the rest
+    /// to recovery now (a live active allocation does not wait for its
+    /// root's reconciliation).
+    fn classify_startup_jobs(&mut self) {
+        let mut released = 0u32;
+        let mut ticketed = Vec::new();
+        self.publish_batched = true;
+        let jobs = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| {
+                self.verification
+                    .get(&job.id)
+                    .is_some_and(|state| !state.running && state.phase == "loading")
+            })
+            .map(|job| (job.id, self.startup_ticket_needed(job)))
+            .collect::<Vec<_>>();
+        for (job, needed) in jobs {
+            if needed {
+                ticketed.push(job);
+            } else {
+                self.release_startup_ticket(job);
+                released += 1;
+            }
+        }
+        self.publish_batched = false;
+        self.startup_phases.classified_ms = Some(crate::startup_phases::since_boot_ms());
+        self.startup_phases.startup_tickets = ticketed.len() as u32;
+        self.startup_phases.startup_untouched = released;
+        tracing::info!(
+            released,
+            ticketed = ticketed.len(),
+            intents = self.startup_intent_jobs.len(),
+            "startup classification: proven and paused jobs released without verification"
+        );
+        for job in ticketed {
+            if !self.pending_control_commits.contains(&job) {
+                self.queue_payload_recovery(job);
+            }
+        }
+        self.publish_now();
+        self.bump_epoch();
     }
 
     fn reconcile_payload_root(&mut self, root: PathBuf) {
@@ -1228,10 +1847,88 @@ impl Owner {
         let worker_root = root.clone();
         let default_root = self.dest_dir.clone();
         let snapshot = self.startup_snapshot.clone();
-        self.payload_then(root.clone(), move || {
+        // W9: a `.runner-file-<id>.part` that is a second name of its
+        // finalized file's publication is removed at startup.
+        let parts = self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| needs_payload(job))
+            .filter_map(|job| {
+                let allocation = self.allocation_cache.get(&job.id)?;
+                (allocation.root == root).then(|| {
+                    (
+                        allocation.path.clone(),
+                        job.files
+                            .iter()
+                            .filter(|file| file.finalized)
+                            .map(|file| {
+                                let key = format!("*File:proof:{}", file.id.0);
+                                let published = job
+                                    .params
+                                    .iter()
+                                    .find(|(name, _)| name == &key)
+                                    .and_then(|(_, raw)| {
+                                        serde_json::from_str::<crate::recovery::DurableFileProof>(
+                                            raw,
+                                        )
+                                        .ok()
+                                    })
+                                    .and_then(|proof| proof.publication_name)
+                                    .unwrap_or_else(|| file.filename.clone());
+                                (file.id.0, published)
+                            })
+                            .collect::<HashMap<u32, String>>(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        // No-wedge item 6: reconciliation runs off the payload lane, so a slow
+        // (FUSE/NFS) root never queues the lease-time allocation revalidation
+        // of its live active jobs behind it. It touches only allocations that
+        // are not live and active; jobs with open intents wait for it.
+        let started_ms = crate::startup_phases::since_boot_ms();
+        let started = Instant::now();
+        let label = root.display().to_string();
+        self.startup_phases
+            .roots
+            .retain(|entry| entry.root != label);
+        self.startup_phases
+            .roots
+            .push(crate::startup_phases::RootReconciliation {
+                root: label.clone(),
+                started_ms,
+                duration_ms: None,
+                ok: None,
+            });
+        let configured = worker_root == self.artifacts.workspace_dir()
+            || self.configured_payload_roots.contains(&worker_root);
+        self.background_then(format!("reconcile-{}", root.display()), move || {
             if worker_root == default_root { prepare_unenrolled_payload_root(&inventory, &worker_root)?; }
-            inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)
+            // A configured root nothing has used yet (no row names it, the
+            // directory does not exist) has nothing to reconcile. An
+            // enrolled root that is missing stays a failure: its mount may
+            // be unavailable.
+            if configured && worker_root != default_root && matches!(
+                std::fs::symlink_metadata(&worker_root),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) && !inventory.startup_reconciliation_roots().map_err(failure)?.contains(&worker_root) {
+                return Ok(());
+            }
+            inventory.reconcile_startup_root_snapshot(&worker_root, &live, &snapshot).map_err(failure)?;
+            for (dir, finalized) in &parts {
+                sweep_stale_parts(dir, finalized);
+            }
+            // W5a: directory probe files a killed run left behind.
+            crate::space_probe::sweep_probe_files(&worker_root);
+            Ok(())
         }, move |owner, result| {
+            let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Some(entry) = owner.startup_phases.roots.iter_mut().find(|entry| entry.root == label) {
+                entry.duration_ms = Some(elapsed);
+                entry.ok = Some(result.is_ok());
+            }
+            tracing::info!(root=%root.display(), ms = elapsed, ok = result.is_ok(), "startup root reconciliation finished");
             let state = owner.startup_reconciliation.get_mut(&root).unwrap();
             state.running = false;
             state.ready = result.is_ok();
@@ -1253,9 +1950,9 @@ impl Owner {
 
     /// One classification path for boot, import and both authority adoptions.
     pub(super) fn queue_payload_recovery(&mut self, job: JobId) {
-        let Some(record) = self.state.job(job).cloned().filter(needs_payload) else {
+        if !self.state.job(job).is_some_and(needs_payload) {
             return;
-        };
+        }
         if self.post_admissions.contains_key(&job)
             || self.pending_control_commits.contains(&job)
             || self
@@ -1275,6 +1972,30 @@ impl Owner {
         if self.allocating_jobs.contains(&job) {
             return;
         }
+        // Recovery invalidates the cached capability even when admission must
+        // wait. Otherwise startup's advisory cache makes the retry selector
+        // mistake a deferred row for an already reconciled allocation.
+        self.allocation_cache.remove(&job);
+        self.allocated_jobs.remove(&job);
+        if !self.payload_recovery_capacity_available() {
+            // Keep the row as the deferred work obligation. Avoid recursively
+            // asking queue_verification to allocate while creating its ticket.
+            if !self.verification.contains_key(&job) {
+                self.allocating_jobs.insert(job);
+                self.queue_verification(job);
+                self.allocating_jobs.remove(&job);
+            }
+            if let Some(state) = self.verification.get_mut(&job) {
+                state.phase = "loading".into();
+                state.reason = None;
+            }
+            return;
+        }
+        // Deferred rows retain their ticket without repeatedly copying a full
+        // NZB descriptor on every lane completion.
+        let Some(record) = self.state.job(job).cloned() else {
+            return;
+        };
         let plan = match imported_payload_plan(&record, &self.dest_dir) {
             Ok(plan) => plan,
             Err(error) => {
@@ -1286,8 +2007,6 @@ impl Owner {
         let inventory = self.artifacts.clone();
         let fallback_root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
-        self.allocation_cache.remove(&job);
-        self.allocated_jobs.remove(&job);
         self.allocating_jobs.insert(job);
         self.queue_verification(job);
         if let Some(state) = self.verification.get_mut(&job) {
@@ -1318,10 +2037,17 @@ impl Owner {
                         .map(|allocation| allocation.root.clone())
                         .unwrap_or_else(|| fallback_root.clone())
                 };
-                if !owner
-                    .startup_reconciliation
-                    .get(&root)
-                    .is_some_and(|state| state.ready)
+                // Only an open lifecycle intent (or an allocation that is not
+                // live and active) waits for its root's reconciliation.
+                let gated = owner.startup_intent_jobs.contains(&job)
+                    || allocation
+                        .as_ref()
+                        .is_none_or(|allocation| allocation.state != "active");
+                if gated
+                    && !owner
+                        .startup_reconciliation
+                        .get(&root)
+                        .is_some_and(|state| state.ready)
                 {
                     owner.allocating_jobs.remove(&job);
                     if !owner.startup_reconciliation.contains_key(&root) {
@@ -1344,13 +2070,45 @@ impl Owner {
                 owner.payload_then(
                     root.clone(),
                     move || {
-                        allocate_imported_payload(
+                        let allocation = allocate_imported_payload(
                             &inventory,
                             &record,
                             &fallback_root,
                             &plan,
                             allocation,
-                        )
+                        )?;
+                        let transformed = inventory
+                            .has_transform_custody(record.id.0)
+                            .map_err(failure)?;
+                        if !transformed && pristine_download(&record) {
+                            // Keep the verifier's fresh allocation and anchored
+                            // custody checks even when there are no ranges to hash.
+                            let current = inventory
+                                .for_job(record.id.0)
+                                .map_err(failure)?
+                                .ok_or_else(|| {
+                                    failure("allocation disappeared during preparation")
+                                })?;
+                            if current.id != allocation.id
+                                || current.generation != allocation.generation
+                                || current.path != allocation.path
+                                || current.root != allocation.root
+                            {
+                                return Err(failure(
+                                    "allocation authority changed during preparation",
+                                ));
+                            }
+                            let custody = inventory
+                                .acquire_terminal_use(record.id.0, &|| Ok(()))
+                                .map_err(failure)?
+                                .ok_or_else(|| failure("allocation custody is unavailable"))?;
+                            if custody.source().artifact != allocation.id
+                                || custody.source().generation != allocation.generation
+                            {
+                                return Err(failure("allocation custody generation differs"));
+                            }
+                        }
+                        Ok((allocation, transformed))
                     },
                     move |owner, result| {
                         owner.allocating_jobs.remove(&job);
@@ -1358,12 +2116,39 @@ impl Owner {
                             return;
                         }
                         match result {
-                            Ok(allocation) => {
+                            Ok((allocation, transformed)) => {
                                 if allocation.state == "active" {
                                     owner.allocated_jobs.insert(job);
                                 }
                                 owner.allocation_cache.insert(job, allocation);
-                                owner.queue_verification(job);
+                                let journal_pending = owner
+                                    .pending_journal_loads
+                                    .get(&job)
+                                    .is_some_and(|loading| loading.0 == epoch);
+                                if !transformed
+                                    && !journal_pending
+                                    && owner.state.job(job).is_some_and(pristine_download)
+                                {
+                                    // Journal replay and allocation/custody reconciliation
+                                    // established that there are no payload claims to read.
+                                    // No proof or segment transition needs a per-job save.
+                                    owner.verification.remove(&job);
+                                    if let Some(record) = owner.state.job_mut(job) {
+                                        set_owner_param(
+                                            &mut record.params,
+                                            "*Recovery:pending",
+                                            None,
+                                        );
+                                        set_owner_param(
+                                            &mut record.params,
+                                            "*Recovery:reason",
+                                            None,
+                                        );
+                                    }
+                                    owner.dirty = true;
+                                } else {
+                                    owner.queue_verification(job);
+                                }
                             }
                             Err(error) => owner.payload_recovery_failed(job, error),
                         }
@@ -1378,6 +2163,14 @@ impl Owner {
 
     fn payload_recovery_failed(&mut self, job: JobId, error: nzbd_state::StateError) {
         self.allocating_jobs.remove(&job);
+        if matches!(error, nzbd_state::StateError::Busy(_)) {
+            if let Some(state) = self.verification.get_mut(&job) {
+                state.phase = "loading".into();
+                state.reason = None;
+                state.retry_at = Instant::now();
+            }
+            return;
+        }
         if let Some(state) = self.verification.get_mut(&job) {
             state.phase = "blocked".into();
             state.reason = Some(error.to_string());
@@ -1421,7 +2214,9 @@ impl Owner {
                     && !self.allocating_jobs.contains(&job.id)
                     && !self.pending_control_commits.contains(&job.id)
                     && self.verification.get(&job.id).is_some_and(|state| {
-                        !state.running && state.phase == "blocked" && state.retry_at <= now
+                        !state.running
+                            && matches!(state.phase.as_str(), "blocked" | "loading")
+                            && state.retry_at <= now
                     })
             })
             .map(|job| job.id)
@@ -1429,6 +2224,49 @@ impl Owner {
         for job in jobs {
             self.queue_payload_recovery(job);
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_part_tests {
+    use super::*;
+    /// Finding 1: the sweep removes only a partial that is a second name of
+    /// its finalized file's publication. A finalized file whose publication
+    /// is missing or a different object keeps its partial (it may be the only
+    /// copy), and so do unfinalized and unknown files.
+    #[test]
+    fn startup_sweep_removes_only_a_second_name_of_the_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // 1: finalized, published, killed before unlink → same object.
+        std::fs::write(d.join("one.mkv"), b"x").unwrap();
+        std::fs::hard_link(d.join("one.mkv"), d.join(".runner-file-1.part")).unwrap();
+        // 2: "finalized" but the rename never happened → only copy.
+        std::fs::write(d.join(".runner-file-2.part"), b"only").unwrap();
+        // 3: finalized, publication exists but is a different object.
+        std::fs::write(d.join("three.mkv"), b"y").unwrap();
+        std::fs::write(d.join(".runner-file-3.part"), b"z").unwrap();
+        // 4: not finalized (not in the map) → resumable.
+        std::fs::write(d.join("four.mkv"), b"w").unwrap();
+        std::fs::hard_link(d.join("four.mkv"), d.join(".runner-file-4.part")).unwrap();
+        std::fs::write(d.join(".runner-file-x.part"), b"x").unwrap();
+        let finalized: HashMap<u32, String> = [
+            (1, "one.mkv".to_string()),
+            (2, "two.mkv".to_string()),
+            (3, "three.mkv".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(sweep_stale_parts(d, &finalized), 1);
+        assert!(!d.join(".runner-file-1.part").exists());
+        assert!(d.join("one.mkv").exists());
+        assert_eq!(
+            std::fs::read(d.join(".runner-file-2.part")).unwrap(),
+            b"only"
+        );
+        assert!(d.join(".runner-file-3.part").exists());
+        assert!(d.join(".runner-file-4.part").exists());
+        assert!(d.join(".runner-file-x.part").exists());
     }
 }
 

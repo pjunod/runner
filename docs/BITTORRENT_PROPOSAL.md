@@ -1,5 +1,13 @@
 # BitTorrent support — one queue, two transfer protocols
 
+**Security amendment, 2026-11-13:** maintained patch
+[`0023-upgrade-upnp-xml-parser.patch`](../contrib/rqbit/0023-upgrade-upnp-xml-parser.patch)
+upgrades the compiled UPnP helper to fixed quick-xml 0.41 and removes both
+XML advisory exceptions. UPnP remains unavailable. Earlier exception tables
+and native matrix measurements below record historical evidence; the
+[gate 9 advisory scope](BITTORRENT_GATE9_REVIEW.md#2-advisory-scope--fixed-parser-no-rustsec-exceptions)
+is authoritative for the updated dependency policy.
+
 **Status:** ADR-19 implemented for single-node v1; M2 lifecycle/policy/activation,
 M3 native surfaces, and M4 qBittorrent compatibility are implemented; the
 magnet DHT amendment is locally qualified and awaits PR publication ·
@@ -555,7 +563,8 @@ and [public torrent statistics](https://docs.rs/librqbit/8.1.1/librqbit/struct.T
 #### 4.3.3 Maintained-engine amendment — selected 2026-08-14
 
 This amendment supersedes the release-only conclusions in §§4.3.1–4.3.2.
-ADR-19 selects rqbit v8.1.1 plus exactly these twelve stable patches:
+The 2026-09-22 amendment selected rqbit v8.1.1 plus these twelve stable
+patches; §4.3.4 records the current security renewal:
 
 1. disable automatic restore while retaining explicit restore;
 2. bound tracker response size, request duration, and announce cadence;
@@ -619,6 +628,45 @@ condition of this ADR. Gate 9 additionally requires patch integrity, every
 reviewed runtime limit, dependency/license evidence, and current native
 measurements. Passing M0 authorizes decomposition and review of M2; it does not
 add daemon config, admission, a listener, DHT, tracker work, or payload I/O.
+
+#### 4.3.4 Security maintenance renewal — 2026-11-13
+
+The canonical [maintained series](../contrib/rqbit/maintained-series.txt)
+now contains fifteen patches against the same checksum-pinned v8.1.1 archive.
+Patches 0022 and 0023 add read-only piece verification and compatible parser/
+lockfile security fixes. Patch 0024 replaces backoff/instant with an owned
+native peer/bootstrap policy and the optional crypto-hash backend with
+RustCrypto SHA-1 behind the historical feature name. Production still uses
+AWS-LC; no listener, discovery source, admission authority or resource limit
+is added or enabled.
+
+A direct backon backport was considered and rejected because its jitter and
+elapsed-budget rules differ. The selected small policy preserves symmetric
+50% jitter, the 10-second initial delay, factors 6/1.5, one-hour/one-minute
+base caps, reset and the 24-hour elapsed budget including the next sleep.
+An independent comparison against backoff 0.4 matches 40,000 cases. The
+project assumes maintenance of this narrow policy instead of a generic retry
+library. Native Linux/macOS/Windows gates exercise its fixed vectors, both
+SHA-1 backends and existing peer wire fixtures; the full maintained proof,
+M0 resource/storage/discovery tests, fuzzing and protected CI remain required.
+This retains the small-maintainable-change decision rather than broadening
+the engine or adopting a newer major release.
+
+The unused librqbit bincode 2 declaration is removed, eliminating it from
+the fuzz/maintained-library graph. Real bincode 1.3.3 peer and 2.0.1 Hiqlite
+persistence uses and their maintenance notices remain visible. Its peer and persisted
+Raft/WAL encodings are unchanged: the 3.0.0 package is a compile-error
+retirement marker. Community bincode-next/bincode_reloaded 3.x forks and
+schema-based alternatives exist, but their compatibility with this project's
+actual persisted and peer records has not been independently established.
+Replacing the codec requires byte/behavior and cross-version recovery proof,
+with a migration wherever formats differ. Optional stock CLI/
+UI and unselected vendor-feature snapshots are inventoried separately from
+actual product and maintained compatibility graphs; their presence is not
+described as a fixed or supported runtime. Optional contribution probes
+compile the CLI without its unrelated stock web UI/npm hook and still target
+independent upstream sources, with their own upstream limitations. No
+advisory suppression is introduced.
 
 ### 4.4 Consequences
 
@@ -1317,7 +1365,7 @@ unleased delegation if its target becomes held. `/api/v1/cluster` publishes the 
 for each node, while the ordinary status response describes the node serving
 that engine snapshot.
 
-[`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md) F1–F3 landed before this expansion.
+[`REGRAB_LOOP_PLAN.md`](archive/REGRAB_LOOP_PLAN.md) F1–F3 landed before this expansion.
 Observed ENOSPC/EDQUOT from existing writers and post-processing still latches
 the same immediate guard even when a mounted filesystem's forecast lies. The
 dormant torrent adapter does not yet report its `StorageFull` signal into that
@@ -2329,9 +2377,9 @@ metainfo/magnet/URL admission · durable descriptor before start · handle map �
 stats coalescing · readiness · pause/resume/delete · seed policy · download and
 upload limits · disk guard · watch directory · terminal history.
 
-**Prerequisites already met:** [`REGRAB_LOOP_PLAN.md`](REGRAB_LOOP_PLAN.md)
+**Prerequisites already met:** [`REGRAB_LOOP_PLAN.md`](archive/REGRAB_LOOP_PLAN.md)
 F1–F3 landed on 2026-07-31, and
-[`DEFECT_HISTORY_DELETE.md`](DEFECT_HISTORY_DELETE.md) is resolved with shared
+[`DEFECT_HISTORY_DELETE.md`](archive/DEFECT_HISTORY_DELETE.md) is resolved with shared
 JSONL tombstones. M2 may rely on the enforcing disk guard and terminal-history
 delete semantics; neither is still a reason to start production networking.
 The complete M0 matrix and independent review of the maintained engine are

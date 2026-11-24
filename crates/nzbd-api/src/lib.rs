@@ -173,6 +173,9 @@ type StorageTarget = nzbd_config::StorageRoot;
 /// Values are optional when no existing ancestor can be measured.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StoragePathDto {
+    /// The dashboard name: `processing`, `completed`, or
+    /// `processing · completed` when one filesystem holds both.
+    pub name: String,
     pub label: String,
     pub path: String,
     pub available_bytes: Option<u64>,
@@ -180,6 +183,23 @@ pub struct StoragePathDto {
     /// False means the current cycle could not measure this row. Non-None
     /// capacity is last-known evidence; None means it has never been known.
     pub current: bool,
+    /// Read/write throughput, sampled once a second. `null` when the
+    /// platform gives the filesystem no device identity.
+    pub io: Option<StorageIoDto>,
+}
+
+/// Throughput for one filesystem. `source` says what the numbers mean:
+/// `block` is device-wide (every program on that disk), `nfs` is this
+/// machine's traffic to the server, `runner` is Runner's own I/O on a
+/// filesystem the kernel keeps no counters for (FUSE such as GlusterFS, SMB;
+/// `detail` names the type), and `stale` means the sampler stopped.
+/// Rates are `null` until a second sample exists.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StorageIoDto {
+    pub source: &'static str,
+    pub detail: String,
+    pub read_bps: Option<u64>,
+    pub write_bps: Option<u64>,
 }
 
 #[cfg(test)]
@@ -200,11 +220,13 @@ fn measure_storage(targets: &[StorageTarget]) -> Vec<StoragePathDto> {
 #[cfg(test)]
 fn storage_path_dto(reading: nzbd_engine::volumes::StorageVolumeReading) -> StoragePathDto {
     StoragePathDto {
+        name: reading.name(),
         label: reading.label,
         path: reading.path.to_string_lossy().into_owned(),
         available_bytes: reading.available_bytes,
         total_bytes: reading.total_bytes,
         current: reading.current,
+        io: None,
     }
 }
 
@@ -471,6 +493,10 @@ pub struct StatusDto {
     pub remaining_bytes: u64,
     pub session_downloaded_bytes: u64,
     pub download_paused: bool,
+    /// Post-processing lane paused — independent of `download_paused`.
+    /// Downloaded jobs wait in `post_queued`; a running job holds at its
+    /// next stage boundary.
+    pub post_paused: bool,
     /// Queue-hold reasons (why nothing is downloading right now).
     pub disk_low: bool,
     /// Lowest measured free bytes across all configured write roots.
@@ -490,6 +516,10 @@ pub struct StatusDto {
     pub enospc_observed: u64,
     /// Operation and path of the last one.
     pub enospc_where: Option<String>,
+    /// Every out-of-space failure currently holding intake: what failed,
+    /// the path, and the configured volume that path is on (named as the
+    /// `storage` rows name it). Empty when no write-observed hold is set.
+    pub enospc_failures: Vec<nzbd_engine::snapshot::SpaceFailureSnapshot>,
     pub quota_reached: bool,
     pub blocked_servers: Vec<u32>,
     /// Critical-health abort armed (`[post] health_action` park/delete)?
@@ -525,6 +555,98 @@ pub struct StatusDto {
     pub servers: Vec<nzbd_engine::ServerVolume>,
     /// Cached capacity readings for the paths this process relies on.
     pub storage: Vec<StoragePathDto>,
+    /// W10: a restart waiting for post-processing to reach a resumable
+    /// boundary (PAR repair and extraction restart from scratch, so they
+    /// finish first). Absent when no restart is waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_pending: Option<RestartPending>,
+    /// W10: the last deferred restart that passed its `not_after` before
+    /// post-processing drained, so it did not run. Cleared by the next
+    /// restart request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_expired: Option<RestartPending>,
+    /// Restart phase timings since process start: listener bound, first
+    /// article lease, classification, per-root background reconciliation.
+    pub startup: nzbd_engine::startup_phases::StartupPhases,
+}
+
+/// A deferred restart: when it was asked for and what it waits on.
+#[derive(Clone, Debug, Serialize)]
+pub struct RestartPending {
+    pub requested_at_unix: i64,
+    /// The request's `not_after`: past it, the restart expires unrun.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_after_unix: Option<i64>,
+    pub waiting_for: Vec<RestartWait>,
+    /// Idempotency keys of the requests this restart answers.
+    #[serde(skip)]
+    keys: Vec<String>,
+    /// Backend generation the request was made under: a reload since then
+    /// already restarted.
+    #[serde(skip)]
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RestartWait {
+    pub job: u32,
+    pub name: String,
+    pub stage: &'static str,
+}
+
+static RESTART_PENDING: std::sync::Mutex<Option<RestartPending>> = std::sync::Mutex::new(None);
+
+/// The repair/extract drain is exactly "a restart is pending". Called with
+/// the `RESTART_PENDING` guard held, so no request, expiry or cancel can
+/// interleave between changing the slot and the flag (a re-request racing
+/// an expiry once left the drain on with nothing pending, and repair and
+/// extraction never started again).
+fn sync_restart_drain(pending: &Option<RestartPending>) {
+    nzbd_engine::set_restart_drain(pending.is_some());
+}
+static RESTART_EXPIRED: std::sync::Mutex<Option<RestartPending>> = std::sync::Mutex::new(None);
+
+/// The backend currently serving (each in-process reload builds a new
+/// engine and setup handle): a deferred restart polls and restarts *this*
+/// one, never the one it was asked under.
+///
+/// It holds only what the poller reads — the published queue snapshot and
+/// the config-only setup handle — never an [`EngineHandle`]. The handle owns
+/// the backend's `artifacts.sqlite` inventory and history store, both opened
+/// `locking_mode=EXCLUSIVE` behind directory locks: a process-wide clone of
+/// it outlived the backend's teardown, and the reload's fresh instance could
+/// then never acquire them (it is registered here only *after* opening them),
+/// so every in-process restart stayed `backend_loading` forever.
+static CURRENT_BACKEND: std::sync::Mutex<Option<(nzbd_engine::SharedSnapshot, Arc<SetupHandle>)>> =
+    std::sync::Mutex::new(None);
+static BACKEND_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn register_backend(engine: &EngineHandle, setup: &Arc<SetupHandle>) {
+    *CURRENT_BACKEND.lock().unwrap() = Some((engine.shared_snapshot(), setup.clone()));
+    BACKEND_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    // A restart deferred under the previous backend is settled by this
+    // reload (or expired); either way its drain ends here, even if the task
+    // that polled it did not survive the reload.
+    poll_pending_restart(unix_now_secs());
+    sync_restart_drain(&RESTART_PENDING.lock().unwrap());
+}
+
+/// Post-processing a restart would throw away: a running PAR repair or
+/// extraction (both restart from the beginning after a reload).
+fn restart_blockers(snap: &QueueSnapshot) -> Vec<RestartWait> {
+    snap.jobs
+        .iter()
+        .filter_map(|job| match job.status {
+            JobStatus::Post {
+                stage: stage @ (nzbd_types::PostStage::ParRepair | nzbd_types::PostStage::Unpack),
+            } => Some(RestartWait {
+                job: job.id.0,
+                name: job.name.clone(),
+                stage: stage.as_str(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 pub fn status_dto(snap: &QueueSnapshot) -> StatusDto {
@@ -535,11 +657,18 @@ fn storage_from_snapshot(snap: &QueueSnapshot) -> Vec<StoragePathDto> {
     snap.storage_volumes
         .iter()
         .map(|volume| StoragePathDto {
+            name: volume.name.clone(),
             label: volume.label.clone(),
             path: volume.path.clone(),
             available_bytes: volume.available_bytes,
             total_bytes: volume.total_bytes,
             current: volume.current,
+            io: volume.io.as_ref().map(|io| StorageIoDto {
+                source: io.source,
+                detail: io.detail.clone(),
+                read_bps: io.read_bps,
+                write_bps: io.write_bps,
+            }),
         })
         .collect()
 }
@@ -552,6 +681,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
             "deliveries-v1",
             "request-token-idempotency-v1",
             probe::CAPABILITY,
+            "job-disposition-v1",
         ],
         version: version::full(),
         built: version::BUILT,
@@ -560,6 +690,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         remaining_bytes: snap.remaining_bytes,
         session_downloaded_bytes: snap.session_downloaded_bytes,
         download_paused: snap.download_paused,
+        post_paused: snap.post_paused,
         disk_low: snap.disk_low,
         disk_guard_free_bytes: snap.disk_guard_free_bytes,
         disk_guard_label: snap.disk_guard_label.clone(),
@@ -568,12 +699,18 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         disk_guard_all_roots_known: snap.disk_guard_all_roots_known,
         enospc_observed: snap.enospc_observed,
         enospc_where: snap.enospc_where.clone(),
+        enospc_failures: snap.enospc_failures.clone(),
         quota_reached: snap.quota_reached,
         blocked_servers: snap.blocked_servers.clone(),
         health_abort: snap.health_abort,
         speed_limit_bps: snap.speed_limit_bps,
         max_active_downloads: snap.max_active_downloads,
-        jobs_queued: count(&|j| matches!(j.status, JobStatus::Queued | JobStatus::Paused)),
+        jobs_queued: count(&|j| {
+            matches!(
+                j.status,
+                JobStatus::Queued | JobStatus::Paused | JobStatus::Held
+            )
+        }),
         jobs_downloading: count(&|j| {
             matches!(
                 j.status,
@@ -592,6 +729,9 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         }),
         servers: snap.server_volumes.clone(),
         storage,
+        restart_pending: RESTART_PENDING.lock().unwrap().clone(),
+        restart_expired: RESTART_EXPIRED.lock().unwrap().clone(),
+        startup: snap.startup.clone(),
     }
 }
 
@@ -1028,7 +1168,7 @@ async fn get_failure_keep(State(st): State<ApiState>, Path(id): Path<u32>) -> Re
         Ok(Ok((Some(source),_)))=>Json(json!({"available":true,"keep":source.keep_on_failure,"sourceArtifactId":source.id,"sourceGeneration":source.generation})).into_response(),
         Ok(Ok((None,true)))=>Json(json!({"available":false,"keep":false})).into_response(),
         Ok(Ok((None,false)))=>match st.engine.export_job(JobId(id)).await {
-            Ok(Some(job)) if matches!(job.status,nzbd_types::JobStatus::Fetching|nzbd_types::JobStatus::Queued|nzbd_types::JobStatus::Paused)
+            Ok(Some(job)) if matches!(job.status,nzbd_types::JobStatus::Fetching|nzbd_types::JobStatus::Queued|nzbd_types::JobStatus::Paused|nzbd_types::JobStatus::Held)
                 || (nzbd_engine::torrent_acquisitions::is_acquisition(&job)
                     && !job.params.iter().any(|(key,value)|key == "Delivery:SourceCleanup" && matches!(value.as_str(),"deleting"|"deleted")))=>Json(json!({"available":true,"keep":job.params.iter().any(|(key,value)|key=="*Runner:KeepOnFailure"&&value=="1")})).into_response(),
             Ok(_)=>Json(json!({"available":false,"keep":false})).into_response(),
@@ -1054,6 +1194,23 @@ async fn set_keep_on_failure(
 }
 
 async fn retry_job_now(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    // A URL job waiting out its NZB fetch backoff (an indexer 429/503, a
+    // timeout) retries the request now.
+    if st.engine.retry_url_fetch_now(JobId(id)) {
+        return Json(json!({"ok": true, "retrying": true, "fetch": true})).into_response();
+    }
+    let fetching_url = st.engine.snapshot().jobs.iter().any(|job| {
+        job.id == JobId(id)
+            && job.kind == nzbd_types::JobKind::Url
+            && job.status == nzbd_types::JobStatus::Fetching
+            && !job.control.as_ref().is_some_and(|c| c.lifecycle == "held")
+    });
+    if fetching_url {
+        return error(
+            StatusCode::CONFLICT,
+            "the NZB fetch has no wait to cut short (already requesting, or not on this node)",
+        );
+    }
     if let Ok(Some(row)) = st.engine.export_job(JobId(id)).await {
         if nzbd_engine::torrent_acquisitions::is_acquisition(&row) {
             if let Some(control) = row.control().filter(|control| {
@@ -1211,7 +1368,7 @@ struct Parked {
 /// still has it; the caller only writes the record if the delete succeeded.
 async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
     st.history.as_ref()?;
-    let j = st.engine.export_job(job).await.ok().flatten()?;
+    let j = st.engine.queue_job_metadata(job).await.ok().flatten()?;
     let url = j
         .params
         .iter()
@@ -1235,6 +1392,11 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
         // The URL is only the requeue source when there is no NZB; keeping
         // both would make the choice ambiguous on the way back.
         params.retain(|(k, _)| k != "*URL");
+    }
+    if let Ok(Some(artifact)) = st.engine.artifacts().for_job(job.0) {
+        params.retain(|(key, _)| key != "Artifact:Id" && key != "Artifact:Generation");
+        params.push(("Artifact:Id".into(), artifact.id));
+        params.push(("Artifact:Generation".into(), artifact.generation));
     }
     Some(Parked {
         entry: nzbd_state::HistoryEntry {
@@ -1267,37 +1429,109 @@ async fn park_snapshot(st: &ApiState, job: JobId) -> Option<Parked> {
 /// the delete, so history can never claim a job that is still queued.
 async fn park_write(st: &ApiState, mut parked: Parked) -> bool {
     if let Ok(Some(a)) = st.engine.artifacts().for_job(parked.entry.job.0) {
-        parked.entry.params.retain(|(k, _)| k != "Artifact:Id");
-        parked
-            .entry
-            .params
-            .push(("Artifact:Id".into(), a.id.clone()));
-        if !a.terminal() {
+        // Keep the identity captured before deletion; a reused queue number
+        // must not attach the old DELETED receipt to a successor allocation.
+        if !a.terminal()
+            && parked
+                .entry
+                .params
+                .iter()
+                .any(|(key, value)| key == "Artifact:Id" && value == &a.id)
+        {
             parked.entry.final_dir = Some(a.path.to_string_lossy().into_owned());
         }
     }
     let Some(db) = st.history.clone() else {
         return false;
     };
+    let inventory = st.engine.artifacts();
     let job = parked.entry.job;
+    if let Some(bytes) = parked.nzb.clone() {
+        let spool = db.clone();
+        let spooled = tokio::task::spawn_blocking(move || spool.spool_nzb(job, &bytes)).await;
+        if !matches!(spooled, Ok(Ok(()))) {
+            tracing::warn!(job = job.0, "could not park the deleted job's NZB");
+            return false;
+        }
+    }
+    // Contract §2.2: an operator delete is a real terminal — `cancelled`,
+    // with the transfer — written through the one terminal chain, so the
+    // `DELETED` history row and `job_pp_finished{cancelled}` come from the
+    // same record. A job that already has its terminal (a failed row
+    // awaiting salvage or disposal) keeps it: no second terminal.
+    let terminal = cancelled_terminal(&parked.entry);
+    let recorded = match st
+        .engine
+        .record_terminal_in(terminal, Some(db.clone()))
+        .await
+    {
+        Ok(Some(row)) if row.outcome == nzbd_types::TerminalOutcome::Cancelled => {
+            Some(row.history_seq.unwrap_or(0))
+        }
+        Ok(Some(_)) => None,
+        Ok(None) | Err(_) => {
+            tracing::warn!(job = job.0, "could not record the cancelled terminal");
+            db.drop_spool(job);
+            return false;
+        }
+    };
     tokio::task::spawn_blocking(move || {
-        if let Some(bytes) = &parked.nzb {
-            if let Err(e) = db.spool_nzb(job, bytes) {
-                tracing::warn!(job = job.0, error = %e, "could not park the deleted job's NZB");
-                return false;
-            }
+        let sequence = match recorded {
+            Some(sequence) => sequence,
+            None => match db.record_seq_durable(&parked.entry) {
+                Ok((sequence, _)) => sequence,
+                Err(e) => {
+                    tracing::warn!(job = job.0, error = %e, "could not write the DELETED history entry");
+                    db.drop_spool(job);
+                    return false;
+                }
+            },
+        };
+        let mut entry = parked.entry;
+        entry.seq = sequence;
+        if let Err(error) = inventory.finalize_deleted_workspaces(&entry) {
+            tracing::warn!(job = job.0, %error, "deleted job scratch awaits maintenance replay");
         }
-        match db.record(&parked.entry) {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(job = job.0, error = %e, "could not write the DELETED history entry");
-                db.drop_spool(job);
-                false
-            }
-        }
+        true
     })
     .await
     .unwrap_or(false)
+}
+
+/// The `cancelled` terminal for a deleted job's `DELETED` history entry.
+fn cancelled_terminal(entry: &nzbd_state::HistoryEntry) -> nzbd_state::artifacts::JobTerminal {
+    nzbd_state::artifacts::JobTerminal {
+        job: entry.job.0,
+        transfer: nzbd_types::transfer_of(&entry.params),
+        outcome: nzbd_types::TerminalOutcome::Cancelled,
+        reason: None,
+        fetch_cause: None,
+        stage: None,
+        message: Some("deleted by the operator".into()),
+        blames_release: false,
+        salvage: nzbd_state::artifacts::SalvageState::None,
+        keep_on_failure: false,
+        fetched: entry
+            .record
+            .as_ref()
+            .map(|record| nzbd_types::Fetched {
+                success_articles: u64::from(record.success_articles),
+                total_articles: u64::from(record.total_articles),
+                bytes: 0,
+            })
+            .unwrap_or_default(),
+        publication: None,
+        markers: Vec::new(),
+        entry: entry.clone(),
+        history_seq: None,
+        history_incarnation: None,
+        markers_stamped: false,
+        emitted: false,
+        disposal: None,
+        salvage_error: None,
+        created_at: 0,
+        updated_at: 0,
+    }
 }
 
 async fn job_action(
@@ -1418,9 +1652,18 @@ async fn queue_action(
     let engine = &st.engine;
     let source = client_source(&headers);
     let result = match action.as_str() {
+        // `pause`/`resume` are the download lane, as they always were.
         "pause" => engine.pause_all(&source).await,
         "resume" => engine.resume_all(&source).await,
-        _ => return error(StatusCode::BAD_REQUEST, "unknown action (pause|resume)"),
+        "pause-post" => engine.pause_post(&source).await,
+        "resume-post" => engine.resume_post(&source).await,
+        "retry-storage" => engine.retry_storage().await,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unknown action (pause|resume|pause-post|resume-post|retry-storage)",
+            )
+        }
     };
     match result {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
@@ -1572,7 +1815,19 @@ async fn test_server(State(st): State<ApiState>, Json(body): Json<TestServerBody
 /// exactly the "page frozen until I hit refresh" field report. Header
 /// stats and per-job rows come from the SAME snapshot, so they can never
 /// disagree the way two separately-cached endpoints did.
-async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) -> Response {
+///
+/// `?storage_io=1` adds a `storage_io` event: each storage filesystem's
+/// read/write throughput (`{"storage": [{path, io}]}`), at most once a
+/// second and only when it changed. The tick leaves `io` out of its
+/// storage rows, because disk counters move every second on a busy box and
+/// would otherwise defeat the tick's de-duplication for every subscriber,
+/// including phones that never draw the graph. `/api/v1/status` keeps `io`.
+async fn sse_events(
+    State(st): State<ApiState>,
+    Query(query): Query<EventsQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let storage_io = query.wants_storage_io();
     use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
     use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 
@@ -1618,6 +1873,7 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_tick_payload: Option<String> = None;
+        let mut last_storage_io: Option<String> = None;
         // Staleness clock for the `hb` event, and the log cursor. A new
         // stream tails the log from "now": replaying the whole ring on
         // every connect would flood a page that has not opened the Logs
@@ -1679,7 +1935,20 @@ async fn sse_events(State(st): State<ApiState>, headers: axum::http::HeaderMap) 
                             last_frame = std::time::Instant::now();
                         }
                     }
-                    let payload = tick_payload(&engine.snapshot());
+                    let snap = engine.snapshot();
+                    if storage_io {
+                        // Not a liveness frame: it leaves `last_frame` alone so
+                        // an idle queue still gets its `hb` on schedule.
+                        let payload = storage_io_payload(&snap);
+                        if last_storage_io.as_deref() != Some(payload.as_str()) {
+                            let sse = SseEvent::default().event("storage_io").data(&payload);
+                            if tx.send(Ok(sse)).await.is_err() {
+                                break;
+                            }
+                            last_storage_io = Some(payload);
+                        }
+                    }
+                    let payload = tick_payload(&snap);
                     if last_tick_payload.as_deref() != Some(payload.as_str()) {
                         let sse = SseEvent::default().event("tick").data(&payload);
                         if tx.send(Ok(sse)).await.is_err() {
@@ -1810,6 +2079,30 @@ fn unix_now() -> i64 {
 }
 
 /// The 1 Hz SSE `tick` body: header status + job rows from one snapshot.
+#[derive(Debug, Default, Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    storage_io: Option<String>,
+}
+
+impl EventsQuery {
+    fn wants_storage_io(&self) -> bool {
+        self.storage_io
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "" | "0" | "false"))
+    }
+}
+
+/// The `storage_io` SSE body: throughput only, keyed by path in the same
+/// order as the status rows.
+fn storage_io_payload(snap: &QueueSnapshot) -> String {
+    let storage = storage_from_snapshot(snap)
+        .into_iter()
+        .map(|row| json!({ "path": row.path, "io": row.io }))
+        .collect::<Vec<_>>();
+    json!({ "storage": storage }).to_string()
+}
+
 fn tick_payload(snap: &QueueSnapshot) -> String {
     let jobs = snap
         .jobs
@@ -1818,7 +2111,18 @@ fn tick_payload(snap: &QueueSnapshot) -> String {
             control_pending::render(job, snap.pending_automatic_controls.contains(&job.id), None)
         })
         .collect::<Vec<_>>();
-    json!({ "status": status_dto(snap), "jobs": jobs }).to_string()
+    let mut status = serde_json::to_value(status_dto(snap)).unwrap_or_default();
+    if let Some(rows) = status
+        .get_mut("storage")
+        .and_then(|rows| rows.as_array_mut())
+    {
+        for row in rows {
+            if let Some(row) = row.as_object_mut() {
+                row.remove("io");
+            }
+        }
+    }
+    json!({ "status": status, "jobs": jobs }).to_string()
 }
 
 /// Resolve when the daemon is shutting down; pend forever if no shutdown
@@ -1881,6 +2185,10 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
             "queue_pause_changed",
             json!({"paused": paused, "source": source}),
         ),
+        E::PostPauseChanged { paused, source } => (
+            "post_pause_changed",
+            json!({"paused": paused, "source": source}),
+        ),
         E::SpeedLimitChanged { bytes_per_sec } => (
             "speed_limit_changed",
             json!({"bytes_per_sec": bytes_per_sec}),
@@ -1895,25 +2203,69 @@ fn event_json(ev: &nzbd_engine::Event) -> (&'static str, serde_json::Value) {
             job,
             name,
             category,
-            pp_status,
-            final_dir,
+            transfer,
+            outcome,
+            reason,
+            fetch_cause,
+            stage,
+            message,
+            blames_release,
+            salvage,
+            keep_on_failure,
+            fetched,
+            publication,
             size_bytes,
             health,
             params,
             history_seq,
+            history_incarnation,
         } => (
             "job_pp_finished",
             json!({
                 "job": job.0,
                 "name": name,
                 "category": category,
-                "pp_status": pp_status,
-                "final_dir": final_dir,
+                "transfer": transfer,
+                "outcome": outcome.as_str(),
+                "reason": reason.map(|r| r.as_str()),
+                "fetch_cause": fetch_cause.map(|c| c.as_str()),
+                "stage": stage,
+                "message": message,
+                "blames_release": blames_release,
+                "salvage": salvage.as_str(),
+                "keep_on_failure": keep_on_failure,
+                "fetched": fetched,
+                "publication": publication,
                 "size_bytes": size_bytes,
                 "health": health,
                 "params": params,
                 "history_seq": history_seq,
+                "history_incarnation": history_incarnation,
             }),
+        ),
+        E::JobStatusChanged {
+            job,
+            transfer,
+            status,
+            stage,
+            control,
+        } => (
+            "job_status_changed",
+            json!({
+                "job": job.0,
+                "transfer": transfer,
+                "status": status,
+                "stage": stage,
+                "control": control,
+            }),
+        ),
+        E::JobPublicationReady {
+            job,
+            transfer,
+            publication,
+        } => (
+            "job_publication_ready",
+            json!({"job": job.0, "transfer": transfer, "publication": publication}),
         ),
     }
 }
@@ -1927,6 +2279,7 @@ async fn metrics(State(st): State<ApiState>) -> Response {
             JobStatus::Queued => "queued",
             JobStatus::Downloading => "downloading",
             JobStatus::Paused => "paused",
+            JobStatus::Held => "held",
             JobStatus::Fetching => "fetching",
             JobStatus::PostQueued | JobStatus::Post { .. } => "post_processing",
             JobStatus::Completed => "completed",
@@ -1958,6 +2311,8 @@ async fn metrics(State(st): State<ApiState>) -> Response {
     );
     let _ = writeln!(m, "# TYPE nzbd_download_paused gauge");
     let _ = writeln!(m, "nzbd_download_paused {}", snap.download_paused as u8);
+    let _ = writeln!(m, "# TYPE nzbd_post_paused gauge");
+    let _ = writeln!(m, "nzbd_post_paused {}", snap.post_paused as u8);
     let _ = writeln!(m, "# TYPE nzbd_speed_limit_bytes_per_second gauge");
     let _ = writeln!(
         m,
@@ -2159,75 +2514,86 @@ async fn get_history(
     let consumer = consumer_name(&headers);
     let now = unix_now();
     let entries = tokio::task::spawn_blocking(move || {
-        db.read_page(limit, offset, since).map(|(entries, total)| {
-            // Record the pull before decorating: this poll SAW these
-            // entries. Both shapes count — a `since_seq` catch-up walk is
-            // still the consumer reading them. A failure here is not worth
-            // failing the read over; the observation is diagnostic, the
-            // response is the job.
-            if consumer.is_some() {
-                let jobs: Vec<crate::JobId> = entries.iter().map(|e| e.job).collect();
-                if !jobs.is_empty() {
-                    let _ = db.mark_seen(&jobs, consumer.as_deref(), now);
-                }
-            }
-            // `can_requeue` is derived, not stored: it answers "is the
-            // requeue source still on this node?", which only a look at the
-            // spool (or the parked `*URL`) can honestly say.
-            //
-            // ONE directory listing for the page, not one `stat` per row:
-            // the spool lives beside the state dir, which on a network
-            // mount made this loop the bulk of a history read (250 ms for
-            // 179 rows, nuc3 2026-07-29).
-            let spooled = db.spooled_ids();
-            let entries = entries
-                .into_iter()
-                .map(|e| {
-                    let reason = history_requeue_refusal(&e);
-                    let can = reason.is_none()
-                        && (spooled.contains(&e.job.0)
-                            || e.params.iter().any(|(k, _)| k == "*URL"));
-                    let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
-                    if let Some(o) = v.as_object_mut() {
-                        o.insert(
-                            "torrent_role".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .and_then(|record| record.torrent_role.as_deref())),
-                        );
-                        o.insert(
-                            "seed_donor_job_id".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .and_then(|record| record.seed_donor_job_id)),
-                        );
-                        o.insert("can_requeue".into(), json!(can));
-                        o.insert("requeue_reason".into(), json!(reason));
-                        o.insert(
-                            "kind".into(),
-                            json!(e
-                                .record
-                                .as_ref()
-                                .map(|record| record.kind)
-                                .unwrap_or(nzbd_types::JobKind::Nzb)),
-                        );
+        db.read_page(limit, offset, since)
+            .map(|(entries, total)| {
+                // Record the pull before decorating: this poll SAW these
+                // entries. Both shapes count — a `since_seq` catch-up walk is
+                // still the consumer reading them. A failure here is not worth
+                // failing the read over; the observation is diagnostic, the
+                // response is the job.
+                if consumer.is_some() {
+                    let jobs: Vec<crate::JobId> = entries.iter().map(|e| e.job).collect();
+                    if !jobs.is_empty() {
+                        let _ = db.mark_seen(&jobs, consumer.as_deref(), now);
                     }
-                    v
-                })
-                .collect::<Vec<_>>();
-            (entries, total, db.sync_status())
-        })
+                }
+                // `can_requeue` is derived, not stored: it answers "is the
+                // requeue source still on this node?", which only a look at the
+                // spool (or the parked `*URL`) can honestly say.
+                //
+                // ONE directory listing for the page, not one `stat` per row:
+                // the spool lives beside the state dir, which on a network
+                // mount made this loop the bulk of a history read (250 ms for
+                // 179 rows, nuc3 2026-07-29).
+                let spooled = db.spooled_ids();
+                let entries = entries
+                    .into_iter()
+                    .map(|e| {
+                        let reason = history_requeue_refusal(&e);
+                        let can = reason.is_none()
+                            && (spooled.contains(&e.job.0)
+                                || e.params.iter().any(|(k, _)| k == "*URL"));
+                        let mut v = serde_json::to_value(&e).unwrap_or_else(|_| json!({}));
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert(
+                                "torrent_role".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .and_then(|record| record.torrent_role.as_deref())),
+                            );
+                            o.insert(
+                                "seed_donor_job_id".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .and_then(|record| record.seed_donor_job_id)),
+                            );
+                            o.insert("can_requeue".into(), json!(can));
+                            o.insert("requeue_reason".into(), json!(reason));
+                            o.insert(
+                                "kind".into(),
+                                json!(e
+                                    .record
+                                    .as_ref()
+                                    .map(|record| record.kind)
+                                    .unwrap_or(nzbd_types::JobKind::Nzb)),
+                            );
+                        }
+                        v
+                    })
+                    .collect::<Vec<_>>();
+                (entries, total, db.sync_status())
+            })
+            .and_then(|(entries, total, sync)| {
+                // Contract §2.5: the cursor is `(incarnation, seq)`. A consumer
+                // whose stored incarnation differs, or whose cursor is below
+                // `retained_min_seq`, has lost continuity and must reconcile.
+                let continuity = (db.incarnation()?, db.head_seq()?, db.retained_min_seq()?);
+                Ok((entries, total, sync, continuity))
+            })
     })
     .await;
     match entries {
-        Ok(Ok((entries, total, sync))) => Json(json!({
+        Ok(Ok((entries, total, sync, (incarnation, head_seq, retained_min_seq)))) => Json(json!({
             "entries": entries,
             "total": total,
             "offset": offset,
             "limit": limit,
             "sync": sync,
+            "incarnation": incarnation,
+            "head_seq": head_seq,
+            "retained_min_seq": retained_min_seq,
         }))
         .into_response(),
         Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -2245,9 +2611,29 @@ async fn openapi() -> Response {
             "/api/v1/status": { "get": { "summary": "Queue + rate + guard status" } },
             "/api/v1/probe": { "post": { "summary": "Decoded head of a release's main file, for Curator's pre-flight measurement (?url= or NZB body, ?bytes=)" } },
             "/api/v1/probes": { "get": { "summary": "Recent release probes and totals" } },
-            "/api/v1/request-admissions/{token}": { "get": { "summary": "Read the durable outcome of one transfer-token URL admission" } },
-            "/api/v1/deliveries": { "get": { "summary": "Durable pending publication deliveries; rescan after=0 or persist every receipt before advancing the cursor" } },
-            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Persist an idempotent consumer receipt for an immutable publication generation and manifest" } },
+            "/api/v1/request-admissions/{token}": { "get": {
+                "summary": "Did a POST /jobs with this transfer token land, and as which job; after a history continuity loss, what happened to that transfer (outcome, failure_reason). Not consulted to settle a terminal in normal operation",
+                "responses": { "200": { "description": "The admission receipt", "content": { "application/json": { "schema": {
+                    "type": "object",
+                    "properties": {
+                        "jobId": { "type": "integer" },
+                        "outcome": { "type": "string" },
+                        "terminalOutcome": { "type": "string", "nullable": true },
+                        "failureReason": { "type": "string", "nullable": true },
+                        "fetchCause": { "type": "string", "nullable": true },
+                        "custodyState": { "type": "string", "deprecated": true,
+                                          "description": "Deprecated (pipeline contract v2 §2.5): runner never holds bytes for curator; removed in M6" },
+                        "sourceCleanupStatus": { "type": "string", "nullable": true, "deprecated": true,
+                                                 "description": "Deprecated (pipeline contract v2 §2.5): source cleanup no longer gates curator; removed in M6" }
+                    } } } } } }
+            } },
+            "/api/v1/deliveries": { "get": {
+                "summary": "Read-only reconciliation feed of publications (contract v2 §2.5): immutable rows in sequence order — job, transfer (requestToken), publicationPath, publicationGeneration, manifestDigest, readyAt, kind completed|salvage, and the manifest body (files, manifest). Curator reads it on the poll to catch a completed or publication_ready it missed",
+                "parameters": [
+                    {"name": "after", "in": "query", "description": "Cursor: rows with sequence > N (nextCursor of the previous page)"},
+                    {"name": "limit", "in": "query", "description": "1..=100, default 50"}
+                ] } },
+            "/api/v1/deliveries/{id}/accept": { "post": { "summary": "Removed (pipeline contract v2 §2.5): answers 410 Gone", "deprecated": true } },
             "/api/v1/jobs": {
                 "get": { "summary": "List queue jobs" },
                 "post": { "summary": "Add a job (NZB body, or ?url=)",
@@ -2264,11 +2650,12 @@ async fn openapi() -> Response {
                           ] }
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
+            "/api/v1/jobs/{id}/disposition": { "post": { "summary": "Persist or poll an identity-bound delete request for a consumer admission" } },
             "/api/v1/jobs/{id}/priority": { "put": { "summary": "Set scheduler priority; higher values run first and 900 is force" } },
-            "/api/v1/jobs/{id}/retry": { "post": { "summary": "Retry the same job's held post-processing or failed-source cleanup" } },
+            "/api/v1/jobs/{id}/retry": { "post": { "summary": "Retry the same job's NZB fetch, held post-processing or failed-source cleanup now" } },
             "/api/v1/jobs/{id}/torrent/seed-policy": { "put": { "summary": "Set stop_on_complete, positive ratio_limit/time_limit_secs (null = unlimited), or use_defaults; never starts a stopped torrent" } },
             "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*|post-restart-*; delete answers {ok, parked}" } },
-            "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume" } },
+            "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume (downloads) · pause-post|resume-post (post-processing)" } },
             "/api/v1/queue/speed-limit": { "put": { "summary": "Set speed limit (bytes_per_sec)" } },
             "/api/v1/servers/test": { "post": { "summary": "Live news-server connectivity probe (connect + greeting + AUTHINFO)" } },
             "/api/v1/jobs/{id}/files": { "get": { "summary": "Per-file detail (segments done/failed, sizes, paused, par2)" } },
@@ -2702,14 +3089,393 @@ async fn put_config(
 
 /// Restart the daemon: tear down and re-run with the config on disk.
 /// The listener bounces for a moment; the UI polls /healthz.
-async fn post_restart(State(st): State<ApiState>) -> Response {
+#[derive(Deserialize, Default)]
+struct RestartQuery {
+    /// Unix seconds after which this request must not run (W10): a restart
+    /// that timed out on the client and is re-sent, or delivered late, is
+    /// refused instead of cancelling work started since.
+    not_after: Option<i64>,
+    /// Restart now even if PAR repair or extraction is running (W10).
+    #[serde(default)]
+    force: bool,
+}
+
+/// What became of a restart request, by idempotency key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartOutcome {
+    /// Deferred, waiting for post-processing to drain.
+    Pending,
+    Executed,
+    /// Passed its `not_after` before it could run.
+    Expired,
+    Cancelled,
+}
+
+/// Idempotency keys of restart requests and what became of them. Kept
+/// across in-process backend reloads (the API state is rebuilt by each).
+static RESTART_OUTCOMES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::VecDeque<(String, RestartOutcome)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn set_restart_outcome(keys: &[String], outcome: RestartOutcome) {
+    let mut outcomes = RESTART_OUTCOMES.lock().unwrap();
+    for key in keys {
+        match outcomes.iter_mut().find(|(seen, _)| seen == key) {
+            Some(entry) => entry.1 = outcome,
+            None => outcomes.push_back((key.clone(), outcome)),
+        }
+    }
+    while outcomes.len() > 64 {
+        outcomes.pop_front();
+    }
+}
+
+/// W10: `Idempotency-Key` (header) makes a re-sent restart answer with what
+/// became of the first one; `not_after` refuses a stale one. Both optional
+/// for existing callers. `Ok(None)` is a new request (recorded `pending`).
+fn restart_admission(
+    key: Option<&str>,
+    not_after: Option<i64>,
+    now: i64,
+) -> Result<Option<RestartOutcome>, &'static str> {
+    let key = key.filter(|key| !key.is_empty());
+    if let Some(key) = key {
+        if let Some((_, outcome)) = RESTART_OUTCOMES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(seen, _)| seen == key)
+        {
+            return Ok(Some(*outcome));
+        }
+    }
+    if not_after.is_some_and(|deadline| now > deadline) {
+        return Err("restart request expired (not_after has passed); send a new one");
+    }
+    if let Some(key) = key {
+        set_restart_outcome(&[key.to_owned()], RestartOutcome::Pending);
+    }
+    Ok(None)
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// What one poll of a deferred restart decided.
+#[derive(Debug, PartialEq, Eq)]
+enum RestartStep {
+    /// Nothing pending (cancelled or already settled).
+    Done,
+    Wait,
+    Expired,
+    /// A reload happened since the request: it already restarted.
+    AlreadyReloaded,
+    /// Post-processing drained: restart now.
+    Restart,
+}
+
+/// One poll: settle the pending restart against the current backend.
+fn poll_pending_restart(now: i64) -> RestartStep {
+    let mut pending = RESTART_PENDING.lock().unwrap();
+    let generation = BACKEND_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let backend = CURRENT_BACKEND.lock().unwrap().clone();
+    let step = settle_restart(&mut pending, now, generation, || {
+        backend
+            .as_ref()
+            .map(|(snapshot, _)| restart_blockers(&snapshot.load_full()))
+    });
+    sync_restart_drain(&pending);
+    drop(pending);
+    if step == RestartStep::Restart {
+        if let Some((_, setup)) = backend {
+            setup
+                .applied
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            setup.reload.notify_one();
+        }
+    }
+    step
+}
+
+/// [`poll_pending_restart`] on a given slot: `blockers` reads the current
+/// backend (None when no backend is registered yet).
+fn settle_restart(
+    pending: &mut Option<RestartPending>,
+    now: i64,
+    generation: u64,
+    blockers: impl FnOnce() -> Option<Vec<RestartWait>>,
+) -> RestartStep {
+    let Some(current) = pending.as_mut() else {
+        return RestartStep::Done;
+    };
+    let step = if current
+        .not_after_unix
+        .is_some_and(|deadline| now > deadline)
+    {
+        RestartStep::Expired
+    } else if generation != current.generation {
+        RestartStep::AlreadyReloaded
+    } else {
+        match blockers() {
+            Some(waiting) if waiting.is_empty() => RestartStep::Restart,
+            Some(waiting) => {
+                current.waiting_for = waiting;
+                RestartStep::Wait
+            }
+            None => RestartStep::Wait,
+        }
+    };
+    match step {
+        RestartStep::Wait | RestartStep::Done => {}
+        RestartStep::Expired => {
+            let expired = pending.take().unwrap();
+            tracing::warn!(not_after = ?expired.not_after_unix,
+                "deferred restart expired before post-processing drained; not restarting");
+            set_restart_outcome(&expired.keys, RestartOutcome::Expired);
+            *RESTART_EXPIRED.lock().unwrap() = Some(expired);
+        }
+        RestartStep::AlreadyReloaded => {
+            let done = pending.take().unwrap();
+            tracing::info!("deferred restart satisfied by a reload that already happened");
+            set_restart_outcome(&done.keys, RestartOutcome::Executed);
+        }
+        RestartStep::Restart => {
+            let done = pending.take().unwrap();
+            set_restart_outcome(&done.keys, RestartOutcome::Executed);
+            tracing::info!("post-processing reached a resumable boundary; restarting");
+        }
+    }
+    step
+}
+
+#[cfg(test)]
+mod restart_admission_tests {
+    use super::*;
+    /// R5 / W10: a stale restart is refused; a re-sent one answers with
+    /// what became of the first.
+    #[test]
+    fn stale_restart_is_refused_and_a_resend_answers_its_outcome() {
+        assert!(restart_admission(None, Some(99), 100).is_err());
+        assert_eq!(restart_admission(None, Some(100), 100), Ok(None));
+        assert_eq!(restart_admission(None, None, 100), Ok(None));
+        let key = "restart-test-key-r5";
+        assert_eq!(restart_admission(Some(key), Some(200), 100), Ok(None));
+        assert_eq!(
+            restart_admission(Some(key), Some(200), 150),
+            Ok(Some(RestartOutcome::Pending)),
+            "a deferral is pending, not executed"
+        );
+        set_restart_outcome(&[key.to_owned()], RestartOutcome::Executed);
+        assert_eq!(
+            restart_admission(Some(key), Some(200), 201),
+            Ok(Some(RestartOutcome::Executed))
+        );
+    }
+
+    fn pend(key: &str, not_after: Option<i64>) -> Option<RestartPending> {
+        set_restart_outcome(&[key.to_owned()], RestartOutcome::Pending);
+        Some(RestartPending {
+            requested_at_unix: 100,
+            not_after_unix: not_after,
+            waiting_for: vec![],
+            keys: vec![key.to_owned()],
+            generation: 7,
+        })
+    }
+
+    fn wait() -> Option<Vec<RestartWait>> {
+        Some(vec![RestartWait {
+            job: 1,
+            name: "x".into(),
+            stage: "par_repair",
+        }])
+    }
+
+    /// Finding 6: a deferred restart expires at its `not_after` (reported,
+    /// never fired late), a reload since the request settles it, and a
+    /// re-sent key reports which of those happened.
+    #[test]
+    fn a_deferred_restart_expires_at_not_after_and_a_reload_settles_it() {
+        let mut slot = pend("k-expire", Some(200));
+        assert_eq!(settle_restart(&mut slot, 150, 7, wait), RestartStep::Wait);
+        assert!(slot.is_some());
+        assert_eq!(
+            settle_restart(&mut slot, 201, 7, wait),
+            RestartStep::Expired
+        );
+        assert!(slot.is_none());
+        assert_eq!(
+            restart_admission(Some("k-expire"), Some(300), 250),
+            Ok(Some(RestartOutcome::Expired))
+        );
+        let mut slot = pend("k-reload", None);
+        assert_eq!(
+            settle_restart(&mut slot, 150, 8, wait),
+            RestartStep::AlreadyReloaded
+        );
+        assert_eq!(
+            restart_admission(Some("k-reload"), None, 150),
+            Ok(Some(RestartOutcome::Executed))
+        );
+        assert_eq!(settle_restart(&mut slot, 150, 8, wait), RestartStep::Done);
+        // The blockers are read from the backend on every poll.
+        let mut slot = pend("k-drained", None);
+        assert_eq!(
+            settle_restart(&mut slot, 150, 7, || Some(vec![])),
+            RestartStep::Restart
+        );
+        assert_eq!(
+            restart_admission(Some("k-drained"), None, 150),
+            Ok(Some(RestartOutcome::Executed))
+        );
+    }
+
+    /// Finding 7: the drain is the pending slot. An expiry clears it, a
+    /// re-request after the expiry sets it again (no stale `false` from the
+    /// expired poll can land after it), and DELETE clears it even when
+    /// nothing is pending.
+    #[tokio::test]
+    async fn the_drain_follows_the_pending_slot() {
+        // The only test touching the process-wide slot and drain.
+        let request = |not_after| {
+            let mut pending = RESTART_PENDING.lock().unwrap();
+            *pending = pend("k-drain", Some(not_after));
+            sync_restart_drain(&pending);
+        };
+        request(200);
+        assert!(nzbd_engine::restart_drain());
+        assert_eq!(poll_pending_restart(201), RestartStep::Expired);
+        assert!(!nzbd_engine::restart_drain(), "expired: nothing pending");
+        request(400);
+        assert!(nzbd_engine::restart_drain(), "the re-request drains again");
+        let _ = delete_restart().await;
+        assert!(RESTART_PENDING.lock().unwrap().is_none());
+        assert!(!nzbd_engine::restart_drain());
+        // A drain left on with nothing pending: DELETE still ends it.
+        nzbd_engine::set_restart_drain(true);
+        let _ = delete_restart().await;
+        assert!(!nzbd_engine::restart_drain());
+    }
+}
+
+async fn post_restart(
+    State(st): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<RestartQuery>,
+) -> Response {
     let Some(h) = &st.setup else {
         return error(StatusCode::NOT_FOUND, "no config handle");
     };
-    tracing::info!("restart requested from the settings UI");
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|key| !key.is_empty());
+    let now = unix_now_secs();
+    match restart_admission(key, query.not_after, now) {
+        Err(reason) => return error(StatusCode::CONFLICT, reason),
+        Ok(Some(outcome)) => {
+            tracing::info!(
+                key,
+                ?outcome,
+                "restart re-sent for an idempotency key already seen"
+            );
+            let answer = match outcome {
+                RestartOutcome::Pending => {
+                    json!({ "ok": true, "restarting": "deferred", "duplicate": true })
+                }
+                RestartOutcome::Executed => {
+                    json!({ "ok": true, "restarting": false, "duplicate": true })
+                }
+                RestartOutcome::Expired => {
+                    json!({ "ok": false, "restarting": false, "duplicate": true, "expired": true })
+                }
+                RestartOutcome::Cancelled => {
+                    json!({ "ok": false, "restarting": false, "duplicate": true, "cancelled": true })
+                }
+            };
+            return Json(answer).into_response();
+        }
+        Ok(None) => {}
+    }
+    RESTART_EXPIRED.lock().unwrap().take();
+    let keys = key.map(|key| vec![key.to_owned()]).unwrap_or_default();
+    // W10: never cancel hours of PAR repair or extraction silently. Unless
+    // the operator forces it, the restart waits for them (visible in
+    // /api/v1/status as `restart_pending`): no new repair or extraction
+    // starts meanwhile (the drain), and past `not_after` it expires.
+    let waiting = restart_blockers(&st.engine.snapshot());
+    if !query.force && !waiting.is_empty() {
+        let generation = BACKEND_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        let spawn = {
+            let mut pending = RESTART_PENDING.lock().unwrap();
+            let spawn = pending.is_none();
+            let mut all_keys = pending.take().map(|p| p.keys).unwrap_or_default();
+            all_keys.extend(keys);
+            *pending = Some(RestartPending {
+                requested_at_unix: now,
+                not_after_unix: query.not_after,
+                waiting_for: waiting.clone(),
+                keys: all_keys,
+                generation,
+            });
+            sync_restart_drain(&pending);
+            spawn
+        };
+        tracing::info!(waiting = ?waiting, not_after = query.not_after,
+            "restart deferred until post-processing reaches a resumable boundary");
+        if spawn {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if poll_pending_restart(unix_now_secs()) != RestartStep::Wait {
+                        return;
+                    }
+                }
+            });
+        }
+        return Json(json!({ "ok": true, "restarting": "deferred", "waiting_for": waiting }))
+            .into_response();
+    }
+    let mut all_keys = {
+        let mut pending = RESTART_PENDING.lock().unwrap();
+        let taken = pending.take();
+        sync_restart_drain(&pending);
+        taken.map(|p| p.keys).unwrap_or_default()
+    };
+    all_keys.extend(keys);
+    set_restart_outcome(&all_keys, RestartOutcome::Executed);
+    tracing::info!(
+        key,
+        not_after = query.not_after,
+        force = query.force,
+        "restart requested from the settings UI"
+    );
     h.applied.store(true, std::sync::atomic::Ordering::Relaxed);
     h.reload.notify_one();
     Json(json!({ "ok": true, "restarting": true })).into_response()
+}
+
+/// W10: cancel a deferred restart. Repair and extraction resume admission.
+async fn delete_restart() -> Response {
+    let cancelled = {
+        let mut pending = RESTART_PENDING.lock().unwrap();
+        let taken = pending.take();
+        // Always: a drain left on with nothing pending ends here too.
+        sync_restart_drain(&pending);
+        taken
+    };
+    match cancelled {
+        Some(pending) => {
+            set_restart_outcome(&pending.keys, RestartOutcome::Cancelled);
+            tracing::info!("deferred restart cancelled");
+            Json(json!({ "ok": true, "cancelled": true })).into_response()
+        }
+        None => Json(json!({ "ok": true, "cancelled": false })).into_response(),
+    }
 }
 
 /// Observed compat clients (Sonarr/Radarr polling us) — the UI's
@@ -2933,6 +3699,7 @@ async fn history_action(
 /// already builds its router inside one.
 pub fn router_with(state: ApiState) -> Router {
     if let Some(setup) = &state.setup {
+        register_backend(&state.engine, setup);
         let roots = setup
             .current
             .lock()
@@ -2966,7 +3733,7 @@ pub fn router_with(state: ApiState) -> Router {
     Router::new()
         .merge(artifacts::router())
         .route("/api/v1/status", get(get_status))
-        // Pre-flight release probes for Curator (ADR 0026 there): the head
+        // Pre-flight release probes for Curator (ADR 0031 there): the head
         // of the main file, never a queued job.
         .route("/api/v1/probe", post(probe::probe_release))
         .route("/api/v1/probes", get(probe::list_probes))
@@ -3017,7 +3784,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/setup", get(get_setup).post(post_setup))
         .route("/api/v1/config", get(get_config).put(put_config))
-        .route("/api/v1/restart", post(post_restart))
+        .route("/api/v1/restart", post(post_restart).delete(delete_restart))
         .route("/healthz", get(healthz))
         .route("/", get(ui_index))
         .route("/manifest.webmanifest", get(pwa_manifest))
@@ -3063,6 +3830,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
+    use std::time::Duration;
     use tower::util::ServiceExt;
 
     async fn test_engine(tmp: &tempfile::TempDir) -> EngineHandle {
@@ -3075,6 +3843,100 @@ mod tests {
         ))
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn disposition_checks_identity_and_replays_after_restart_without_rewriting_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/disposition.nzb", listener.local_addr().unwrap());
+        let token = "disposition-fixture";
+        let id = engine
+            .add_url(
+                "delete this acquisition",
+                &url,
+                nzbd_engine::AddOpts {
+                    params: vec![("monarr-transfer".into(), token.into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let admission = engine.url_admission(token).await.unwrap().unwrap();
+        let request = json!({
+            "requestId": "confirmed-delete",
+            "action": "delete",
+            "transfer": token,
+            "runnerInstanceId": admission.runner_instance_id,
+            "generation": admission.generation,
+        });
+        async fn send(engine: &EngineHandle, id: JobId, request: &serde_json::Value) -> Response {
+            router(engine.clone())
+                .oneshot(
+                    axum::http::Request::post(format!("/api/v1/jobs/{}/disposition", id.0))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        for (field, value) in [
+            ("runnerInstanceId", "restored-installation"),
+            ("generation", "older-admission"),
+            ("transfer", "different-transfer"),
+        ] {
+            let mut stale = request.clone();
+            stale[field] = json!(value);
+            assert_eq!(
+                send(&engine, id, &stale).await.status(),
+                StatusCode::CONFLICT
+            );
+        }
+        let first = send(&engine, id, &request).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        assert_eq!(body_json(first).await["state"], "pending");
+        assert!(engine.shutdown().await);
+        drop(engine);
+
+        let engine = test_engine(&tmp).await;
+        let settled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = send(&engine, id, &request).await;
+                if response.status() == StatusCode::OK {
+                    break body_json(response).await;
+                }
+                assert!(matches!(
+                    response.status(),
+                    StatusCode::ACCEPTED
+                        | StatusCode::TOO_MANY_REQUESTS
+                        | StatusCode::SERVICE_UNAVAILABLE
+                ));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(settled["state"], "verified");
+        assert_eq!(settled["jobId"], id.0.to_string());
+        let terminal = engine.artifacts().terminal(id.0).unwrap().unwrap();
+        assert_eq!(terminal.transfer.as_deref(), Some(token));
+        assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Cancelled);
+        assert!(terminal.finished());
+        let again = send(&engine, id, &request).await;
+        assert_eq!(body_json(again).await, settled);
+        let after = engine.artifacts().terminal(id.0).unwrap().unwrap();
+        assert_eq!(after.history_seq, terminal.history_seq);
+        let mut changed = request;
+        changed["sourceArtifactId"] = json!("different-artifact");
+        changed["sourceGeneration"] = json!("different-generation");
+        assert_eq!(
+            send(&engine, id, &changed).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert!(engine.shutdown().await);
     }
 
     #[tokio::test]
@@ -3124,7 +3986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_routes_page_accept_refresh_and_retry_source_cleanup() {
+    async fn accept_is_gone() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = test_engine(&tmp).await;
         let root = tmp.path().join("processing");
@@ -3158,12 +4020,9 @@ mod tests {
         assert_eq!(pending["deliveries"][0]["deliveryId"], delivery.delivery_id);
         assert_eq!(pending["nextCursor"], delivery.sequence);
 
-        let body = serde_json::json!({
-            "protocolVersion": 1,
-            "publicationGeneration": delivery.publication_generation,
-            "manifestDigest": delivery.manifest_digest,
-            "consumerReceiptId": "curator-receipt-fixture"
-        });
+        // IMPL §7.4 / contract §2.5: there is no acceptance. M1a answered
+        // 200 as a no-op for one release; now the route is gone (410) and
+        // the row stays on the feed, unchanged.
         let accepted = app
             .clone()
             .oneshot(
@@ -3172,34 +4031,22 @@ mod tests {
                     delivery.delivery_id
                 ))
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "protocolVersion": 1,
+                        "publicationGeneration": delivery.publication_generation,
+                        "manifestDigest": delivery.manifest_digest,
+                        "consumerReceiptId": "curator-receipt-fixture"
+                    })
+                    .to_string(),
+                ))
                 .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(accepted.status(), StatusCode::OK);
-        assert_eq!(
-            body_json(accepted).await["consumerReceiptId"],
-            "curator-receipt-fixture"
-        );
+        assert_eq!(accepted.status(), StatusCode::GONE);
 
-        let hidden_after_accept = app
-            .clone()
-            .oneshot(
-                axum::http::Request::get("/api/v1/deliveries?after=0&limit=1")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let hidden_after_accept = body_json(hidden_after_accept).await;
-        assert!(hidden_after_accept["deliveries"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        assert_eq!(hidden_after_accept["nextCursor"], delivery.sequence);
-
-        let accepted_page = app
+        let still_listed = app
             .clone()
             .oneshot(
                 axum::http::Request::get("/api/v1/deliveries?after=0&limit=1&includeAccepted=true")
@@ -3208,61 +4055,24 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            body_json(accepted_page).await["deliveries"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
+        let still_listed = body_json(still_listed).await;
+        let row = &still_listed["deliveries"][0];
+        assert_eq!(row["deliveryId"], delivery.delivery_id);
+        assert_eq!(row["kind"], "completed");
+        assert_eq!(row["manifestDigest"], delivery.manifest_digest);
+        assert_eq!(row["files"].as_array().unwrap().len(), 1);
+        assert!(row.get("status").is_none(), "no acceptance state: {row}");
+        assert!(
+            row.get("acceptedAt").is_none(),
+            "no acceptance state: {row}"
         );
-
-        let refreshed = app
-            .clone()
-            .oneshot(
-                axum::http::Request::get(format!("/api/v1/deliveries/{}", delivery.delivery_id))
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(refreshed.status(), StatusCode::OK);
-        assert!(body_json(refreshed).await["acceptedAt"].is_number());
-
-        let replay = app
-            .clone()
-            .oneshot(
-                axum::http::Request::post(format!(
-                    "/api/v1/deliveries/{}/accept",
-                    delivery.delivery_id
-                ))
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(replay.status(), StatusCode::OK);
-
-        let conflicting = serde_json::json!({
-            "protocolVersion": 1,
-            "publicationGeneration": delivery.publication_generation,
-            "manifestDigest": delivery.manifest_digest,
-            "consumerReceiptId": "different-receipt"
-        });
-        let conflict = app
-            .clone()
-            .oneshot(
-                axum::http::Request::post(format!(
-                    "/api/v1/deliveries/{}/accept",
-                    delivery.delivery_id
-                ))
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(conflicting.to_string()))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        // Cleanup can advance concurrently with these requests. Compare the
+        // immutable delivery to the original fixture, rather than racing two
+        // reads of the mutable cleanup progress (or comparing a row to itself).
+        let stored = artifacts.delivery(&delivery.delivery_id).unwrap();
+        let mut expected = delivery.clone();
+        expected.source_cleanup = stored.source_cleanup.clone();
+        assert_eq!(stored, expected);
 
         let retry_cleanup = app
             .oneshot(
@@ -3316,6 +4126,8 @@ mod tests {
             verification: None,
             repair_progress: None,
             control: None,
+            status_projected: status.as_str().into(),
+            transfer: None,
             lifecycle_eligible: false,
             url_fetch: None,
             failed_cleanup: None,
@@ -3361,6 +4173,42 @@ mod tests {
             params: vec![],
             stages: vec![],
         }
+    }
+
+    /// W10: only a running PAR repair or extraction defers a restart.
+    #[test]
+    fn restart_waits_only_for_par_repair_and_extraction() {
+        use nzbd_types::PostStage;
+        let snapshot = QueueSnapshot {
+            jobs: vec![
+                summary(
+                    1,
+                    JobStatus::Post {
+                        stage: PostStage::ParRepair,
+                    },
+                ),
+                summary(
+                    2,
+                    JobStatus::Post {
+                        stage: PostStage::Unpack,
+                    },
+                ),
+                summary(
+                    3,
+                    JobStatus::Post {
+                        stage: PostStage::ParVerify,
+                    },
+                ),
+                summary(4, JobStatus::Downloading),
+            ],
+            ..Default::default()
+        };
+        let waiting = super::restart_blockers(&snapshot);
+        assert_eq!(
+            waiting.iter().map(|w| (w.job, w.stage)).collect::<Vec<_>>(),
+            vec![(1, "par_repair"), (2, "unpack")]
+        );
+        assert!(super::restart_blockers(&QueueSnapshot::default()).is_empty());
     }
 
     #[test]
@@ -3462,6 +4310,91 @@ mod tests {
     }
 
     #[test]
+    fn the_tick_leaves_storage_io_to_its_own_frame() {
+        let snap = QueueSnapshot {
+            storage_volumes: vec![nzbd_engine::snapshot::StorageVolumeSnapshot {
+                name: "processing".into(),
+                label: "working".into(),
+                path: "/processing".into(),
+                available_bytes: Some(10),
+                total_bytes: Some(100),
+                current: true,
+                io: Some(nzbd_engine::snapshot::StorageIoSnapshot {
+                    source: "block",
+                    detail: "sda1".into(),
+                    read_bps: Some(7),
+                    write_bps: Some(9),
+                }),
+            }],
+            ..Default::default()
+        };
+        let tick: serde_json::Value = serde_json::from_str(&tick_payload(&snap)).unwrap();
+        let row = &tick["status"]["storage"][0];
+        assert_eq!(row["name"], "processing", "the tick keeps the capacity row");
+        assert!(
+            row.get("io").is_none(),
+            "the tick does not carry I/O: {row}"
+        );
+        let io: serde_json::Value = serde_json::from_str(&storage_io_payload(&snap)).unwrap();
+        assert_eq!(io["storage"][0]["path"], "/processing");
+        assert_eq!(io["storage"][0]["io"]["write_bps"], 9);
+        for (raw, wants) in [
+            (None, false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("0"), false),
+            (Some(""), false),
+        ] {
+            let query = EventsQuery {
+                storage_io: raw.map(str::to_owned),
+            };
+            assert_eq!(query.wants_storage_io(), wants, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn status_storage_carries_the_dashboard_name_and_io() {
+        let snap = QueueSnapshot {
+            storage_volumes: vec![
+                nzbd_engine::snapshot::StorageVolumeSnapshot {
+                    name: "processing".into(),
+                    label: "state · working · failed".into(),
+                    path: "/processing".into(),
+                    available_bytes: Some(10),
+                    total_bytes: Some(100),
+                    current: true,
+                    io: Some(nzbd_engine::snapshot::StorageIoSnapshot {
+                        source: "block",
+                        detail: "nvme0n1p2".into(),
+                        read_bps: Some(1_000),
+                        write_bps: Some(2_000),
+                    }),
+                },
+                nzbd_engine::snapshot::StorageVolumeSnapshot {
+                    name: "completed".into(),
+                    label: "downloads".into(),
+                    path: "/completed".into(),
+                    available_bytes: None,
+                    total_bytes: None,
+                    current: false,
+                    io: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(status_dto(&snap)).unwrap();
+        let storage = &value["storage"];
+        assert_eq!(storage[0]["name"], "processing");
+        assert_eq!(storage[0]["label"], "state · working · failed");
+        assert_eq!(storage[0]["io"]["source"], "block");
+        assert_eq!(storage[0]["io"]["detail"], "nvme0n1p2");
+        assert_eq!(storage[0]["io"]["read_bps"], 1_000);
+        assert_eq!(storage[0]["io"]["write_bps"], 2_000);
+        assert_eq!(storage[1]["name"], "completed");
+        assert!(storage[1]["io"].is_null());
+    }
+
+    #[test]
     fn storage_probe_covers_configured_paths_and_missing_destinations() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = nzbd_config::Config::default();
@@ -3499,6 +4432,10 @@ mod tests {
                 "state · downloads · working · failed · temporary · category: tv"
             );
             assert_eq!(measured[0].path, tmp.path().to_string_lossy());
+            assert_eq!(
+                measured[0].name, "processing · completed",
+                "one filesystem holding work and output is named for both"
+            );
         }
         #[cfg(windows)]
         assert_eq!(
@@ -3574,9 +4511,9 @@ mod tests {
         engine
             .hold_job(
                 id,
-                nzbd_types::HoldCause::IdentityConflict,
+                nzbd_types::HoldCause::MountUnavailable,
                 "download_write",
-                "conflicting yEnc declared size",
+                "configured root identity changed",
             )
             .await
             .unwrap();
@@ -3620,6 +4557,14 @@ mod tests {
             .add_nzb("huge", huge.as_bytes(), None, 0)
             .await
             .unwrap();
+        // Scope simulated headroom to this exact payload directory. A fixed
+        // 256 GB request does not exceed real free space on every test host.
+        #[cfg(unix)]
+        let _capacity_limit = nzbd_state::capacity::inject_available_test_limit(
+            &engine.artifacts().for_job(big.0).unwrap().unwrap().path,
+            2 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
         engine
             .hold_job(
                 big,
@@ -3901,6 +4846,166 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// Contract §2.2 / IMPL §5.4: an operator delete is a real `cancelled`
+    /// terminal with the transfer, from the same record as its `DELETED`
+    /// history row; `job_deleted` stays advisory.
+    #[tokio::test]
+    async fn operator_delete_emits_cancelled_terminal_with_transfer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let id = engine
+            .add_nzb_opts(
+                "to-delete",
+                NZB.as_bytes(),
+                nzbd_engine::AddOpts {
+                    params: vec![("monarr-transfer".into(), "t-cancel-1".into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut events = engine.subscribe();
+        let response = app
+            .oneshot(
+                axum::http::Request::post(format!("/api/v1/jobs/{}/actions/delete", id.0))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let entry = db.get(id).unwrap().unwrap();
+        assert_eq!(entry.status, "DELETED");
+        let terminal = engine.artifacts().terminal(id.0).unwrap().unwrap();
+        assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Cancelled);
+        assert_eq!(terminal.transfer.as_deref(), Some("t-cancel-1"));
+        assert_eq!(terminal.history_seq, Some(entry.seq));
+        assert!(terminal.emitted);
+        let (mut deleted, mut cancelled) = (false, false);
+        while let Ok(event) = events.try_recv() {
+            match event {
+                nzbd_engine::Event::JobDeleted { job } if job == id => deleted = true,
+                nzbd_engine::Event::JobPpFinished {
+                    job,
+                    outcome,
+                    transfer,
+                    history_seq,
+                    blames_release,
+                    ..
+                } if job == id => {
+                    assert_eq!(outcome, nzbd_types::TerminalOutcome::Cancelled);
+                    assert_eq!(transfer.as_deref(), Some("t-cancel-1"));
+                    assert_eq!(history_seq, entry.seq);
+                    assert!(!blames_release);
+                    cancelled = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(deleted, "job_deleted is still emitted");
+        assert!(
+            cancelled,
+            "job_pp_finished{{cancelled}} reaches the consumer"
+        );
+        engine.shutdown().await;
+    }
+
+    /// Plan M1 (h), narrowed in M6b: `params`/`history_seq` keep their
+    /// names and the `*Control:v1` the event carries parses with the v1
+    /// fixture consumer; the legacy `pp_status`/`final_dir` are gone (every
+    /// curator reads `outcome`/`reason`/`publication` since M2).
+    #[tokio::test]
+    async fn old_curator_fixture_parses_new_event() {
+        let fixture: nzbd_types::JobControl = serde_json::from_str(include_str!(
+            "../../nzbd-types/fixtures/job-control-v1.json"
+        ))
+        .unwrap();
+        let (name, data) = event_json(&nzbd_engine::Event::JobPpFinished {
+            job: JobId(7),
+            name: "Show".into(),
+            category: Some("tv".into()),
+            transfer: Some("t-7".into()),
+            outcome: nzbd_types::TerminalOutcome::Failed,
+            reason: Some(nzbd_types::FailureReason::Unpack),
+            fetch_cause: None,
+            stage: Some("unpack".into()),
+            message: Some("extractor failed".into()),
+            blames_release: true,
+            salvage: nzbd_types::Salvage::Pending,
+            keep_on_failure: false,
+            fetched: Default::default(),
+            publication: None,
+            size_bytes: 1,
+            health: 1000,
+            params: vec![
+                ("monarr-transfer".into(), "t-7".into()),
+                (
+                    nzbd_types::CONTROL_PARAM.into(),
+                    serde_json::to_string(&fixture).unwrap(),
+                ),
+            ],
+            history_seq: 12,
+            history_incarnation: "abc".into(),
+        });
+        assert_eq!(name, "job_pp_finished");
+        assert_eq!(data["outcome"], "failed");
+        assert_eq!(data["reason"], "unpack");
+        assert!(data.get("pp_status").is_none() && data.get("final_dir").is_none());
+        assert_eq!(data["history_seq"], 12);
+        let control = data["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pair| pair[0] == nzbd_types::CONTROL_PARAM)
+            .unwrap()[1]
+            .as_str()
+            .unwrap();
+        let parsed: nzbd_types::JobControl = serde_json::from_str(control).unwrap();
+        assert_eq!(parsed, fixture);
+        // The history cursor carries its identity.
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let db = Arc::new(HistoryDb::open(&tmp.path().join("history.sqlite"), None).unwrap());
+        let app = router_with(ApiState {
+            engine: engine.clone(),
+            history: Some(db.clone()),
+            torrent: None,
+            log: None,
+            setup: None,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        });
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/history?since_seq=0")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page = body_json(response).await;
+        assert_eq!(page["incarnation"].as_str().unwrap().len(), 32);
+        assert_eq!(page["head_seq"], 0);
+        assert_eq!(page["retained_min_seq"], 0);
+        engine.shutdown().await;
+    }
+
     #[tokio::test]
     async fn consumer_history_requeue_refuses_both_sources_without_retiring_history() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3991,6 +5096,15 @@ mod tests {
             .await
             .unwrap();
         let old_id = body_json(added).await["id"].as_u64().unwrap();
+        let inventory = engine.artifacts();
+        let allocation = inventory.for_job(old_id as u32).unwrap().unwrap();
+        let path = allocation.path;
+        std::fs::write(path.join("original"), b"recoverable original").unwrap();
+        let workspace = inventory
+            .workspace(old_id as u32, "par_repair", "de1e7e")
+            .unwrap();
+        std::fs::write(workspace.scratch.path.join("scratch"), b"obsolete scratch").unwrap();
+        inventory.finish_workspace(&workspace).unwrap();
         let deleted = app
             .clone()
             .oneshot(
@@ -4003,6 +5117,20 @@ mod tests {
         assert_eq!(deleted.status(), StatusCode::OK);
         assert_eq!(body_json(deleted).await["parked"], true);
         assert_eq!(db.list_filtered(10, true).unwrap()[0].status, "DELETED");
+        assert!(!workspace.scratch.path.exists());
+        assert_eq!(
+            inventory.get(&workspace.scratch.id).unwrap().state,
+            "deleted"
+        );
+        assert_eq!(
+            std::fs::read(path.join("original")).unwrap(),
+            b"recoverable original"
+        );
+        let deleted_entry = db.get(JobId(old_id as u32)).unwrap().unwrap();
+        assert!(deleted_entry.params.contains(&(
+            "Artifact:Generation".into(),
+            workspace.source.generation.clone()
+        )));
 
         let requeued = app
             .clone()
@@ -4124,6 +5252,51 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["jobs_queued"], 1);
         assert_eq!(v["remaining_bytes"], 1000);
+        assert_eq!(v["post_paused"], false);
+
+        // The two pause lanes: `pause-post` touches only post-processing,
+        // and an unknown lane is a client error rather than a silent no-op.
+        let queue_action = |action: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::post(format!("/api/v1/queue/actions/{action}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let status = || {
+            let app = app.clone();
+            async move {
+                body_json(
+                    app.oneshot(
+                        axum::http::Request::get("/api/v1/status")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .await
+            }
+        };
+        assert_eq!(queue_action("pause-post").await.status(), StatusCode::OK);
+        let v = status().await;
+        assert_eq!(v["post_paused"], true);
+        assert_eq!(v["download_paused"], false);
+        assert_eq!(queue_action("pause").await.status(), StatusCode::OK);
+        assert_eq!(queue_action("resume-post").await.status(), StatusCode::OK);
+        let v = status().await;
+        assert_eq!(v["post_paused"], false);
+        assert_eq!(v["download_paused"], true);
+        assert_eq!(queue_action("resume").await.status(), StatusCode::OK);
+        assert_eq!(
+            queue_action("pause-everything").await.status(),
+            StatusCode::BAD_REQUEST
+        );
 
         // Pause + resume + delete.
         for (action, expect) in [("pause", true), ("resume", true), ("delete", true)] {
@@ -4495,6 +5668,42 @@ mod tests {
             text.contains("download_rate_bps") && text.contains("tickjob"),
             "tick carries status + job rows: {text:?}"
         );
+        engine.shutdown().await;
+    }
+
+    /// The dashboard opts in to the per-second storage throughput frame;
+    /// it arrives beside the tick without being part of it.
+    #[tokio::test]
+    async fn storage_io_frames_are_opt_in() {
+        use tokio_stream::StreamExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let resp = router(engine.clone())
+            .oneshot(
+                axum::http::Request::get("/api/v1/events?storage_io=1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        let mut text = String::new();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(chunk) = body.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+                if text.contains("event: storage_io") && text.contains("event: tick") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(
+            got,
+            Ok(true),
+            "no storage_io frame beside the tick: {text:?}"
+        );
+        assert!(text.contains("\"storage\":"), "got: {text:?}");
         engine.shutdown().await;
     }
 
@@ -5168,6 +6377,15 @@ mod tests {
             data.contains("monarr/1.0"),
             "pause events carry their source: {data}"
         );
+        let (name, data) = wire(&E::PostPauseChanged {
+            paused: false,
+            source: "curator/0.6".into(),
+        });
+        assert_eq!(name, "post_pause_changed");
+        assert!(
+            data.contains("false") && data.contains("curator/0.6"),
+            "{data}"
+        );
         let (name, data) = wire(&E::SpeedLimitChanged {
             bytes_per_sec: Some(1024),
         });
@@ -5193,16 +6411,37 @@ mod tests {
             job: JobId(7),
             name: "Show.S01E01".into(),
             category: Some("tv".into()),
-            pp_status: "SUCCESS".into(),
-            final_dir: Some("/dest/Show.S01E01".into()),
+            transfer: Some("t-42-a3f9c1".into()),
+            outcome: nzbd_types::TerminalOutcome::Completed,
+            reason: None,
+            fetch_cause: None,
+            stage: None,
+            message: None,
+            blames_release: false,
+            salvage: nzbd_types::Salvage::None,
+            keep_on_failure: false,
+            fetched: nzbd_types::Fetched {
+                success_articles: 10,
+                total_articles: 10,
+                bytes: 42,
+            },
+            publication: Some(nzbd_types::Publication {
+                path: "/dest/Show.S01E01".into(),
+                generation: "29c8".into(),
+                manifest_digest: "a0ac".into(),
+                files: 1,
+                cross_volume: false,
+            }),
             size_bytes: 42,
             health: 1000,
             params: vec![("monarr-transfer".into(), "t-42-a3f9c1".into())],
             history_seq: 913,
+            history_incarnation: "7f3a".into(),
         });
         assert_eq!(name, "job_pp_finished");
+        assert!(data.contains("\"path\":\"/dest/Show.S01E01\""), "{data}");
         assert!(
-            data.contains("\"final_dir\":\"/dest/Show.S01E01\""),
+            !data.contains("final_dir") && !data.contains("pp_status"),
             "{data}"
         );
         assert!(data.contains("\"history_seq\":913"), "{data}");
@@ -5210,9 +6449,72 @@ mod tests {
             data.contains("monarr-transfer"),
             "the transfer id must survive to the wire: {data}"
         );
+        for field in [
+            "\"transfer\":\"t-42-a3f9c1\"",
+            "\"outcome\":\"completed\"",
+            "\"salvage\":\"none\"",
+            "\"history_incarnation\":\"7f3a\"",
+            "\"manifest_digest\":\"a0ac\"",
+            "\"cross_volume\":false",
+            "\"success_articles\":10",
+        ] {
+            assert!(data.contains(field), "{field} missing: {data}");
+        }
+        let (name, data) = wire(&E::JobPpFinished {
+            job: JobId(8),
+            name: "Show.S01E02".into(),
+            category: None,
+            transfer: Some("t-43".into()),
+            outcome: nzbd_types::TerminalOutcome::Failed,
+            reason: Some(nzbd_types::FailureReason::Fetch),
+            fetch_cause: Some(nzbd_types::FetchCause::IndexerUnavailable),
+            stage: Some("fetch".into()),
+            message: Some("http: status 503".into()),
+            blames_release: false,
+            salvage: nzbd_types::Salvage::None,
+            keep_on_failure: false,
+            fetched: Default::default(),
+            publication: None,
+            size_bytes: 0,
+            health: 0,
+            params: vec![],
+            history_seq: 914,
+            history_incarnation: "7f3a".into(),
+        });
+        assert_eq!(name, "job_pp_finished");
+        for field in [
+            "\"reason\":\"fetch\"",
+            "\"fetch_cause\":\"indexer_unavailable\"",
+            "\"blames_release\":false",
+            "\"publication\":null",
+        ] {
+            assert!(data.contains(field), "{field} missing: {data}");
+        }
+        let (name, data) = wire(&E::JobStatusChanged {
+            job: JobId(9),
+            transfer: None,
+            status: "held".into(),
+            stage: None,
+            control: None,
+        });
+        assert_eq!(name, "job_status_changed");
+        assert!(data.contains("\"status\":\"held\""), "{data}");
+        let (name, data) = wire(&E::JobPublicationReady {
+            job: JobId(9),
+            transfer: Some("t-9".into()),
+            publication: nzbd_types::Publication {
+                path: "/c/x.runner-1".into(),
+                generation: "1".into(),
+                manifest_digest: "ab".into(),
+                files: 2,
+                cross_volume: false,
+            },
+        });
+        assert_eq!(name, "job_publication_ready");
+        assert!(data.contains("\"files\":2"), "{data}");
     }
 
-    /// The release probe (Curator ADR 0026): advertised in status, refused
+    /// The release probe (Curator ADR 0031): advertised in status, refused
     /// without news servers, and with them it returns the head of the main
     /// file and lists the probe for the UI — without queueing a job.
     #[tokio::test]
@@ -5315,5 +6617,207 @@ mod tests {
         assert_eq!(log["served"], 1, "{log}");
         assert_eq!(log["recent"][0]["file"], "Title.2021.2160p.mkv");
         assert_eq!(log["recent"][0]["bytes"], 30_000);
+    }
+}
+
+#[cfg(test)]
+mod integration_doc_tests {
+    use super::event_json;
+    use nzbd_engine::Event as E;
+    use nzbd_types::{FileId, JobId, JobStatus, PostStage, ServerId};
+    use std::collections::BTreeSet;
+
+    /// One of every engine event. The match below stops compiling when a
+    /// variant is added, so a new event cannot skip the doc check.
+    fn every_event() -> Vec<E> {
+        let job = JobId(1);
+        let control = nzbd_types::JobControl {
+            expiry_pending: false,
+            version: 1,
+            revision: "1".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "unpack".into(),
+            retry_policy: "resume_same_job".into(),
+            message: String::new(),
+            instance: String::new(),
+            previous_status: None,
+            manual_pause: false,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        };
+        let publication = nzbd_types::Publication {
+            path: "/completed/x".into(),
+            generation: "g".into(),
+            manifest_digest: "d".into(),
+            files: 1,
+            cross_volume: false,
+        };
+        let events = vec![
+            E::JobControlChanged {
+                job,
+                control: control.clone(),
+            },
+            E::JobAdded {
+                job,
+                name: "x".into(),
+            },
+            E::JobFinished {
+                job,
+                name: "x".into(),
+                status: JobStatus::Completed,
+                health: 1000,
+            },
+            E::JobDeleted { job },
+            E::UrlFetchResolved { job },
+            E::FileFinished {
+                job,
+                file: FileId(1),
+                filename: "x".into(),
+                ok: true,
+            },
+            E::SegmentExhausted {
+                job,
+                file: FileId(1),
+                segment: 1,
+            },
+            E::ServerBlocked {
+                server: ServerId(0),
+                seconds: 1,
+            },
+            E::QueuePauseChanged {
+                paused: true,
+                source: "test".into(),
+            },
+            E::PostPauseChanged {
+                paused: true,
+                source: "test".into(),
+            },
+            E::SpeedLimitChanged {
+                bytes_per_sec: None,
+            },
+            E::MaxActiveDownloadsChanged { n: 1 },
+            E::JobAssigned { job, node: None },
+            E::JobPpStage {
+                job,
+                name: "x".into(),
+                stage: PostStage::Unpack,
+            },
+            E::JobPpFinished {
+                job,
+                name: "x".into(),
+                category: None,
+                transfer: None,
+                outcome: nzbd_types::TerminalOutcome::Completed,
+                reason: None,
+                fetch_cause: None,
+                stage: None,
+                message: None,
+                blames_release: false,
+                salvage: nzbd_types::Salvage::None,
+                keep_on_failure: false,
+                fetched: nzbd_types::Fetched {
+                    success_articles: 0,
+                    total_articles: 0,
+                    bytes: 0,
+                },
+                publication: Some(publication.clone()),
+                size_bytes: 0,
+                health: 1000,
+                params: Vec::new(),
+                history_seq: 1,
+                history_incarnation: "i".into(),
+            },
+            E::JobStatusChanged {
+                job,
+                transfer: None,
+                status: "held".into(),
+                stage: None,
+                control: Some(control),
+            },
+            E::JobPublicationReady {
+                job,
+                transfer: None,
+                publication,
+            },
+        ];
+        for event in &events {
+            match event {
+                E::JobControlChanged { .. }
+                | E::JobAdded { .. }
+                | E::JobFinished { .. }
+                | E::JobDeleted { .. }
+                | E::UrlFetchResolved { .. }
+                | E::FileFinished { .. }
+                | E::SegmentExhausted { .. }
+                | E::ServerBlocked { .. }
+                | E::QueuePauseChanged { .. }
+                | E::PostPauseChanged { .. }
+                | E::SpeedLimitChanged { .. }
+                | E::MaxActiveDownloadsChanged { .. }
+                | E::JobAssigned { .. }
+                | E::JobPpStage { .. }
+                | E::JobPpFinished { .. }
+                | E::JobStatusChanged { .. }
+                | E::JobPublicationReady { .. } => {}
+            }
+        }
+        events
+    }
+
+    /// The backticked first-column names of the tables in `docs/INTEGRATION.md`
+    /// "### Event reference", split at the "Stream frames" paragraph.
+    fn documented() -> (BTreeSet<String>, BTreeSet<String>) {
+        let doc = include_str!("../../../docs/INTEGRATION.md");
+        let start = doc
+            .find("### Event reference")
+            .expect("INTEGRATION.md has an Event reference section");
+        let section = &doc[start + 1..];
+        let section = &section[..section.find("\n### ").unwrap_or(section.len())];
+        let split = section
+            .find("Stream frames")
+            .expect("the section names its stream frames");
+        let names = |part: &str| {
+            part.lines()
+                .filter_map(|line| line.strip_prefix("| `"))
+                .filter_map(|rest| rest.split('`').next())
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        };
+        (names(&section[..split]), names(&section[split..]))
+    }
+
+    #[test]
+    fn integration_doc_names_every_sse_event() {
+        let emitted: BTreeSet<String> = every_event()
+            .iter()
+            .map(|event| event_json(event).0.to_owned())
+            .collect();
+        let (engine, frames) = documented();
+        assert_eq!(
+            emitted, engine,
+            "docs/INTEGRATION.md engine events differ from event_json"
+        );
+        // Stream-local frames: every literal SSE event name this file writes.
+        let source = include_str!("lib.rs");
+        let mut literal = BTreeSet::new();
+        let mut rest = source;
+        let needle = concat!(".event", "(\"");
+        while let Some(at) = rest.find(needle) {
+            let tail = &rest[at + needle.len()..];
+            if let Some(end) = tail.find('"') {
+                literal.insert(tail[..end].to_owned());
+            }
+            rest = tail;
+        }
+        assert_eq!(
+            literal, frames,
+            "docs/INTEGRATION.md stream frames differ from the SSE handler"
+        );
+        assert!(engine.is_disjoint(&frames));
     }
 }

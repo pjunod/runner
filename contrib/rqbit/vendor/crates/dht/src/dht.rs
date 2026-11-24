@@ -20,12 +20,12 @@ use crate::{
     INACTIVITY_TIMEOUT, REQUERY_INTERVAL, RESPONSE_TIMEOUT,
 };
 use anyhow::{bail, Context};
-use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use bencode::ByteBufOwned;
 use dashmap::DashMap;
 use futures::{
     future::BoxFuture, stream::FuturesUnordered, FutureExt, Stream, StreamExt, TryFutureExt,
 };
+use librqbit_core::retry::RetryPolicy;
 
 use leaky_bucket::RateLimiter;
 use librqbit_core::{
@@ -974,12 +974,7 @@ impl DhtWorker {
     }
 
     async fn bootstrap_hostname_with_backoff(&self, addr: &str) -> anyhow::Result<()> {
-        let mut backoff = ExponentialBackoffBuilder::new()
-            .with_initial_interval(Duration::from_secs(10))
-            .with_multiplier(1.5)
-            .with_max_interval(Duration::from_secs(60))
-            .with_max_elapsed_time(Some(Duration::from_secs(86400)))
-            .build();
+        let mut backoff = RetryPolicy::bootstrap();
 
         loop {
             let backoff = match self

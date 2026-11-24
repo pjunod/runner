@@ -7,12 +7,16 @@ export type PostStage =
   | 'cleanup'
   | 'move'
   | 'post_unpack_rename'
+  | 'publication_verify'
   | 'script';
 
 export type JobStatus =
   | 'queued'
   | 'downloading'
   | 'paused'
+  // Runner 0.6.0+: a job on hold (its `control` says why). Older Runners
+  // report a hold as `paused` with a held control.
+  | 'held'
   | 'fetching'
   | 'post_queued'
   | 'completed'
@@ -48,6 +52,12 @@ export interface JobControl {
   instance: string;
   previous_status?: JobStatus | null;
   manual_pause?: boolean;
+  blocked_since_unix?: number | null;
+  next_retry_at_unix?: number | null;
+  /** Seconds until Runner ends this hold as failed/hold_expired (relative: hosts share no clock). */
+  deadline_in_s?: number | null;
+  /** The same deadline as a unix time, for display. */
+  deadline_unix?: number | null;
 }
 
 export interface ControlPending {
@@ -127,12 +137,27 @@ export interface ServerVolume {
   rate_bps: number;
 }
 
+/** One filesystem's throughput. `block` is device-wide, `nfs` is this
+ * Runner host's traffic to the server, `runner` is Runner's own I/O where
+ * the kernel keeps no counters, `stale` means the sampler stopped. */
+export interface StorageIo {
+  source: 'block' | 'nfs' | 'runner' | 'stale' | 'unsupported' | string;
+  detail: string;
+  read_bps: number | null;
+  write_bps: number | null;
+}
+
 export interface StoragePath {
+  /** What the filesystem is for: processing, completed, or both. Absent on older daemons. */
+  name?: string;
+  /** The configured roles on this filesystem. */
   label: string;
   path: string;
   available_bytes: number | null;
   total_bytes: number | null;
   current?: boolean;
+  /** Present on /api/v1/status and storage_io frames; ticks leave it out. */
+  io?: StorageIo | null;
 }
 
 export interface StatusDto {
@@ -143,6 +168,8 @@ export interface StatusDto {
   remaining_bytes: number;
   session_downloaded_bytes: number;
   download_paused: boolean;
+  /** Absent on older daemons; treat as false. */
+  post_paused?: boolean;
   disk_low: boolean;
   disk_guard_free_bytes?: number | null;
   disk_guard_label?: string | null;
@@ -151,6 +178,8 @@ export interface StatusDto {
   disk_guard_all_roots_known?: boolean;
   enospc_observed: number;
   enospc_where: string | null;
+  /** Absent on daemons before 0.9.8. */
+  enospc_failures?: SpaceFailure[];
   quota_reached: boolean;
   blocked_servers: number[];
   health_abort: boolean;
@@ -290,4 +319,14 @@ export interface DeliveryTrace {
   runnerStages?: { nodeId: string; clockDomain: string; spans: StageSpan[] } | null;
   sourceCleanup?: { status: string; attempts: number; error?: string | null; nextRetryAt?: number | null };
   sourceCopies?: { id: string; ownerNode: string; status: string; attempts: number; error?: string | null; nextRetryAt?: number | null }[];
+}
+
+/** One out-of-space failure currently holding intake (daemon 0.9.8+). */
+export interface SpaceFailure {
+  operation: string;
+  detail: string;
+  path: string | null;
+  volume: string | null;
+  volume_label: string | null;
+  volume_path: string | null;
 }

@@ -26,7 +26,7 @@ exclude = ["contrib/rqbit/vendor", "vendor/hiqlite", "vendor/hiqlite-wal"]
 # Releases are git tags `v<this>` — see docs/DEPLOY.md, "Cutting a
 # release". What the daemon reports comes from `git describe`, so it moves
 # on every commit; this is only the release the count is measured from.
-version = "0.2.0"
+version = "0.9.8"
 edition = "2021"
 rust-version = "1.95"
 # License note: this code is written from scratch against a behavioral spec
@@ -36,28 +36,29 @@ license = "MIT OR Apache-2.0"
 repository = "https://example.invalid/nzbd"
 
 [workspace.dependencies]
-nzbd-types = { version = "=0.2.0", path = "crates/nzbd-types" }
-nzbd-nzb = { version = "=0.2.0", path = "crates/nzbd-nzb" }
-nzbd-yenc = { version = "=0.2.0", path = "crates/nzbd-yenc" }
-nzbd-par2 = { version = "=0.2.0", path = "crates/nzbd-par2" }
-nzbd-nntp = { version = "=0.2.0", path = "crates/nzbd-nntp" }
-nzbd-engine = { version = "=0.2.0", path = "crates/nzbd-engine" }
-nzbd-feed = { version = "=0.2.0", path = "crates/nzbd-feed" }
-nzbd-post = { version = "=0.2.0", path = "crates/nzbd-post" }
-nzbd-state = { version = "=0.2.0", path = "crates/nzbd-state" }
-nzbd-config = { version = "=0.2.0", path = "crates/nzbd-config" }
-nzbd-api = { version = "=0.2.0", path = "crates/nzbd-api" }
-nzbd-compat = { version = "=0.2.0", path = "crates/nzbd-compat" }
+nzbd-types = { version = "=0.9.8", path = "crates/nzbd-types" }
+nzbd-nzb = { version = "=0.9.8", path = "crates/nzbd-nzb" }
+nzbd-yenc = { version = "=0.9.8", path = "crates/nzbd-yenc" }
+nzbd-par2 = { version = "=0.9.8", path = "crates/nzbd-par2" }
+nzbd-nntp = { version = "=0.9.8", path = "crates/nzbd-nntp" }
+nzbd-engine = { version = "=0.9.8", path = "crates/nzbd-engine" }
+nzbd-feed = { version = "=0.9.8", path = "crates/nzbd-feed" }
+nzbd-post = { version = "=0.9.8", path = "crates/nzbd-post" }
+nzbd-state = { version = "=0.9.8", path = "crates/nzbd-state" }
+nzbd-config = { version = "=0.9.8", path = "crates/nzbd-config" }
+nzbd-api = { version = "=0.9.8", path = "crates/nzbd-api" }
+nzbd-compat = { version = "=0.9.8", path = "crates/nzbd-compat" }
 
-nzbd-nserv = { version = "=0.2.0", path = "crates/nzbd-nserv" }
-nzbd-cluster = { version = "=0.2.0", path = "crates/nzbd-cluster" }
-nzbd-torrent = { version = "=0.2.0", path = "crates/nzbd-torrent" }
-nzbd-qbit-compat = { version = "=0.2.0", path = "crates/nzbd-qbit-compat" }
-nzbd-probe = { version = "=0.2.0", path = "crates/nzbd-probe" }
+nzbd-nserv = { version = "=0.9.8", path = "crates/nzbd-nserv" }
+nzbd-cluster = { version = "=0.9.8", path = "crates/nzbd-cluster" }
+nzbd-torrent = { version = "=0.9.8", path = "crates/nzbd-torrent" }
+nzbd-qbit-compat = { version = "=0.9.8", path = "crates/nzbd-qbit-compat" }
+nzbd-probe = { version = "=0.9.8", path = "crates/nzbd-probe" }
 
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zstd = { version = "0.13.3", default-features = false }
 thiserror = "2"
 # Pin the first release in Tokio's fixed 1.53 line for RUSTSEC-2026-0386.
 # The workspace's Rust 1.95 MSRV also supports Windows OnceLock::wait.
@@ -77,12 +78,12 @@ http-body-util = "0.1"
 httpdate = "1"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
 sha2 = "0.10"
-quick-xml = "0.41"
+quick-xml = "0.42"
 crc32fast = "1"
 base64 = "0.22"
 libc = "0.2"
 md-5 = "0.10"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 hiqlite = { version = "=0.14.0", default-features = false, features = ["auto-heal", "macros", "sqlite"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -97,12 +97,16 @@ fn group_status(j: &JobSummary) -> &'static str {
     match j.status {
         JobStatus::Queued => "QUEUED",
         JobStatus::Downloading => "DOWNLOADING",
-        JobStatus::Paused => "PAUSED",
+        // NZBGet has no held state; a hold reads as paused here (contract
+        // §2.3). Native clients see `held`.
+        JobStatus::Paused | JobStatus::Held => "PAUSED",
         JobStatus::Fetching => "FETCHING",
         JobStatus::PostQueued => "PP_QUEUED",
         JobStatus::Post { stage } => match stage {
             nzbd_types::PostStage::ParRename | nzbd_types::PostStage::RarRename => "RENAMING",
-            nzbd_types::PostStage::ParVerify => "VERIFYING_SOURCES",
+            nzbd_types::PostStage::ParVerify | nzbd_types::PostStage::PublicationVerify => {
+                "VERIFYING_SOURCES"
+            }
             nzbd_types::PostStage::ParRepair => "REPAIRING",
             nzbd_types::PostStage::Unpack => "UNPACKING",
             nzbd_types::PostStage::Cleanup | nzbd_types::PostStage::Move => "MOVING",
@@ -406,6 +410,16 @@ async fn dispatch_cluster(
             let source = current_client(state);
             Ok(Value::Bool(state.engine.resume_all(&source).await.is_ok()))
         }
+        // NZBGet's post-processing pause maps onto runner's post lane: the
+        // running stage finishes, no new one starts, downloads carry on.
+        "pausepost" => {
+            let source = current_client(state);
+            Ok(Value::Bool(state.engine.pause_post(&source).await.is_ok()))
+        }
+        "resumepost" => {
+            let source = current_client(state);
+            Ok(Value::Bool(state.engine.resume_post(&source).await.is_ok()))
+        }
         "writelog" => {
             // writelog(Kind, Text) — scripts and clients inject log lines.
             if let Some(buf) = &state.log {
@@ -446,7 +460,7 @@ fn status_json(state: &CompatState) -> Value {
         "DownloadLimit": snap.speed_limit_bps.unwrap_or(0).min(u32::MAX as u64) as u32,
         "DownloadPaused": snap.download_paused,
         "Download2Paused": snap.download_paused, // deprecated alias
-        "PostPaused": false,
+        "PostPaused": snap.post_paused,
         "ScanPaused": false,
         "ServerStandBy": snap.download_rate_bps == 0,
         "UpTimeSec": uptime,
@@ -807,12 +821,11 @@ async fn editqueue(
                 }
                 done
             }
-            "GroupSetCategory" => {
-                edit_job(state, id, |j| {
-                    j.category = (!text.is_empty()).then(|| text.clone());
-                })
+            "GroupSetCategory" => state
+                .engine
+                .set_category(id, (!text.is_empty()).then(|| text.clone()))
                 .await
-            }
+                .unwrap_or(false),
             "GroupSetParameter" => match text.split_once('=') {
                 Some((k, _)) if k.starts_with('*') => false,
                 Some((k, v)) => {
@@ -985,7 +998,7 @@ async fn listfiles(state: &CompatState, params: &Value) -> Result<Value, (i64, &
 
 /// Delete a queue job the NZBGet way: it becomes a history entry.
 async fn delete_to_history(state: &CompatState, id: JobId, with_files: bool) -> bool {
-    let exported = state.engine.export_job(id).await.ok().flatten();
+    let exported = state.engine.queue_job_metadata(id).await.ok().flatten();
     let deleted = state
         .engine
         .delete_job(id, with_files)
@@ -1176,6 +1189,7 @@ mod tests {
     use nzbd_engine::{Engine, EngineConfig, Tuning};
 
     async fn test_state(tmp: &tempfile::TempDir) -> CompatState {
+        std::fs::create_dir_all(tmp.path().join("dest")).unwrap();
         let engine = Engine::spawn(EngineConfig::single_node(
             vec![],
             tmp.path().join("state"),
@@ -1199,6 +1213,19 @@ mod tests {
             scan_notify: None,
             feeds: None,
         }
+    }
+
+    async fn export_fixture_job(engine: &EngineHandle, id: JobId) -> nzbd_types::Job {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match engine.export_job(id).await {
+                    Err(nzbd_engine::EngineError::Lifecycle(reason))
+                        if reason == "job verification or writer retirement is still in progress; retry later" =>
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    result => return result.unwrap().unwrap(),
+                }
+            }
+        }).await.expect("fixture payload verification must complete")
     }
 
     const NZB: &str = r#"<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
@@ -1335,6 +1362,7 @@ mod tests {
             .unwrap();
         assert_eq!(r, json!(true));
 
+        let before_forbidden = state.engine.export_job(id).await.unwrap().unwrap().params;
         let forbidden = dispatch(
             &state,
             "editqueue",
@@ -1344,10 +1372,10 @@ mod tests {
         .unwrap();
         assert_eq!(forbidden, json!(false));
         let job = state.engine.export_job(id).await.unwrap().unwrap();
-        assert!(!job
-            .params
-            .iter()
-            .any(|(key, _)| key == "*Runner:LifecycleEligible"));
+        assert_eq!(
+            job.params, before_forbidden,
+            "reserved parameters cannot be changed by compat clients"
+        );
 
         // Set a parameter then a category, verify via export.
         let r = dispatch(
@@ -1366,7 +1394,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r, json!(true));
-        let job = state.engine.export_job(id).await.unwrap().unwrap();
+        let job = export_fixture_job(&state.engine, id).await;
         assert!(job
             .params
             .iter()
@@ -1577,6 +1605,23 @@ mod tests {
             .await
             .unwrap();
         assert!(!state.engine.snapshot().download_paused);
+
+        // NZBGet's post-processing pause is the post lane, not a no-op.
+        assert_eq!(
+            dispatch(&state, "pausepost", &Value::Null).await.unwrap(),
+            json!(true)
+        );
+        assert!(state.engine.snapshot().post_paused);
+        assert!(!state.engine.snapshot().download_paused);
+        assert_eq!(
+            dispatch(&state, "status", &Value::Null).await.unwrap()["PostPaused"],
+            json!(true)
+        );
+        assert_eq!(
+            dispatch(&state, "resumepost", &Value::Null).await.unwrap(),
+            json!(true)
+        );
+        assert!(!state.engine.snapshot().post_paused);
         state.engine.shutdown().await;
     }
 

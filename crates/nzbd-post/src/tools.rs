@@ -2,7 +2,7 @@
 //! (ARCHITECTURE.md §9): argv-only, scrubbed env, timeout, output caps,
 //! kill-on-drop.
 
-use crate::{ArchiveKind, ExtractOutcome, PostError, RepairResult, VerifyResult};
+use crate::{ArchiveKind, ExtractOutcome, FsContext, PostError, RepairResult, VerifyResult};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -69,7 +69,7 @@ async fn run_tool_owned(
         use std::os::unix::process::CommandExt;
         command.as_std_mut().process_group(0);
     }
-    let mut child = command
+    command
         .args(args)
         .current_dir(cwd)
         .env_clear()
@@ -80,11 +80,23 @@ async fn run_tool_owned(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    let mut child = crate::script::spawn_retrying_etxtbsy(&mut command)
+        .await
         .map_err(|e| PostError::ToolMissing(format!("{cmd}: {e}")))?;
 
     let group = child.id();
+    // The tool's reads and writes land in the directory it runs in (par2
+    // repairs in place; archives extract to a staging dir inside the job's
+    // attempt workspace). Charge them to that filesystem for the
+    // dashboard's I/O graph. On Linux the exit is observed without reaping,
+    // so the final sample sees everything; elsewhere there is no procfs.
+    let device = tokio::fs::metadata(cwd)
+        .await
+        .ok()
+        .as_ref()
+        .and_then(nzbd_state::io_meter::device_of_metadata);
+    let mut meter = group.map(|pid| nzbd_state::io_meter::ProcessMeter::new(pid, device));
     let out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
     let read_capped = |mut r: tokio::process::ChildStdout| async move {
@@ -121,7 +133,45 @@ async fn run_tool_owned(
     let result = tokio::select! {
         _ = cancellation.cancelled() => None,
         result = tokio::time::timeout(timeout, async {
-        let (o, e, status) = tokio::join!(read_capped(out), read_err, child.wait());
+        let waited = async {
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Poll for exit with WNOWAIT instead of racing wait(), which
+            // would reap the child before its last bytes are read. Where
+            // that cannot be observed, sample until wait() returns instead;
+            // only the final interval's bytes are lost then.
+            #[cfg(target_os = "linux")]
+            if let Some(pid) = group {
+                loop {
+                    tick.tick().await;
+                    match nzbd_state::io_meter::exited_unreaped(pid) {
+                        Ok(exited) => {
+                            if let Some(meter) = meter.as_mut() {
+                                meter.sample();
+                            }
+                            if exited {
+                                return child.wait().await;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "tool exit not observable without reaping; sampling until wait()");
+                            break;
+                        }
+                    }
+                }
+            }
+            loop {
+                tokio::select! {
+                    status = child.wait() => break status,
+                    _ = tick.tick() => {
+                        if let Some(meter) = meter.as_mut() {
+                            meter.sample();
+                        }
+                    }
+                }
+            }
+        };
+        let (o, e, status) = tokio::join!(read_capped(out), read_err, waited);
         (o, e, status)
     }) => Some(result),
     };
@@ -142,7 +192,10 @@ async fn run_tool_owned(
         }
         None => {
             crate::attempt::kill_child(&mut child, group).await?;
-            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tool cancelled").into())
+            Err(PostError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "tool cancelled",
+            )))
         }
     }
 }
@@ -164,7 +217,7 @@ impl Par2Tool {
         let name = main_par2.file_name().unwrap().to_string_lossy();
         let out = run_tool(&self.cmd, &["verify", "-q", &name], dir, self.timeout).await?;
         let text = format!("{}\n{}", out.stdout, out.stderr);
-        if nzbd_engine::is_out_of_space(&text) {
+        if nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&text).as_ref()) {
             return Err(PostError::Subprocess(text.chars().take(4096).collect()));
         }
         Ok(parse_verify_output(&text, out.code))
@@ -175,7 +228,7 @@ impl Par2Tool {
         let name = main_par2.file_name().unwrap().to_string_lossy();
         let out = run_tool(&self.cmd, &["repair", "-q", &name], dir, self.timeout).await?;
         let text = format!("{}\n{}", out.stdout, out.stderr);
-        if nzbd_engine::is_out_of_space(&text) {
+        if nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&text).as_ref()) {
             return Err(PostError::Subprocess(text.chars().take(4096).collect()));
         }
         if out.code == 0
@@ -548,7 +601,7 @@ impl Extractors {
         dest: &Path,
         password: Option<&str>,
     ) -> Result<ExtractOutcome, PostError> {
-        std::fs::create_dir_all(dest)?;
+        std::fs::create_dir_all(dest).at("create directory", dest)?;
         let dir = archive.parent().unwrap_or(Path::new("."));
         // RAR, then 7-Zip if RAR did not deliver.
         //
@@ -599,7 +652,7 @@ impl Extractors {
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => return Err(e.into()),
+                    Err(e) => return Err(e).at("create directory", &candidate),
                 }
             }
             let retry_dir = retry_dir.ok_or_else(|| {
@@ -659,7 +712,7 @@ impl Extractors {
         dest: &Path,
         password: Option<&str>,
     ) -> Result<ExtractOutcome, PostError> {
-        std::fs::create_dir_all(dest)?;
+        std::fs::create_dir_all(dest).at("create directory", dest)?;
         let dir = archive.parent().unwrap_or(Path::new("."));
         let arch = archive.to_string_lossy().into_owned();
         let dest_s = dest.to_string_lossy().into_owned();
@@ -700,9 +753,10 @@ impl Extractors {
                     .any(|m| all.contains(m));
                 let lower = all.to_lowercase();
                 let quota_error = lower.contains("quota exceeded") || lower.contains("disk quota");
-                let capacity = nzbd_engine::is_out_of_space(&all)
-                    || lower.contains("there is not enough space")
-                    || lower.contains("disk full");
+                let capacity =
+                    nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&all).as_ref())
+                        || lower.contains("there is not enough space")
+                        || lower.contains("disk full");
                 let diagnostic = match password {
                     Some(secret) if !secret.is_empty() => all.replace(secret, "[redacted]"),
                     _ => all.clone(),
@@ -746,9 +800,10 @@ impl Extractors {
                 // 7z requires the literal success line (nzbget does the same).
                 let lower = all.to_lowercase();
                 let quota_error = lower.contains("quota exceeded") || lower.contains("disk quota");
-                let capacity = nzbd_engine::is_out_of_space(&all)
-                    || lower.contains("there is not enough space")
-                    || lower.contains("disk full");
+                let capacity =
+                    nzbd_engine::out_of_space(nzbd_engine::stderr_hold_cause(&all).as_ref())
+                        || lower.contains("there is not enough space")
+                        || lower.contains("disk full");
                 let diagnostic = match password {
                     Some(secret) if !secret.is_empty() => all.replace(secret, "[redacted]"),
                     _ => all.clone(),
@@ -821,6 +876,36 @@ mod tests {
     // a loaded runner cannot turn a successful one-line fixture into the
     // timeout outcome the assertion is deliberately not testing.
     const SUBPROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A tool whose executable is still open for writing fails `execve`
+    /// with `ETXTBSY`. That is a busy tool, not a missing one: reporting it
+    /// as `ToolMissing` hands a RAR to the 7-Zip fallback even when the
+    /// first extractor would have reported disk exhaustion. Hold the write
+    /// handle briefly, as a concurrent fork does, and require the run.
+    #[tokio::test]
+    async fn busy_tool_executable_is_retried_not_reported_missing() {
+        use std::io::Write;
+        let t = tempfile::tempdir().unwrap();
+        let tool = t.path().join("busy-tool");
+        let mut handle = std::fs::File::create(&tool).unwrap();
+        handle.write_all(b"#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(handle);
+        });
+        let out = run_tool(
+            tool.to_str().unwrap(),
+            &[],
+            t.path(),
+            SUBPROCESS_TEST_TIMEOUT,
+        )
+        .await
+        .expect("a briefly busy executable is spawned once it is released");
+        release.join().unwrap();
+        assert_eq!(out.code, 0);
+        assert_eq!(out.stdout.trim(), "ran");
+    }
 
     fn write_tool(path: &Path, body: &str) {
         std::fs::write(path, body).unwrap();
@@ -1358,5 +1443,37 @@ mod tests {
         } else {
             assert!(!require_tool(missing));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod io_meter_tests {
+    #[tokio::test]
+    async fn a_tool_run_is_charged_to_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let device = nzbd_state::io_meter::device_of(tmp.path()).unwrap();
+        let before = nzbd_state::io_meter::totals(device);
+        // The shell's printf builtin writes with write(2), as par2 and 7z
+        // do (uutils coreutils copy with splice(), which the counters never
+        // see). The trailing sleep keeps the tool alive across many
+        // samples: kernel 7.0 hides an exited child's counters, so a run
+        // shorter than one sampling interval would otherwise be lost.
+        let out = super::run_tool(
+            "sh",
+            &[
+                "-c",
+                "i=0; while [ $i -lt 1024 ]; do printf '%01024d' 0; i=$((i+1)); done > out.txt; sleep 1",
+            ],
+            tmp.path(),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let after = nzbd_state::io_meter::totals(device);
+        assert!(
+            after.write_bytes - before.write_bytes >= 1024 * 1024,
+            "{after:?}"
+        );
     }
 }

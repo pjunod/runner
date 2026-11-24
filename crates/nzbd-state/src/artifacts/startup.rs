@@ -151,10 +151,108 @@ impl Drop for ReconciliationLease<'_> {
         for key in &self.keys {
             uses.remove(key);
         }
+        self.inventory.reconciliation_released.notify_all();
+    }
+}
+
+/// Rebind a legacy record (empty `mount_id`) to the live device: the
+/// root, the payload directory and every file of the same filesystem.
+fn rebind_legacy_device(artifact: &mut Artifact, device: u64) {
+    artifact.root_identity.device = device;
+    if let Some(identity) = artifact.identity.as_mut().filter(|i| i.mount_id.is_empty()) {
+        identity.device = device;
+    }
+    for file in artifact
+        .files
+        .iter_mut()
+        .filter(|f| f.identity.mount_id.is_empty())
+    {
+        file.identity.device = device;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test support: the mount table `live_legacy_root_device` reads.
+    pub(super) static MOUNTINFO: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+fn mountinfo_text() -> Option<String> {
+    #[cfg(test)]
+    if let Some(text) = MOUNTINFO.with(|value| value.borrow().clone()) {
+        return Some(text);
+    }
+    std::fs::read_to_string("/proc/self/mountinfo").ok()
+}
+
+/// The name only Runner gives a directory: a transform scratch is named by
+/// its operation key (`scratch-<key>` row, `<key>` directory), a job
+/// directory carries `.job-<N>-` for its own job.
+fn runner_named(artifact: &Artifact) -> bool {
+    let Some(name) = artifact.path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    match artifact.job {
+        Some(job) => name.contains(&format!(".job-{job}-")),
+        None => artifact
+            .id
+            .strip_prefix("scratch-")
+            .is_some_and(|key| key == name),
     }
 }
 
 impl Inventory {
+    /// Positive evidence that a legacy record's root (empty `mount_id`) is
+    /// the live volume it named: the directory at the recorded root is the
+    /// same inode; it is not empty; and its device is the device of the
+    /// mount currently covering it in `/proc/self/mountinfo`, which is a
+    /// real mount of its own — not the parent (root) filesystem an
+    /// unmounted, empty mountpoint would fall through to. Returns that
+    /// device.
+    #[cfg(not(unix))]
+    pub(super) fn live_legacy_root_device(&self, _a: &Artifact) -> Option<u64> {
+        None
+    }
+
+    #[cfg(unix)]
+    pub(super) fn live_legacy_root_device(&self, a: &Artifact) -> Option<u64> {
+        if !a.root_identity.mount_id.is_empty() || !a.root_identity.directory {
+            return None;
+        }
+        let root = fs::open_dir(&a.root).ok()?;
+        let observed = fs::identity_for_file(&root).ok()?;
+        if observed.inode != a.root_identity.inode || !observed.directory {
+            return None;
+        }
+        if !std::fs::read_dir(&a.root).ok()?.any(|entry| entry.is_ok()) {
+            return None;
+        }
+        let path = std::fs::canonicalize(&a.root).ok()?;
+        let mountinfo = mountinfo_text()?;
+        let mut best: Option<(usize, u64, String)> = None;
+        for line in mountinfo.lines() {
+            let Some((before, _)) = line.split_once(" - ") else {
+                continue;
+            };
+            let fields: Vec<_> = before.split_ascii_whitespace().collect();
+            if fields.len() < 5 {
+                continue;
+            }
+            let point = fields[4].replace("\\040", " ");
+            let covers = path == Path::new(&point)
+                || path
+                    .strip_prefix(&point)
+                    .is_ok_and(|rest| point == "/" || !rest.as_os_str().is_empty());
+            if !covers || best.as_ref().is_some_and(|(len, _, _)| *len > point.len()) {
+                continue;
+            }
+            let (major, minor) = fields[2].split_once(':')?;
+            let device = libc::makedev(major.parse().ok()?, minor.parse().ok()?);
+            best = Some((point.len(), device as u64, point));
+        }
+        let (_, device, point) = best?;
+        (point != "/" && device == observed.device).then_some(device)
+    }
     pub(super) fn reconciliation_in_use(&self, artifact: &Artifact) -> bool {
         self.reconciliation_uses
             .lock()
@@ -336,11 +434,14 @@ impl Inventory {
         snapshot: &StartupReconciliation,
     ) -> Result<()> {
         self.reconcile_deleted_artifacts_snapshot(Some(snapshot))?;
+        self.park_legacy_startup_orphans(root)?;
         self.reconcile_relocations_root_snapshot(root, Some(snapshot))?;
         self.reconcile_transforms_root_snapshot(root, Some(snapshot))?;
         let rows = {
             let db = self.db.lock().unwrap();
-            let mut statement = db.prepare("SELECT data FROM artifacts WHERE state IN ('allocating','retiring','active') AND json_extract(data,'$.root')=?1")?;
+            // A `transitioning` row no transform, relocation or intent
+            // holds any more is an `active` one whose state was left behind.
+            let mut statement = db.prepare(&format!("SELECT data FROM artifacts a WHERE json_extract(a.data,'$.root')=?1 AND (state IN ('allocating','retiring','active') OR (state='transitioning' AND NOT EXISTS(SELECT 1 FROM operations o WHERE o.artifact=a.id AND o.state NOT IN ('succeeded','cancelled','failed','transferred') AND json_extract(o.data,'$.kind') IN ('par_restore','par_repair','extract','relocate')) AND NOT EXISTS(SELECT 1 FROM relocation_intents i WHERE i.artifact=a.id AND i.state IN {})))", intents::OPEN_STATES))?;
             let rows = statement.query_map([root.to_string_lossy().as_ref()], |row| {
                 row.get::<_, String>(0)
             })?;
@@ -351,10 +452,16 @@ impl Inventory {
             if !snapshot.allows_artifact(self, &original)? {
                 continue;
             }
-            if self.is_transform_scratch(&original)? {
+            // A transform's scratch follows its journal — except an
+            // interrupted allocation, which no journal ever used.
+            if original.state != "allocating" && self.is_transform_scratch(&original)? {
                 continue;
             }
             let live = original.job.is_some_and(|job| live_jobs.contains(&job));
+            if original.state == "transitioning" && live {
+                // A live job's attempt may still own it.
+                continue;
+            }
             if original.state == "active" && live {
                 continue;
             }
@@ -367,9 +474,27 @@ impl Inventory {
                 continue;
             }
             let mut artifact = original.clone();
+            // A pre-mount-id record (empty `mount_id`) identifies its root
+            // by device + inode, and a remount changes the device number, so
+            // it never verified again and the row was skipped every boot
+            // (nuc4 job 1704). With positive evidence that the root is the
+            // live volume (see `live_legacy_root_device`) the record is
+            // rebound to the current device and continues normally.
+            let mut legacy_rebound = false;
             if self.verify_root(&artifact).is_err() {
-                continue;
+                let Some(device) = self.live_legacy_root_device(&artifact) else {
+                    continue;
+                };
+                rebind_legacy_device(&mut artifact, device);
+                if self.verify_root(&artifact).is_err() {
+                    continue;
+                }
+                if artifact.owned && artifact.path.symlink_metadata().is_ok() {
+                    self.sidecar(&artifact)?;
+                }
+                legacy_rebound = true;
             }
+            let mut retirement_gone = false;
             if artifact.state == "allocating" {
                 if !artifact.path.try_exists()? && live {
                     std::fs::create_dir(&artifact.path)?;
@@ -377,6 +502,43 @@ impl Inventory {
                 }
                 if !artifact.path.try_exists()? {
                     artifact.state = "source_gone".into();
+                } else if runner_named(&artifact) {
+                    // The directory sits at the name only Runner gives (a
+                    // transform key, a `.job-<N>-` job directory): Runner
+                    // made it; the interruption only lost the identity
+                    // commit. It stays Runner's.
+                    let dir = fs::open_dir(&artifact.path)?;
+                    let files = fs::manifest(&dir, 100_000)?;
+                    artifact.identity = Some(fs::identity_for_file(&dir)?);
+                    artifact.owned = true;
+                    artifact.files = files;
+                    artifact.inspected_at = Some(now());
+                    if live {
+                        artifact.state = "active".into();
+                        self.sidecar(&artifact)?;
+                    } else if artifact.files.is_empty() {
+                        // Nothing was ever written: remove the empty
+                        // directory (never recursively) and close the row.
+                        drop(dir);
+                        match std::fs::remove_dir(&artifact.path) {
+                            Ok(()) => {
+                                artifact.state = "deleted".into();
+                                artifact.hold = None;
+                                retirement_gone = true;
+                            }
+                            Err(_) => {
+                                artifact.state = "retained".into();
+                                artifact.hold = None;
+                                self.sidecar(&artifact)?;
+                            }
+                        }
+                    } else {
+                        // Bytes an interrupted Runner allocation wrote: a
+                        // failed payload, parked below with the failed TTL.
+                        artifact.state = "retained".into();
+                        artifact.hold = None;
+                        self.sidecar(&artifact)?;
+                    }
                 } else {
                     // mkdir without a committed sidecar cannot prove ownership.
                     artifact.identity =
@@ -400,21 +562,63 @@ impl Inventory {
                         Some("review".into())
                     };
                 }
+            } else if matches!(
+                artifact.path.symlink_metadata(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                // The root verified and nothing is at the path: the
+                // retirement finished before the interruption, or the bytes
+                // are gone. That is the hold's own registered exit ("gone →
+                // source_gone"), reached now instead of being re-armed (and
+                // its timer restarted) at every boot.
+                artifact.state = "source_gone".into();
+                artifact.hold = None;
+                artifact.files.clear();
+                retirement_gone = true;
+            } else if original.state == "transitioning" && artifact.owned {
+                // A leftover `transitioning` row (nothing holds it) whose
+                // directory no longer verifies is no interrupted writer
+                // retirement: that hold's exit would release it back to a
+                // state with no exit. Runner's own failed payload: parked
+                // below with the failed TTL (its retention deletion
+                // re-snapshots the closed scope).
+                artifact.state = "retained".into();
+                artifact.hold = None;
             } else {
                 artifact.hold = Some("review: interrupted writer retirement".into());
             }
-            let orphan_receipt = (!live).then(|| OrphanReceipt {
+            let orphan_receipt = (!live && !retirement_gone).then(|| OrphanReceipt {
                 generation: artifact.generation.clone(),
                 previous_keep: artifact.keep,
                 previous_hold: artifact.hold.clone(),
                 classified_revision: original.revision + 1,
             });
-            if !live {
+            if !live && artifact.state == "retained" && artifact.owned {
+                // W9: an owned allocation whose job is gone is a failed
+                // source with the failed-payload TTL, not a review state.
+                // The durable binding stays, so an import/adoption that
+                // arrives later reclaims it (`reclaim_recovered_orphan`).
+                // No-wedge: closed scope — an owned allocation is Runner's
+                // own download whenever it was made, so pre-eligibility rows
+                // park too; a person's Keep still retains it, and a hold it
+                // already had keeps its own registered exit.
+                let hold = artifact.hold.take();
+                Self::park_orphan(&mut artifact, self.settings()?.failed_retention_days);
+                artifact.automatic_cleanup_eligible = true;
+                artifact.hold = hold;
+            } else if !live && artifact.owned {
+                // Not retained (an interrupted writer retirement): its own
+                // hold's registered exit reclassifies it.
+            } else if !live {
                 // Imports/adoptions may arrive while this payload worker is
                 // running. Retain the durable binding so a later owner can
                 // still locate a nondefault root without guessing its path.
                 artifact.keep = true;
                 artifact.hold = Some("review: allocation has no recovered job".into());
+            }
+            if legacy_rebound && artifact.state == "source_gone" {
+                // Gone, not removed: the finding rests on the rebind.
+                artifact.gone_reason = Some("legacy_root_rebind".into());
             }
             let _coordinator = self.mutation_guard()?;
             let current = self.get(&original.id)?;
@@ -452,15 +656,67 @@ impl Inventory {
         Ok(())
     }
 
+    /// A startup orphan's failed-payload retention (W9).
+    fn park_orphan(artifact: &mut Artifact, retention_days: u32) {
+        artifact.state = "parked_failed".into();
+        artifact.hold = None;
+        artifact.retention_seconds = u64::from(retention_days) * 86400;
+        artifact.deadline = Some(now().saturating_add(artifact.retention_seconds as i64));
+    }
+
+    /// W9 upgrade: an owned orphan an older build classified as a review
+    /// hold (`retained`, Keep, "allocation has no recovered job") with no
+    /// operator change since becomes a parked failure with the TTL.
+    /// Idempotent: a converted row no longer carries the hold.
+    pub(super) fn park_legacy_startup_orphans(&self, root: &Path) -> Result<usize> {
+        let retention_days = self.settings()?.failed_retention_days;
+        let _guard = self.mutation_guard()?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let rows = {
+            let mut statement = tx.prepare("SELECT a.data,o.data FROM artifacts a JOIN operations o ON o.id='startup-orphan-'||a.id||'-'||json_extract(a.data,'$.generation') WHERE a.state='retained' AND json_extract(a.data,'$.hold')='review: allocation has no recovered job' AND json_extract(a.data,'$.root')=?1 AND o.state='retained'")?;
+            let rows = statement.query_map([root.to_string_lossy().as_ref()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut parked = 0;
+        for (raw, op) in rows {
+            let mut artifact: Artifact = serde_json::from_str(&raw)?;
+            let operation: Operation = serde_json::from_str(&op)?;
+            let receipt: OrphanReceipt = serde_json::from_str(&operation.request)?;
+            if !artifact.owned || receipt.generation != artifact.generation {
+                continue;
+            }
+            // No-wedge: closed scope. Keep is what it was before the
+            // classification pinned it (a later person's change wins), and a
+            // hold it had before keeps its own registered exit.
+            if artifact.revision == receipt.classified_revision {
+                artifact.keep = receipt.previous_keep;
+            }
+            Self::park_orphan(&mut artifact, retention_days);
+            artifact.automatic_cleanup_eligible = true;
+            artifact.hold = receipt.previous_hold.clone();
+            artifact.revision += 1;
+            artifact.updated_at = now();
+            save_artifact(&tx, &artifact)?;
+            event(&tx, &artifact.id, "retention", "startup orphan parked")?;
+            parked += 1;
+        }
+        tx.commit()?;
+        Ok(parked)
+    }
+
     /// Reclaim only the automatic startup classification when a job is later
     /// imported/adopted. Never infer ownership or clear an operator's choice.
     pub fn reclaim_recovered_orphan(&self, job: u32) -> Result<Option<Artifact>> {
         let Some(original) = self.for_job(job)? else {
             return Ok(None);
         };
-        if original.state != "retained"
-            || original.hold.as_deref() != Some("review: allocation has no recovered job")
-        {
+        let reviewed = original.state == "retained"
+            && original.hold.as_deref() == Some("review: allocation has no recovered job");
+        let parked = original.state == "parked_failed" && original.hold.is_none();
+        if !reviewed && !parked {
             return Ok(Some(original));
         }
         let key = format!("startup-orphan-{}-{}", original.id, original.generation);
@@ -485,6 +741,8 @@ impl Inventory {
         let mut artifact = self.get(&original.id)?;
         artifact.state = "active".into();
         artifact.hold = receipt.previous_hold;
+        artifact.retention_seconds = 0;
+        artifact.deadline = None;
         // Retention controls made after classification remain authoritative.
         if artifact.revision == receipt.classified_revision {
             artifact.keep = receipt.previous_keep;
@@ -511,6 +769,54 @@ mod snapshot_tests {
         std::fs::create_dir(&root).unwrap();
         let inventory = Inventory::open(&temporary.path().join("state")).unwrap();
         (temporary, inventory, root)
+    }
+
+    /// W9: an owned allocation with no recovered job is a parked failure
+    /// with the failed-payload TTL, not a review hold; a later import
+    /// reclaims it. An older build's review classification converts once.
+    #[test]
+    fn startup_orphan_is_parked_with_a_ttl_and_legacy_review_converts() {
+        let (_temporary, inventory, root) = inventory();
+        let path = root.join("orphan");
+        inventory
+            .allocate_for_delivery(91, &root, &path, true, true)
+            .unwrap();
+        std::fs::write(path.join("media.mkv"), b"bytes").unwrap();
+        inventory.finish(91, &path, &root, "active").unwrap();
+        let snapshot = inventory.capture_startup_reconciliation().unwrap();
+        inventory
+            .reconcile_startup_root_snapshot(&root, &[], &snapshot)
+            .unwrap();
+        let parked = inventory.for_job(91).unwrap().unwrap();
+        assert_eq!(parked.state, "parked_failed");
+        assert!(!parked.keep && parked.hold.is_none());
+        assert!(parked.deadline.is_some_and(|deadline| deadline > now()));
+        assert!(parked.earliest_expiry().is_some(), "expires on its own");
+        let reclaimed = inventory.reclaim_recovered_orphan(91).unwrap().unwrap();
+        assert_eq!(reclaimed.state, "active");
+        assert!(reclaimed.deadline.is_none());
+
+        // Legacy shape: what 0.8 wrote for the same orphan.
+        let key = format!("startup-orphan-{}-{}", parked.id, parked.generation);
+        let mut legacy = inventory.get(&parked.id).unwrap();
+        legacy.state = "retained".into();
+        legacy.keep = true;
+        legacy.hold = Some("review: allocation has no recovered job".into());
+        let mut operation = inventory.operation(&key).unwrap();
+        operation.state = "retained".into();
+        let mut receipt: OrphanReceipt = serde_json::from_str(&operation.request).unwrap();
+        receipt.classified_revision = legacy.revision;
+        operation.request = serde_json::to_string(&receipt).unwrap();
+        {
+            let db = inventory.db.lock().unwrap();
+            save_artifact(&db, &legacy).unwrap();
+            save_operation(&db, &operation).unwrap();
+        }
+        assert_eq!(inventory.park_legacy_startup_orphans(&root).unwrap(), 1);
+        assert_eq!(inventory.park_legacy_startup_orphans(&root).unwrap(), 0);
+        let converted = inventory.get(&parked.id).unwrap();
+        assert_eq!(converted.state, "parked_failed");
+        assert!(!converted.keep && converted.hold.is_none());
     }
 
     #[test]

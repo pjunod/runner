@@ -232,3 +232,42 @@ pub struct NodeRecord {
 fn default_weight() -> u32 {
     1
 }
+
+/// Metadata-only expiry notice. It grants no source ownership or deletion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoldExpiryRequest {
+    pub node: String,
+    pub job: nzbd_types::JobId,
+    pub context: nzbd_state::artifacts::WorkerControlContext,
+    pub token: LeaseToken,
+    pub control: nzbd_types::JobControl,
+    pub source: nzbd_state::artifacts::SourceGeneration,
+    pub fetched: nzbd_types::Fetched,
+    pub stop_request: nzbd_state::artifacts::WorkerStopRequest,
+    #[serde(default)]
+    pub stopped: Option<nzbd_state::artifacts::WorkerStoppedReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_disposition: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writer_paths: Vec<String>,
+}
+impl HoldExpiryRequest {
+    pub fn receipt_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "worker-hold-expired:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&(
+                    &self.node,
+                    self.job,
+                    &self.context,
+                    &self.control,
+                    &self.source,
+                    &self.fetched,
+                    &self.stop_request
+                ))
+                .expect("expiry metadata serializes")
+            )
+        )
+    }
+}

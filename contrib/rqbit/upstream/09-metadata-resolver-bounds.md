@@ -14,10 +14,10 @@ No API change. For ordinary magnets (a few hundred peers at most) the behaviour 
 
 ## Tests
 ```
-# upstream main f4ca7d91 + this commit; Linux x86_64, Rust 1.97.1
+# upstream main f23bacdd + this commit; Linux x86_64, Rust 1.97.1
 cargo fmt --all -- --check     # ok
-cargo clippy --all-targets     # no warnings (also clean with Rust 1.94)
-cargo test                     # 170 passed, 0 failed (main alone: 168 passed, 0 failed)
+cargo clippy --all-targets     # no warnings
+cargo test                     # 173 passed, 0 failed (main alone: 171 passed, 0 failed)
 ```
 The new tests (`initial_and_streamed_candidates_are_connected_to` in `librqbit`, `production_metadata_queues_close_at_exact_boundaries` in `librqbit`) are part of that run and pass.
 

@@ -4,7 +4,7 @@
 refreshed native measurements pass; independent review complete ·
 **Date:** 2026-08-07 · **Disposition and amendment recorded:** 2026-08-14 ·
 **Accepted:** 2026-08-14 · **Status reconciled:** 2026-08-22 ·
-**Engine:** rqbit v8.1.1 archive plus the ordered twelve-patch maintained series ·
+**Engine:** rqbit v8.1.1 archive plus the canonical fifteen-patch maintained series ·
 **Decision owner:** ADR-19 in
 [BITTORRENT_PROPOSAL.md](BITTORRENT_PROPOSAL.md)
 
@@ -50,6 +50,17 @@ renewal rule the twelve-patch derivation, vendor drift check, focused upstream
 suites (including the new tracker lifecycle, backoff, UDP and identity
 proofs), release-mode DHT dispatch proof, and upstream workspace check passed
 locally on 2026-09-22; PR CI is the publication record.
+
+The 2026-11-13 security renewal is recorded in
+[ADR-19 §4.3.4](BITTORRENT_PROPOSAL.md#434-security-maintenance-renewal--2026-11-13).
+The immutable archive and resource/admission boundaries remain unchanged.
+Patch 0024 removes unmaintained generic retry/clock and optional hash
+libraries while preserving retry timing, BitTorrent SHA-1 outputs and the
+production AWS-LC selection. Native timing/hash/wire proofs are added to M0;
+its resource, storage, discovery and fuzz gates remain required. Bincode's
+unmaintained notices and unused provenance snapshots stay explicit. Current
+source derivation, scoped graph audits and protected checks renew the evidence;
+historical measurements above remain historical, rather than being relabeled.
 
 No production BitTorrent path is enabled by this review or by its recorded
 disposition. Gate 8 uses the maintained selective-restore option. Gate 7
@@ -171,46 +182,23 @@ The normal closure is permissively licensed except for exact
 `deny.toml` accepts only that package/version under MPL-2.0; another MPL package
 or version fails the blocking policy job.
 
-## 2. Advisory scope — an exception is a capability restriction
+## 2. Advisory scope — fixed parser, no RustSec exceptions
 
-| Advisory | Locked crate | Affected surface | Enforced disposition |
-|---|---|---|---|
-| [RUSTSEC-2026-0194](https://rustsec.org/advisories/RUSTSEC-2026-0194.html) | `quick-xml 0.37.5` | Attribute iteration can consume quadratic CPU on hostile XML | The only normal path is `librqbit-upnp 1.0.0`; the adapter has no UPnP input and always passes `enable_upnp_port_forwarding: false`. |
-| [RUSTSEC-2026-0195](https://rustsec.org/advisories/RUSTSEC-2026-0195.html) | `quick-xml 0.37.5` | `NsReader` can allocate unbounded namespace state on hostile XML | Same compiled-but-disabled UPnP path. UPnP remains unavailable until the affected dependency is removed or patched. |
-| [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html) | `time 0.3.41` (historical) | RFC 2822 parsing can exhaust the stack | Resolved on 2026-09-19: the clustering compiler upgrade moved the locked graph to fixed `time 0.3.51`, so the exception was removed. |
-
-The distinction matters: `quick-xml` is still compiled, so the exception is
-not proof the crate is safe. It is acceptable only while nzbd cannot construct
-the affected UPnP runtime path. The historical `time` exception is no longer
-part of the repository policy.
+As of 2026-11-13, maintained patch
+[`0023-upgrade-upnp-xml-parser.patch`](../contrib/rqbit/0023-upgrade-upnp-xml-parser.patch)
+requires fixed `quick-xml 0.41` in the UPnP helper. The former exceptions for
+RUSTSEC-2026-0194 and RUSTSEC-2026-0195 are removed from
+[`deny.toml`](../deny.toml) and the audit invocation. The older
+RUSTSEC-2026-0009 `time` exception was removed on 2026-09-19.
 
 [`scripts/check-reviewed-dependency-exceptions.sh`](../scripts/check-reviewed-dependency-exceptions.sh)
-turns those statements into a repository-wide blocking graph check. It fails
-if:
+rejects older affected XML releases, any RustSec ignore, and drift in the
+exact MPL-2.0 `option-ext 0.2.0` dependency path. Workspace versions are
+normalized so release bumps do not masquerade as dependency changes.
 
-- the `quick-xml 0.37.5` package set differs from the reviewed active daemon
-  chain (`nzbd`, its API/compat/cluster routing crates, `nzbd-torrent`,
-  `librqbit`, and `librqbit-upnp`); the broader workspace reach reflects
-  activation, while the affected UPnP runtime path remains unconstructable;
-- the exact MPL-2.0 `option-ext 0.2.0` path changes; or
-- `deny.toml` ignores any RustSec identifier other than the two `quick-xml`
-  advisories above.
-
-Workspace package versions are normalized before comparison, so an nzbd
-release bump does not masquerade as third-party graph drift. If a pinned
-package disappears, the check fails closed with the exception or license
-entry that must be reconsidered instead of exposing Cargo's unmatched-package
-error as the only diagnosis.
-
-The check lives in the repository-wide Supply chain workflow because the
-complete RustSec ignore set is repository-wide. That
-workflow runs on every pull request and push plus a daily schedule. The daily
-run refreshes RustSec data; the locked graph assertions rerun alongside it but
-can change only when tracked dependency inputs change.
-
-The adapter unit test separately requires the constructed rqbit options to
-keep UPnP false. Graph evidence and runtime-option evidence are intentionally
-separate: either can regress without the other.
+UPnP remains disabled. Fixing the compiled dependency does not authorize
+router changes or change the accepted production capability boundary. The
+recorded August dispositions below remain historical review evidence.
 
 ## 3. Reproduction — inspect the same evidence CI enforces
 

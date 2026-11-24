@@ -12,11 +12,30 @@ nzbd touches exactly three kinds of places, all set in `nzbd.toml`:
 |---|---|---|
 | Working root | `paths.main_dir` | in-progress downloads, the crash-safe queue journal (`<main_dir>/queue`), history DB |
 | Completed | `paths.dest_dir` | finished, post-processed jobs (per-category subdirs/overrides) |
+| State (optional) | `paths.queue_dir` | queue snapshots, journals, `artifacts.sqlite`, history index, parked NZBs (default `<main_dir>/queue`) |
+| Workspaces (optional) | `paths.workspace_dir` | PAR repair / extraction scratch (default `<state dir>/transform-workspaces`) |
 | Config | — | `nzbd.toml` itself (+ optional extension scripts dir, watch dir) |
 
 In containers the convention is one volume, `/data`, holding both:
 `main_dir = "/data"`, `dest_dir = "/data/complete"`, with the config
 directory mounted read-write at `/etc/nzbd`.
+
+**Small local state disk, payload on a shared volume** (e.g. a 4 GiB
+local LV for state, GlusterFS for payload): keep state local and put every
+payload directory on the processing volume, so transforms and publication
+are same-volume renames, never copies:
+
+```toml
+[paths]
+queue_dir     = "/srv/nzbd/state"          # local: queue, journals, artifacts.sqlite, history
+main_dir      = "/processing"
+workspace_dir = "/processing/.workspaces"
+dest_dir      = "/processing/completed"
+```
+
+Moving existing workspaces off the state disk: stop nzbd, move
+`<state dir>/transform-workspaces` to the new `workspace_dir`, set it, start
+— startup rewrites the recorded paths once (see CONFIGURATION.md).
 
 **The path-alignment rule (the one people trip on):** Sonarr/Radarr must
 see finished downloads at the *same path* nzbd reports. Mount the same
@@ -309,6 +328,16 @@ storage root is usable. `nzbd health --ready` instead exits successfully
 when the configured secure public control listener responds. Check the
 application status for queue loading, blocked storage, and recovery
 progress.
+
+A restart does not verify the queue. Jobs whose ranges carry writer proofs,
+paused jobs and legacy jobs are released without opening a file; only jobs
+with unproven ranges, identity conflicts or open lifecycle intents are
+checked, and lifecycle reconciliation of each payload root runs in the
+background. `/api/v1/status` reports the restart's phases under `startup`
+(milliseconds since process start): `listener_ms`, `owner_ready_ms`,
+`classified_ms`, `first_lease_ms`, `startup_tickets` / `startup_untouched`,
+and per-root `roots[].duration_ms`. Post-deploy check: `first_lease_ms`
+within a few seconds of `listener_ms`, and `startup_tickets` near zero.
 
 Discovery depends on `service_started`, so its advertiser can start while
 nzbd is recovering. This service advertises an endpoint; it does not promise

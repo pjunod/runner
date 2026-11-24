@@ -481,13 +481,13 @@ pub fn reconcile_fact_with_roots(
             }
             torrent.ready_at_unix.get_or_insert(now_unix);
             torrent.content_path = Some(content_path);
-            torrent.phase = if job.status == JobStatus::Paused {
+            torrent.phase = if job.status.is_stopped() {
                 TorrentPhase::PausedSeed
             } else {
                 TorrentPhase::Seeding
             };
             torrent.last_error = None;
-            if job.status != JobStatus::Paused {
+            if !job.status.is_stopped() {
                 job.status = JobStatus::Downloading;
             }
             ReconcileOutcome {
@@ -510,7 +510,8 @@ pub fn reconcile_fact_with_roots(
                     if storage_hold {
                         torrent.stop_reason = Some(nzbd_types::TorrentStopReason::StorageFull);
                     }
-                    job.status = JobStatus::Paused;
+                    // A held torrent stays held; a running one stops.
+                    job.stop();
                 }
                 StopReason::SchedulerYield => {
                     torrent.phase = TorrentPhase::Queued;
@@ -519,10 +520,10 @@ pub fn reconcile_fact_with_roots(
                 }
                 StopReason::MissingContent => {
                     torrent.phase = TorrentPhase::MissingFiles;
-                    job.status = JobStatus::Paused;
+                    job.stop();
                 }
                 StopReason::Transient => {
-                    if job.status != JobStatus::Paused {
+                    if !job.status.is_stopped() {
                         if torrent.ready_at_unix.is_some() {
                             torrent.phase = TorrentPhase::Seeding;
                             job.status = JobStatus::Downloading;
@@ -540,7 +541,7 @@ pub fn reconcile_fact_with_roots(
                         .stop_reason
                         .or_else(|| seed_policy_stop_reason(torrent));
                     torrent.phase = TorrentPhase::PausedSeed;
-                    job.status = JobStatus::Paused;
+                    job.stop();
                 }
                 StopReason::Removed | StopReason::Shutdown => {}
             }
@@ -552,7 +553,7 @@ pub fn reconcile_fact_with_roots(
         BackendFact::Resumed { .. } => {
             let torrent = job.torrent.as_mut().unwrap();
             torrent.last_error = None;
-            if job.status != JobStatus::Paused {
+            if !job.status.is_stopped() {
                 torrent.stop_reason = None;
                 // A newly started backend needs a fresh discovery window;
                 // the previous run's idle clock cannot immediately yield it.

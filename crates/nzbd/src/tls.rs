@@ -57,14 +57,7 @@ pub fn install_process_crypto_provider() -> anyhow_lite::Result<()> {
 
 /// Build the server TLS config, generating a persistent self-signed cert
 /// when none is configured. Returns None when `[api] tls` is off.
-#[cfg(test)]
-pub fn server_config(
-    cfg: &nzbd_config::Config,
-    state_dir: &Path,
-) -> anyhow_lite::Result<Option<TlsSetup>> {
-    server_config_checked(cfg, state_dir, || Ok(()))
-}
-
+///
 /// Existing security material is read without requiring backend ownership.
 /// The caller's nonmutating installation preflight runs only immediately
 /// before proven first initialization could create material on the data root.
@@ -305,7 +298,9 @@ mod tests {
     fn tls_off_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = base_cfg(tmp.path());
-        assert!(server_config(&cfg, tmp.path()).unwrap().is_none());
+        assert!(server_config_checked(&cfg, tmp.path(), || Ok(()))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -315,7 +310,9 @@ mod tests {
         cfg.api.tls = true;
         cfg.api.tls_sans = vec!["nas.lan".into()];
 
-        let first = server_config(&cfg, tmp.path()).unwrap().unwrap();
+        let first = server_config_checked(&cfg, tmp.path(), || Ok(()))
+            .unwrap()
+            .unwrap();
         assert!(first.note.contains("self-signed"));
         assert!(first.note.contains("sha256"));
         let cert_pem = std::fs::read_to_string(tmp.path().join("tls/cert.pem")).unwrap();
@@ -334,7 +331,9 @@ mod tests {
         }
 
         // Second boot: same cert (fingerprint in the note is identical).
-        let second = server_config(&cfg, tmp.path()).unwrap().unwrap();
+        let second = server_config_checked(&cfg, tmp.path(), || Ok(()))
+            .unwrap()
+            .unwrap();
         let fp = |note: &str| note.split("sha256 ").nth(1).map(str::to_string);
         assert_eq!(fp(&first.note), fp(&second.note), "cert must persist");
     }
@@ -345,7 +344,7 @@ mod tests {
         let mut cfg = base_cfg(tmp.path());
         cfg.api.tls = true;
         cfg.api.tls_cert = Some(std::path::PathBuf::from("/x/cert.pem"));
-        let err = match server_config(&cfg, tmp.path()) {
+        let err = match server_config_checked(&cfg, tmp.path(), || Ok(())) {
             Err(e) => e,
             Ok(_) => panic!("half-configured pair must error"),
         };
@@ -359,19 +358,23 @@ mod tests {
         // Generate a valid pair by running self-signed once...
         let mut gen = base_cfg(tmp.path());
         gen.api.tls = true;
-        server_config(&gen, tmp.path()).unwrap().unwrap();
+        server_config_checked(&gen, tmp.path(), || Ok(()))
+            .unwrap()
+            .unwrap();
 
         // ...then load it back through the bring-your-own path.
         let mut cfg = base_cfg(tmp.path());
         cfg.api.tls = true;
         cfg.api.tls_cert = Some(tmp.path().join("tls/cert.pem"));
         cfg.api.tls_key = Some(tmp.path().join("tls/key.pem"));
-        let setup = server_config(&cfg, tmp.path()).unwrap().unwrap();
+        let setup = server_config_checked(&cfg, tmp.path(), || Ok(()))
+            .unwrap()
+            .unwrap();
         assert!(!setup.note.contains("self-signed"));
 
         // Garbage cert file: a clear parse/empty error, not a panic.
         std::fs::write(tmp.path().join("tls/cert.pem"), "not a pem").unwrap();
-        let err = match server_config(&cfg, tmp.path()) {
+        let err = match server_config_checked(&cfg, tmp.path(), || Ok(())) {
             Err(e) => e,
             Ok(_) => panic!("garbage cert must error"),
         };
@@ -384,7 +387,7 @@ mod tests {
         )
         .unwrap();
         std::fs::remove_file(tmp.path().join("tls/key.pem")).unwrap();
-        assert!(server_config(&cfg, tmp.path()).is_err());
+        assert!(server_config_checked(&cfg, tmp.path(), || Ok(())).is_err());
     }
 
     #[test]
@@ -392,11 +395,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = base_cfg(tmp.path());
         cfg.api.tls = true;
-        server_config(&cfg, tmp.path()).unwrap();
+        server_config_checked(&cfg, tmp.path(), || Ok(())).unwrap();
         let key_path = tmp.path().join("tls/key.pem");
         let key = std::fs::read(&key_path).unwrap();
         std::fs::remove_file(tmp.path().join("tls/cert.pem")).unwrap();
-        assert!(server_config(&cfg, tmp.path()).is_err());
+        assert!(server_config_checked(&cfg, tmp.path(), || Ok(())).is_err());
         assert_eq!(std::fs::read(key_path).unwrap(), key);
         assert!(!tmp.path().join("tls/cert.pem").try_exists().unwrap());
     }

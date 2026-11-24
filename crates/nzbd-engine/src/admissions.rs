@@ -5,6 +5,20 @@ use nzbd_types::Job;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+/// Deliberately independent of job IDs, tokens and snapshot high-water marks.
+pub(crate) fn generation_nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut random = std::collections::hash_map::RandomState::new().build_hasher();
+    random.write_u32(std::process::id());
+    random.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    format!("{:016x}", random.finish())
+}
+
 pub(crate) fn identity(receipt: &UrlAdmissionReceipt) -> String {
     format!(
         "{:x}",
@@ -301,6 +315,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_url_history_never_accumulates_a_cluster_pending_index() {
         let temporary = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temporary.path().join("working")).unwrap();
         let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
             Vec::new(),
             temporary.path().join("state"),
@@ -340,15 +355,18 @@ mod tests {
     #[tokio::test]
     async fn public_consumer_identity_and_tombstone_highwater_survive_projection_replacement() {
         let temporary = tempfile::tempdir().unwrap();
-        let engine = crate::Engine::spawn(crate::EngineConfig::single_node(
+        std::fs::create_dir(temporary.path().join("working")).unwrap();
+        let mut config = crate::EngineConfig::single_node(
             Vec::new(),
             temporary.path().join("state"),
             temporary.path().join("working"),
             crate::Tuning::default(),
             None,
-        ))
-        .await
-        .unwrap();
+        );
+        // This fixture exercises the external authority catalog. Standalone
+        // admissions settle locally and never enter its pending index.
+        config.persist_guard = Some(std::sync::Arc::new(|| true));
+        let engine = crate::Engine::spawn(config).await.unwrap();
         let storage = engine.artifacts().installation.clone();
         assert!(engine
             .set_consumer_instance_id("stable-cluster-consumer".into())
@@ -394,6 +412,13 @@ mod tests {
             .find(|(key, _)| key == "*URL:AdmissionGeneration")
             .map(|(_, value)| value.clone());
         assert!(private_generation.is_some());
+        assert!(
+            private_generation
+                .as_ref()
+                .unwrap()
+                .starts_with(&format!("{storage}-url-")),
+            "private fetch identity belongs to storage, not the public consumer projection"
+        );
         assert!(engine.begin_url_admission_adoption().await.unwrap());
         assert!(engine
             .adopt_url_admissions(vec![receipt("retired-token", 1001)])

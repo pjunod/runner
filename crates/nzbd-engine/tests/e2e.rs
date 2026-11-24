@@ -15,6 +15,56 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
+#[tokio::test]
+async fn startup_maintenance_retires_preexisting_deleted_workspace_without_api_action() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let processing = tmp.path().join("processing");
+    std::fs::create_dir(&processing).unwrap();
+    let inventory = nzbd_state::artifacts::Inventory::open(&state).unwrap();
+    let path = processing.join("old-job");
+    let source = inventory.allocate(12, &processing, &path).unwrap();
+    std::fs::write(path.join("original"), b"recoverable original").unwrap();
+    let workspace = inventory.workspace(12, "par_repair", "abc").unwrap();
+    std::fs::write(workspace.scratch.path.join("scratch"), b"obsolete scratch").unwrap();
+    inventory.finish_workspace(&workspace).unwrap();
+    inventory
+        .finish(12, &path, &processing, "retained")
+        .unwrap();
+    let history = std::sync::Arc::new(
+        nzbd_state::history::HistoryDb::open(&state.join("history.sqlite"), None).unwrap(),
+    );
+    let entry = serde_json::from_value(serde_json::json!({
+        "job": 12, "name": "old deleted job", "status": "DELETED", "size": 20,
+        "completed_at_unix": source.created_at, "final_dir": path,
+        "params": [["Artifact:Id", source.id]]
+    }))
+    .unwrap();
+    history.record(&entry).unwrap();
+    drop(inventory);
+
+    let mut cfg = EngineConfig::single_node(vec![], state, processing, Tuning::default(), None);
+    cfg.history = Some(history);
+    let engine = Engine::spawn(cfg).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while engine.artifacts().get(&workspace.scratch.id).unwrap().state != "deleted" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("startup maintenance must reclaim the old scratch without another delete request");
+    assert!(!workspace.scratch.path.exists());
+    assert_eq!(
+        engine.artifacts().get(&workspace.scratch.id).unwrap().state,
+        "deleted"
+    );
+    assert_eq!(
+        std::fs::read(path.join("original")).unwrap(),
+        b"recoverable original"
+    );
+    engine.shutdown().await;
+}
+
 fn dormant_torrent_job() -> nzbd_types::Job {
     nzbd_types::Job {
         id: JobId(77),
@@ -155,7 +205,49 @@ fn test_tuning() -> Tuning {
     }
 }
 
+// Imports acknowledge durable queue replacement before runtime payload
+// verification finishes. Fixtures wait for that real public fence to clear.
+trait FixtureEngine {
+    async fn export_ready(&self, job: JobId) -> Result<Option<Job>, nzbd_engine::EngineError>;
+    async fn import_ready(
+        &self,
+        job: Job,
+        fold: bool,
+        emit: bool,
+    ) -> Result<(), nzbd_engine::EngineError>;
+}
+impl FixtureEngine for EngineHandle {
+    async fn export_ready(&self, job: JobId) -> Result<Option<Job>, nzbd_engine::EngineError> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match self.export_job(job).await {
+                    Err(nzbd_engine::EngineError::Lifecycle(reason)) if reason ==
+                        "job verification or writer retirement is still in progress; retry later" => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    result => return result,
+                }
+            }
+        }).await.expect("fixture payload verification must finish")
+    }
+    async fn import_ready(
+        &self,
+        job: Job,
+        fold: bool,
+        emit: bool,
+    ) -> Result<(), nzbd_engine::EngineError> {
+        let id = job.id;
+        self.import_job(job, fold, emit).await?;
+        assert!(
+            self.export_ready(id).await?.is_some(),
+            "imported fixture job must remain present"
+        );
+        Ok(())
+    }
+}
+
 async fn spawn_engine(dir: &Path, servers: Vec<ServerDef>) -> EngineHandle {
+    std::fs::create_dir_all(dir.join("dest")).unwrap();
     Engine::spawn(EngineConfig::single_node(
         servers,
         dir.join("state"),
@@ -289,6 +381,13 @@ async fn cluster_authority_adoption_refuses_unreadable_snapshots_without_rewrite
     }
 }
 
+async fn next_fixture_event(events: &mut broadcast::Receiver<Event>) -> Event {
+    tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("fixture event must arrive after its acknowledged command")
+        .expect("fixture event stream must remain open")
+}
+
 async fn wait_finished(
     rx: &mut broadcast::Receiver<Event>,
     job: JobId,
@@ -337,7 +436,7 @@ async fn wait_finished_with_snapshot(
     match result {
         Ok(finished) => finished,
         Err(error) => {
-            let job = engine.export_job(job).await.unwrap_or(None);
+            let job = engine.export_ready(job).await.unwrap_or(None);
             panic!("timed out waiting for JobFinished: {error}; current job: {job:#?}");
         }
     }
@@ -388,13 +487,13 @@ async fn queue_controls_apply_atomically_and_report_missing_targets() {
     assert!(!engine.set_priority(JobId(999_001), 1).await.unwrap());
     assert_eq!(engine.snapshot().jobs[0].priority, 37);
 
-    let exported = engine.export_job(first).await.unwrap().unwrap();
+    let exported = engine.export_ready(first).await.unwrap().unwrap();
     let first_file = exported.files[0].id;
     assert!(engine
         .set_file_paused(first, first_file, true)
         .await
         .unwrap());
-    assert!(engine.export_job(first).await.unwrap().unwrap().files[0].paused);
+    assert!(engine.export_ready(first).await.unwrap().unwrap().files[0].paused);
     assert!(engine
         .set_file_paused(first, first_file, false)
         .await
@@ -410,7 +509,13 @@ async fn queue_controls_apply_atomically_and_report_missing_targets() {
     assert!(engine.delete_file(first, first_file).await.unwrap());
     assert!(!engine.delete_file(first, first_file).await.unwrap());
     assert_eq!(
-        engine.export_job(first).await.unwrap().unwrap().files.len(),
+        engine
+            .export_ready(first)
+            .await
+            .unwrap()
+            .unwrap()
+            .files
+            .len(),
         1
     );
 
@@ -435,7 +540,7 @@ async fn queue_controls_apply_atomically_and_report_missing_targets() {
     let mut events = engine.subscribe();
     engine.pause_all("coverage-client").await.unwrap();
     assert!(matches!(
-        events.recv().await.unwrap(),
+        next_fixture_event(&mut events).await,
         Event::QueuePauseChanged {
             paused: true,
             ref source
@@ -443,12 +548,43 @@ async fn queue_controls_apply_atomically_and_report_missing_targets() {
     ));
     engine.resume_all("coverage-client").await.unwrap();
     assert!(matches!(
-        events.recv().await.unwrap(),
+        next_fixture_event(&mut events).await,
         Event::QueuePauseChanged {
             paused: false,
             ref source
         } if source == "coverage-client"
     ));
+
+    // The post-processing lane pauses on its own and never touches the
+    // download lane, in either direction.
+    engine.pause_post("coverage-client").await.unwrap();
+    assert!(matches!(
+        next_fixture_event(&mut events).await,
+        Event::PostPauseChanged {
+            paused: true,
+            ref source
+        } if source == "coverage-client"
+    ));
+    assert!(engine.snapshot().post_paused);
+    assert!(!engine.snapshot().download_paused);
+    assert!(engine.recovery_document().await.unwrap().post_paused);
+    engine.pause_all("coverage-client").await.unwrap();
+    let _ = next_fixture_event(&mut events).await;
+    engine.resume_post("coverage-client").await.unwrap();
+    assert!(matches!(
+        next_fixture_event(&mut events).await,
+        Event::PostPauseChanged {
+            paused: false,
+            ref source
+        } if source == "coverage-client"
+    ));
+    assert!(!engine.snapshot().post_paused);
+    assert!(
+        engine.snapshot().download_paused,
+        "resuming post leaves downloads paused"
+    );
+    engine.resume_all("coverage-client").await.unwrap();
+    let _ = next_fixture_event(&mut events).await;
 
     engine.set_speed_limit(Some(12_345)).await.unwrap();
     assert_eq!(engine.snapshot().speed_limit_bps, Some(12_345));
@@ -468,7 +604,7 @@ async fn queue_controls_apply_atomically_and_report_missing_targets() {
         bytes_per_sec: Some(77),
     });
     assert!(matches!(
-        external.recv().await.unwrap(),
+        next_fixture_event(&mut external).await,
         Event::SpeedLimitChanged {
             bytes_per_sec: Some(77)
         }
@@ -507,8 +643,8 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     imported.files[0].segments[0].state = SegmentState::Leased {
         server: ServerId(1),
     };
-    engine.import_job(imported, false, false).await.unwrap();
-    let normalized = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    engine.import_ready(imported, false, false).await.unwrap();
+    let normalized = engine.export_ready(JobId(40)).await.unwrap().unwrap();
     assert_eq!(normalized.status, JobStatus::Queued);
     assert_eq!(normalized.files[0].segments[0].state, SegmentState::Pending);
 
@@ -518,7 +654,7 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
         .await
         .unwrap());
     assert!(matches!(
-        assigned.recv().await.unwrap(),
+        next_fixture_event(&mut assigned).await,
         Event::JobAssigned {
             job: JobId(40),
             node: Some(ref node)
@@ -542,7 +678,7 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     );
     // A round trip behind the fire-and-forget update is a deterministic
     // mailbox barrier; no polling sleep is needed.
-    engine.export_job(JobId(40)).await.unwrap();
+    engine.export_ready(JobId(40)).await.unwrap();
     let summary = engine.snapshot().jobs[0].clone();
     assert_eq!(summary.assigned_node.as_deref(), Some("worker-a"));
     assert_eq!(summary.done_articles, 7);
@@ -570,8 +706,8 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
         .await
         .unwrap());
     engine.close_post_stage_now(JobId(40), 1_002, Some(1_500));
-    engine.export_job(JobId(40)).await.unwrap();
-    let staged = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    engine.export_ready(JobId(40)).await.unwrap();
+    let staged = engine.export_ready(JobId(40)).await.unwrap().unwrap();
     assert_eq!(
         staged.status,
         JobStatus::Post {
@@ -593,12 +729,12 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
         .await
         .unwrap());
 
-    let mut replacement = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    let mut replacement = engine.export_ready(JobId(40)).await.unwrap().unwrap();
     replacement.priority = 44;
     assert!(engine.import_job_if_present(replacement).await.unwrap());
     assert_eq!(
         engine
-            .export_job(JobId(40))
+            .export_ready(JobId(40))
             .await
             .unwrap()
             .unwrap()
@@ -608,14 +744,18 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     let mut absent = transfer_job(999, "absent", JobStatus::Queued);
     absent.priority = 88;
     assert!(!engine.import_job_if_present(absent).await.unwrap());
-    assert!(engine.export_job(JobId(999)).await.unwrap().is_none());
+    assert!(engine.export_ready(JobId(999)).await.unwrap().is_none());
 
-    let mut terminal = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    let mut terminal = engine.export_ready(JobId(40)).await.unwrap().unwrap();
+    // This assertion exercises the metadata-only terminal import event.
+    // Payload-bearing imports instead require asynchronous verification and
+    // must never announce completion from an unverified imported status.
+    terminal.files.clear();
     terminal.status = JobStatus::Completed;
     let mut finished = engine.subscribe();
-    engine.import_job(terminal, false, true).await.unwrap();
+    engine.import_ready(terminal, false, true).await.unwrap();
     assert!(matches!(
-        finished.recv().await.unwrap(),
+        next_fixture_event(&mut finished).await,
         Event::JobFinished {
             job: JobId(40),
             status: JobStatus::Completed,
@@ -624,7 +764,7 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     ));
 
     engine
-        .import_job(delayed_par_job(41), false, false)
+        .import_ready(delayed_par_job(41), false, false)
         .await
         .unwrap();
     let freed = engine
@@ -632,7 +772,7 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
         .await
         .unwrap();
     assert!(freed >= 2);
-    let recovery = engine.export_job(JobId(41)).await.unwrap().unwrap();
+    let recovery = engine.export_ready(JobId(41)).await.unwrap().unwrap();
     assert_eq!(recovery.status, JobStatus::Queued);
     assert!(recovery.files.iter().any(|file| !file.paused));
     assert_eq!(
@@ -644,7 +784,7 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
     );
 
     engine
-        .import_job(transfer_job(42, "discard", JobStatus::Queued), false, false)
+        .import_ready(transfer_job(42, "discard", JobStatus::Queued), false, false)
         .await
         .unwrap();
     assert!(engine
@@ -655,7 +795,7 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
         .retain_jobs(vec![JobId(40), JobId(41)])
         .await
         .unwrap();
-    assert!(engine.export_job(JobId(42)).await.unwrap().is_none());
+    assert!(engine.export_ready(JobId(42)).await.unwrap().is_none());
     assert!(engine
         .snapshot()
         .jobs
@@ -664,13 +804,13 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
 
     // RetainJobs demotes persistence. A fenced replace must report false and
     // restore the previous in-memory copy instead of applying the mutation.
-    let before = engine.export_job(JobId(40)).await.unwrap().unwrap();
+    let before = engine.export_ready(JobId(40)).await.unwrap().unwrap();
     let mut fenced = before.clone();
     fenced.priority = 99;
     assert!(!engine.import_job_if_present(fenced).await.unwrap());
     assert_eq!(
         engine
-            .export_job(JobId(40))
+            .export_ready(JobId(40))
             .await
             .unwrap()
             .unwrap()
@@ -684,8 +824,64 @@ async fn cluster_commands_normalize_delegate_retain_and_fence_jobs() {
 }
 
 #[tokio::test]
+async fn post_admission_waiter_wakes_when_failed_rollback_becomes_durable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(temporary.path(), vec![]).await;
+    let mut failed = transfer_job(79, "rollback-wakeup", JobStatus::Failed);
+    failed.files.clear();
+    failed.params.push(("*PP:failure-at".into(), "123".into()));
+    engine.import_ready(failed, false, false).await.unwrap();
+    let admission = engine
+        .begin_post_admission(JobId(79))
+        .await
+        .unwrap()
+        .unwrap();
+    let scoped = engine.for_post_admission(&admission);
+    let mut candidate = scoped.export_job(JobId(79)).await.unwrap().unwrap();
+    candidate
+        .params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "1".into()));
+    let blocked = temporary.path().join("state/queue.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    assert!(!scoped.import_job_if_present(candidate).await.unwrap());
+    engine.end_post_admission(admission).await.unwrap();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let waiting = engine.wait_post_admission(JobId(79), &cancellation);
+    tokio::pin!(waiting);
+    tokio::select! {
+        result = &mut waiting => panic!("rollback waiter completed before storage recovery: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+    }
+    std::fs::remove_dir(&blocked).unwrap();
+    let admission = tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+        .await
+        .expect("durable rollback must notify the public admission waiter")
+        .unwrap()
+        .unwrap();
+    let row = engine
+        .for_post_admission(&admission)
+        .export_job(JobId(79))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, JobStatus::Failed);
+    assert!(row
+        .params
+        .iter()
+        .any(|(key, value)| key == "*PP:failure-at" && value == "123"));
+    assert!(!row
+        .params
+        .iter()
+        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM));
+    engine.end_post_admission(admission).await.unwrap();
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn worker_terminal_replace_is_ephemeral_and_never_resurrects_missing_jobs() {
     let tmp = tempfile::tempdir().unwrap();
+    let downloads = tmp.path().join("dest");
+    std::fs::create_dir(&downloads).unwrap();
     let mut config = EngineConfig::single_node(
         vec![],
         tmp.path().join("state"),
@@ -696,7 +892,29 @@ async fn worker_terminal_replace_is_ephemeral_and_never_resurrects_missing_jobs(
     config.persist_queue = false;
     let engine = Engine::spawn(config).await.unwrap();
     let mut job = transfer_job(77, "worker", JobStatus::Completed);
-    engine.import_job(job.clone(), false, false).await.unwrap();
+    // Terminal worker stamps require the same owned source and bound lease
+    // that a real worker receives, even when its queue stays ephemeral.
+    job.files.clear();
+    let context = nzbd_state::artifacts::WorkerControlContext {
+        lease_id: "worker-test-lease".into(),
+        job_incarnation: "worker-test-incarnation".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 1,
+    };
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&context).unwrap(),
+    ));
+    let inventory = engine.artifacts();
+    inventory
+        .allocate(job.id.0, &downloads, &downloads.join("worker"))
+        .unwrap();
+    inventory.bind_worker_context(job.id.0, &context).unwrap();
+    engine
+        .import_ready(job.clone(), false, false)
+        .await
+        .unwrap();
     job.params
         .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()));
     assert!(engine
@@ -711,7 +929,7 @@ async fn worker_terminal_replace_is_ephemeral_and_never_resurrects_missing_jobs(
     assert!(!engine.import_job_if_present(strict).await.unwrap());
     assert_eq!(
         engine
-            .export_job(JobId(77))
+            .export_ready(JobId(77))
             .await
             .unwrap()
             .unwrap()
@@ -720,7 +938,7 @@ async fn worker_terminal_replace_is_ephemeral_and_never_resurrects_missing_jobs(
     );
     assert!(engine.remove_job_silent(JobId(77)).await.unwrap());
     assert!(!engine.import_worker_job_if_present(job).await.unwrap());
-    assert!(engine.export_job(JobId(77)).await.unwrap().is_none());
+    assert!(engine.export_ready(JobId(77)).await.unwrap().is_none());
     engine.shutdown().await;
 }
 
@@ -729,7 +947,7 @@ async fn successful_authority_adoption_merges_durable_and_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let authority = spawn_engine(tmp.path(), Vec::new()).await;
     authority
-        .import_job(transfer_job(70, "durable", JobStatus::Queued), false, false)
+        .import_ready(transfer_job(70, "durable", JobStatus::Queued), false, false)
         .await
         .unwrap();
     authority.pause_all("authority").await.unwrap();
@@ -747,7 +965,7 @@ async fn successful_authority_adoption_merges_durable_and_local_state() {
     config.journal_suffix = "worker".into();
     let worker = Engine::spawn(config).await.unwrap();
     worker
-        .import_job(transfer_job(71, "local", JobStatus::Queued), false, false)
+        .import_ready(transfer_job(71, "local", JobStatus::Queued), false, false)
         .await
         .unwrap();
     assert_eq!(worker.snapshot().jobs.len(), 1);
@@ -763,11 +981,40 @@ async fn successful_authority_adoption_merges_durable_and_local_state() {
 }
 
 #[tokio::test]
+async fn rejected_authority_adoption_preserves_live_speed_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let store = nzbd_state::SnapshotStore::open(&state).unwrap();
+    store
+        .save(&nzbd_state::QueueSnapshotDoc {
+            speed_limit_bps: Some(4096),
+            ..Default::default()
+        })
+        .unwrap();
+    let before = std::fs::read(state.join("queue.json")).unwrap();
+    let mut config = EngineConfig::single_node(
+        vec![],
+        state.clone(),
+        tmp.path().join("dest"),
+        test_tuning(),
+        None,
+    );
+    config.persist_queue = false;
+    config.persist_guard = Some(std::sync::Arc::new(|| false));
+    let engine = Engine::spawn(config).await.unwrap();
+    engine.set_speed_limit(Some(777)).await.unwrap();
+    assert!(engine.adopt_authority().await.is_err());
+    assert_eq!(engine.snapshot().speed_limit_bps, Some(777));
+    assert_eq!(std::fs::read(state.join("queue.json")).unwrap(), before);
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn folding_a_foreign_journal_recovers_progress_and_surfaces_missing_disk_data() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(tmp.path(), Vec::new()).await;
     engine
-        .import_job(transfer_job(80, "folded", JobStatus::Queued), false, false)
+        .import_ready(transfer_job(80, "folded", JobStatus::Queued), false, false)
         .await
         .unwrap();
 
@@ -788,12 +1035,15 @@ async fn folding_a_foreign_journal_recovers_progress_and_surfaces_missing_disk_d
 
     let mut events = engine.subscribe();
     engine.fold_job_journals(JobId(80)).await.unwrap();
-    engine.export_job(JobId(80)).await.unwrap();
-    let job = engine.export_job(JobId(80)).await.unwrap().unwrap();
+    engine.export_ready(JobId(80)).await.unwrap();
+    let job = engine.export_ready(JobId(80)).await.unwrap().unwrap();
     assert_eq!(job.files[0].segments[0].state, SegmentState::Pending);
     assert!(!job.files[0].finalized);
-    assert_eq!(job.status, JobStatus::Paused);
-    assert!(job.held());
+    assert_eq!(job.status, JobStatus::Queued);
+    assert!(
+        !job.held(),
+        "definitively missing bytes can be downloaded again"
+    );
     while let Ok(event) = events.try_recv() {
         assert!(!matches!(
             event,
@@ -863,7 +1113,7 @@ async fn duplicate_inflight_url_add_updates_params_without_a_second_job() {
         .unwrap();
     assert_eq!(duplicate, first);
     assert_eq!(engine.snapshot().jobs.len(), 1);
-    let fetching = engine.export_job(first).await.unwrap().unwrap();
+    let fetching = engine.export_ready(first).await.unwrap().unwrap();
     assert_eq!(fetching.status, JobStatus::Fetching);
     assert!(fetching
         .params
@@ -968,7 +1218,7 @@ async fn multipart_articles_with_different_yenc_names_download_bit_identically()
         .unwrap();
     let (status, health) = wait_finished(&mut rx, job, 10).await;
     assert_eq!((status, health), (JobStatus::Completed, 1000));
-    let record = engine.export_job(job).await.unwrap().unwrap();
+    let record = engine.export_ready(job).await.unwrap().unwrap();
     assert!(!record.held());
     assert!(record.files[0].filename.starts_with("obfuscated-part-"));
     assert_eq!(
@@ -1164,31 +1414,16 @@ async fn missing_articles_finish_download_but_keep_partial_private() {
         .add_nzb("damaged", post.nzb.as_bytes(), None, 0)
         .await
         .unwrap();
-    for _ in 0..1200 {
-        if engine
-            .snapshot()
-            .jobs
-            .iter()
-            .any(|j| j.id == job && j.status == JobStatus::Completed)
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Completion publishes the durable snapshot before emitting this event.
+    // Waiting for the matching event avoids observing the publish/emit window.
+    let (status, _) = wait_finished(&mut rx, job, 12).await;
+    assert_eq!(status, JobStatus::Completed);
     let snap = engine.snapshot();
     let held = snap.jobs.iter().find(|j| j.id == job).unwrap();
     assert_eq!(held.status, JobStatus::Completed);
     assert!(held.control.is_none());
     assert!(!held.ready && !held.pp_done);
-    let mut finished = false;
-    while let Ok(event) = rx.try_recv() {
-        finished |= matches!(event, Event::JobFinished {job: id, ..} if id == job);
-    }
-    assert!(
-        finished,
-        "ordinary missing articles must reach a terminal download verdict"
-    );
-    let exported = engine.export_job(job).await.unwrap().unwrap();
+    let exported = engine.export_ready(job).await.unwrap().unwrap();
     let file = &exported.files[0];
     let got = std::fs::read(
         tmp.path()
@@ -1211,7 +1446,7 @@ async fn critical_health_abort_stops_wasting_bandwidth() {
 
     // Parts 1..=4 gone everywhere (40% of bytes): health 600 < critical
     // 850 (no par2 in the set). Parts 5..=10 are served only after a long
-    // delay — without the abort, the job would sit through ~3s+ of
+    // delay — without the abort, the job would sit through 30s+ of
     // downloads it can never repair.
     let mut b = NservBuilder::new().with_post(&post);
     for part in 1..=4 {
@@ -1220,7 +1455,7 @@ async fn critical_health_abort_stops_wasting_bandwidth() {
     for part in 5..=10 {
         b = b.behavior(
             &post.message_id("doomed.bin", part),
-            Behavior::Delay(Duration::from_secs(3)),
+            Behavior::Delay(Duration::from_secs(30)),
         );
     }
     let ns = b.start().await.unwrap();
@@ -1246,12 +1481,7 @@ async fn critical_health_abort_stops_wasting_bandwidth() {
         .unwrap();
     let (status, health) = wait_finished(&mut rx, job, 30).await;
     assert_eq!(status, JobStatus::Failed, "unrepairable -> failed");
-    // Pending delayed parts were failed by the abort, not downloaded:
-    // health lands below the no-abort value of 600.
-    assert!(
-        health < 600,
-        "abort must fail pending segments, got {health}"
-    );
+    assert!(health < 850, "below threshold, got {health}");
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "job should abort quickly, took {:?}",
@@ -1471,13 +1701,38 @@ async fn url_jobs_fetch_then_download() {
         .iter()
         .any(|j| j.id == id && matches!(j.status, JobStatus::Fetching)));
 
-    // Retry-After: 0 cannot undercut the production 30-second first backoff.
-    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 90).await;
-    assert_eq!(status, JobStatus::Completed);
-    assert_eq!(
-        std::fs::read(tmp.path().join("dest/urljob/u.bin")).unwrap(),
-        data
+    // The 429 parks the job on the production one-minute first step; the
+    // operator's "retry now" ends that wait well inside it.
+    let parked = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let waiting = engine.snapshot().jobs.iter().any(|j| {
+            j.id == id
+                && j.url_fetch
+                    .as_ref()
+                    .is_some_and(|retry| retry.next_retry_at_unix.is_some())
+        });
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < parked,
+            "429 never parked the fetch"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let kicked = tokio::time::Instant::now();
+    assert!(
+        engine.retry_url_fetch_now(id),
+        "a fetching job accepts retry now"
     );
+    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 45).await;
+    assert!(
+        kicked.elapsed() < Duration::from_secs(45),
+        "retry now must not wait out the one-minute step"
+    );
+    assert_eq!(status, JobStatus::Completed);
+    let payload = engine.artifacts().for_job(id.0).unwrap().unwrap().path;
+    assert_eq!(std::fs::read(payload.join("u.bin")).unwrap(), data);
 
     // Dead URL: job fails (history classification is FAILURE/FETCH,
     // asserted at the PP layer).
@@ -1501,6 +1756,26 @@ async fn url_jobs_fetch_then_download() {
     let (status, _) = wait_finished(&mut rx, dead, 30).await;
     assert_eq!(status, JobStatus::Failed);
     dead_response.join().unwrap();
+    // Contract §2.2 / plan M1 (l): the fetcher types its own terminal. A
+    // 404 is the indexer answering for this item: `fetch{gone}`, blamed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let terminal = loop {
+        if let Some(terminal) = engine
+            .artifacts()
+            .terminal(dead.0)
+            .unwrap()
+            .filter(|t| t.emitted)
+        {
+            break terminal;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no fetch terminal");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Fetch));
+    assert_eq!(terminal.fetch_cause, Some(nzbd_types::FetchCause::Gone));
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(terminal.stage.as_deref(), Some("fetch"));
     engine.shutdown().await;
 }
 
@@ -1625,14 +1900,8 @@ async fn url_fetch_resumes_after_restart_with_clean_name() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert_eq!(
-        std::fs::read(
-            tmp.path()
-                .join("dest/af51ab64582e226f4bc8de91b7b757d8067ba8e6/r.bin")
-        )
-        .unwrap(),
-        data
-    );
+    let payload = engine.artifacts().for_job(id.0).unwrap().unwrap().path;
+    assert_eq!(std::fs::read(payload.join("r.bin")).unwrap(), data);
     engine.shutdown().await;
 }
 
@@ -1787,6 +2056,7 @@ async fn storage_inventory_publishes_when_the_enforcing_floor_is_disabled() {
             assert!(!snapshot.disk_low);
             assert!(snapshot.storage_volumes[0].current);
             assert_eq!(snapshot.storage_volumes[0].label, "downloads");
+            assert_eq!(snapshot.storage_volumes[0].name, "completed");
             break;
         }
         assert!(
@@ -1794,6 +2064,33 @@ async fn storage_inventory_publishes_when_the_enforcing_floor_is_disabled() {
             "storage inventory was not published with the floor disabled"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The I/O sampler follows the capacity probe's filesystems. On Linux
+    // every row gets a source within a few samples; a block device or NFS
+    // mount also gets rates once two samples exist.
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let snapshot = engine.snapshot();
+            let io = snapshot.storage_volumes[0].io.clone();
+            let done = match &io {
+                Some(io) if ["block", "nfs", "runner"].contains(&io.source) => {
+                    assert!(!io.detail.is_empty());
+                    io.read_bps.is_some() && io.write_bps.is_some()
+                }
+                _ => false,
+            };
+            if done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "storage I/O was not published: {io:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     engine.shutdown().await;
 }
@@ -1976,7 +2273,7 @@ async fn an_obfuscated_job_names_itself_from_its_par2_metadata() {
 
     // …and every file is in ONE directory, the one it started in. A rename
     // that moved the storage name would have split them.
-    let exported = engine.export_job(id).await.unwrap().unwrap();
+    let exported = engine.export_ready(id).await.unwrap().unwrap();
     assert_eq!(
         exported.dir_name,
         nzbd_engine::queue::sanitize_name("monarr · cc310b99"),
@@ -2025,7 +2322,7 @@ async fn public_resume_releases_allocation_and_identity_holds() {
         .unwrap());
     assert!(engine.resume_job(job).await.unwrap());
     let control = engine
-        .export_job(job)
+        .export_ready(job)
         .await
         .unwrap()
         .unwrap()
@@ -2036,16 +2333,15 @@ async fn public_resume_releases_allocation_and_identity_holds() {
     assert!(engine
         .hold_job(
             job,
-            nzbd_types::HoldCause::IdentityConflict,
+            nzbd_types::HoldCause::PasswordRequired,
             "extract",
-            "review required",
+            "password required",
         )
         .await
         .unwrap());
-    // A review hold never retries by itself, but an operator resume is
-    // always an exit (docs/HELD_JOBS_PLAN.md §4.6).
+    // An operator resume is always an exit (docs/archive/HELD_JOBS_PLAN.md §4.6).
     assert!(engine.resume_job(job).await.unwrap());
-    assert!(!engine.export_job(job).await.unwrap().unwrap().held());
+    assert!(!engine.export_ready(job).await.unwrap().unwrap().held());
     engine.shutdown().await;
 }
 
@@ -2071,6 +2367,7 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
         )
         .unwrap();
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "7".into(),
             lifecycle: "held".into(),
@@ -2085,26 +2382,31 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
             next_retry_at_unix: None,
             blocked_since_unix: None,
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
-        engine.import_job(job, false, false).await.unwrap();
+        engine.import_ready(job, false, false).await.unwrap();
         engine.shutdown().await;
         let engine = spawn_engine(tmp.path(), vec![]).await;
-        for _ in 0..100 {
-            if engine
-                .export_job(JobId(991))
-                .await
-                .unwrap()
-                .is_some_and(|j| j.files[0].finalized)
-            {
+        // Recovery acknowledges verification, publication intent and the
+        // partial checkpoint through separate durable owner continuations.
+        // A one-second poll window can end before the next owner tick even
+        // without test contention. Wait for the actual finalized fact while
+        // retaining a bounded failure deadline and every integrity assertion.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let recovered = engine.export_ready(JobId(991)).await.unwrap().unwrap();
+            if manual || recovered.files[0].finalized {
                 break;
             }
-            if manual {
-                break;
-            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "legacy recovery did not finalize its partial checkpoint: {recovered:?}"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let job = engine.export_job(JobId(991)).await.unwrap().unwrap();
+        let job = engine.export_ready(JobId(991)).await.unwrap().unwrap();
         assert_eq!(job.held(), manual);
         assert_eq!(job.files[0].finalized, !manual);
         assert!(matches!(
@@ -2118,23 +2420,135 @@ async fn legacy_coverage_hold_recovers_without_repeating_valid_articles() {
     }
 }
 
+/// Contract §2.3 / plan M1 (g): a control persisted by a pre-v2 build with
+/// the terminal cause `identity_conflict` is converted at boot — before hold
+/// recovery — into the terminal `failed/identity`, with its history row and
+/// `job_pp_finished`, whatever the operator's pause said. It is not retried.
+#[tokio::test]
+async fn legacy_identity_conflict_hold_converts_at_boot() {
+    for manual in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        // Nothing downloaded yet: no partial for startup verification to
+        // judge, so the conversion below is the boot conversion's alone.
+        let mut job = transfer_job(991, "legacy-partial", JobStatus::Queued);
+        job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
+            version: 1,
+            revision: "7".into(),
+            lifecycle: "held".into(),
+            cause: "identity_conflict".into(),
+            stage: "finalize".into(),
+            retry_policy: "review".into(),
+            message: "conflicting yEnc declared size".into(),
+            instance: "legacy".into(),
+            previous_status: Some(JobStatus::Downloading),
+            manual_pause: manual,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        });
+        job.status = JobStatus::Paused;
+        engine.import_ready(job, false, false).await.unwrap();
+        engine.shutdown().await;
+
+        let history = std::sync::Arc::new(
+            nzbd_state::history::HistoryDb::open(
+                &tmp.path().join("history.sqlite"),
+                Some(tmp.path()),
+            )
+            .unwrap(),
+        );
+        let mut cfg = EngineConfig::single_node(
+            vec![],
+            tmp.path().join("state"),
+            tmp.path().join("dest"),
+            test_tuning(),
+            None,
+        );
+        cfg.history = Some(history.clone());
+        let engine = Engine::spawn(cfg).await.expect("engine spawn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let terminal = loop {
+            if let Some(terminal) = engine
+                .artifacts()
+                .terminal(991)
+                .unwrap()
+                .filter(|t| t.emitted)
+            {
+                break terminal;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "legacy hold was not converted: {:?}",
+                engine.snapshot().jobs
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Failed);
+        assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Identity));
+        assert_eq!(terminal.stage.as_deref(), Some("finalize"));
+        assert_eq!(
+            terminal.message.as_deref(),
+            Some("conflicting yEnc declared size"),
+            "converted from the stored control, not re-diagnosed"
+        );
+        assert!(terminal.blames_release);
+        assert!(terminal.reason.unwrap().park_always());
+        assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+        let seq = terminal.history_seq.unwrap();
+        assert!(seq > 0, "the event is sent only once history is durable");
+        let row = history.get_sequence(seq).unwrap().unwrap();
+        assert_eq!(row.status, "FAILURE/IDENTITY");
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Reason" && value == "identity"));
+        let summary = engine
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|job| job.id == JobId(991))
+            .cloned()
+            .unwrap();
+        assert!(summary.pp_done);
+        assert_eq!(summary.status, JobStatus::Failed);
+        assert_ne!(summary.status_projected, "held");
+        assert_eq!(engine.run_hold_recovery_pass().await.unwrap(), 0);
+        engine.shutdown().await;
+    }
+}
+
 /// Field report 2026-11-01, end to end: a job held `io` · `review` by a
 /// build that never scheduled download-side retries (#2183). The restart
 /// reclassifies it from its own errno and the recovery pass releases it with
 /// no click; a paused one stays with the operator.
 #[tokio::test]
 async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
+    let disconnected = format!(
+        "write /processing/stranded/.runner-file-1.part: {}",
+        std::io::Error::from_raw_os_error(libc::ENOTCONN)
+    );
     for (cause, policy, message, manual) in [
-        ("io", "review", "write /processing/stranded/.runner-file-1.part: Transport endpoint is not connected (os error 107)", false),
-        ("io", "review", "write /processing/stranded/.runner-file-1.part: Transport endpoint is not connected (os error 107)", true),
+        ("io", "review", disconnected.as_str(), false),
+        ("io", "review", disconnected.as_str(), true),
         // A full disk written before storage holds carried a time: released
         // by the recovery pass once the probe admits writes.
-        ("capacity", "resume_same_job", "write x: No space left on device (os error 28)", false),
+        (
+            "capacity",
+            "resume_same_job",
+            "write x: No space left on device (os error 28)",
+            false,
+        ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let engine = spawn_engine(tmp.path(), vec![]).await;
         let mut job = transfer_job(992, "stranded", JobStatus::Queued);
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),
@@ -2149,14 +2563,16 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
-        engine.import_job(job, false, false).await.unwrap();
+        engine.import_ready(job, false, false).await.unwrap();
         engine.shutdown().await;
 
         let engine = spawn_engine(tmp.path(), vec![]).await;
         let control = engine
-            .export_job(JobId(992))
+            .export_ready(JobId(992))
             .await
             .unwrap()
             .unwrap()
@@ -2177,14 +2593,23 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
             engine.run_hold_recovery_pass().await.unwrap(),
             usize::from(!manual)
         );
-        let job = engine.export_job(JobId(992)).await.unwrap().unwrap();
-        assert_eq!(job.held(), manual, "{cause}: a paused hold waits for the operator");
+        let job = engine.export_ready(JobId(992)).await.unwrap().unwrap();
+        assert_eq!(
+            job.held(),
+            manual,
+            "{cause}: a paused hold waits for the operator"
+        );
         if manual {
             assert!(
                 engine.resume_job(JobId(992)).await.unwrap(),
                 "…whose retry always works"
             );
-            assert!(!engine.export_job(JobId(992)).await.unwrap().unwrap().held());
+            assert!(!engine
+                .export_ready(JobId(992))
+                .await
+                .unwrap()
+                .unwrap()
+                .held());
         } else {
             assert_ne!(job.status, JobStatus::Paused);
         }
@@ -2195,13 +2620,12 @@ async fn stranded_storage_hold_recovers_after_restart_without_a_click() {
 /// The recovery pass end to end on the post side (#2181's path): a held
 /// post-processing job whose payload passes the custody check goes back to
 /// post-processing; one whose payload is gone stays held, rescheduled, with
-/// the refusal on the job. A review hold is never touched.
+/// the refusal on the job.
 #[tokio::test]
-async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
+async fn recovery_pass_releases_post_holds_through_custody() {
     for (cause, payload_present) in [
         ("storage_unavailable", true),
         ("storage_unavailable", false),
-        ("identity_conflict", true),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let engine = spawn_engine(tmp.path(), vec![]).await;
@@ -2212,19 +2636,15 @@ async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
             .await
             .unwrap();
         let dir = engine.artifacts().for_job(id.0).unwrap().unwrap().path;
-        let mut job = engine.export_job(id).await.unwrap().unwrap();
+        let mut job = engine.export_ready(id).await.unwrap().unwrap();
         job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),
             cause: cause.into(),
             stage: "post_unpack_rename".into(),
-            retry_policy: if cause == "identity_conflict" {
-                "review"
-            } else {
-                "scheduled_retry"
-            }
-            .into(),
+            retry_policy: "scheduled_retry".into(),
             message: "io: read /processing/post-held/x: Input/output error (os error 5)".into(),
             instance: "field".into(),
             previous_status: Some(JobStatus::Post {
@@ -2235,26 +2655,33 @@ async fn recovery_pass_releases_post_holds_through_custody_and_skips_review() {
             next_retry_at_unix: None,
             blocked_since_unix: Some(1),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         job.status = JobStatus::Paused;
-        engine.import_job(job, false, false).await.unwrap();
+        engine.import_ready(job, false, false).await.unwrap();
         engine.shutdown().await;
 
         let engine = spawn_engine(tmp.path(), vec![]).await;
+        engine.export_ready(id).await.unwrap().unwrap();
         if !payload_present {
             // The volume answers, but the payload is not what custody
             // recorded: the retry must be refused and say so.
             std::fs::remove_dir_all(&dir).unwrap();
         }
         let released = engine.run_hold_recovery_pass().await.unwrap();
-        let job = engine.export_job(id).await.unwrap().unwrap();
+        // A deliberately missing allocation keeps generic export fenced.
+        // Inspect the recovery row without granting payload-read authority.
+        let job = engine
+            .recovery_document()
+            .await
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|job| job.id == id)
+            .unwrap();
         let control = job.control().unwrap();
         match (cause, payload_present) {
-            ("identity_conflict", _) => {
-                assert_eq!(released, 0, "a review hold waits for a person");
-                assert!(job.held());
-                assert!(!control.message.contains("retry refused"));
-            }
             (_, true) => {
                 assert_eq!(released, 1, "{}", control.message);
                 assert!(!job.held());
@@ -2284,7 +2711,7 @@ async fn transient_repair_progress_is_attempt_fenced_and_absent_after_terminal_s
     let temp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(temp.path(), vec![]).await;
     let job = transfer_job(501, "repair-progress", JobStatus::PostQueued);
-    engine.import_job(job, false, false).await.unwrap();
+    engine.import_ready(job, false, false).await.unwrap();
     assert!(engine
         .register_repair_attempt(JobId(501), "old".into())
         .await
@@ -2304,7 +2731,7 @@ async fn transient_repair_progress_is_attempt_fenced_and_absent_after_terminal_s
         .update_repair_progress(JobId(501), progress.clone())
         .await;
     // Export is an ordered owner barrier, so the snapshot is deterministic.
-    engine.export_job(JobId(501)).await.unwrap();
+    engine.export_ready(JobId(501)).await.unwrap();
     assert_eq!(
         engine.snapshot().jobs[0]
             .repair_progress
@@ -2324,7 +2751,7 @@ async fn transient_repair_progress_is_attempt_fenced_and_absent_after_terminal_s
     progress.attempt_id = "new".into();
     progress.phase = RepairPhase::Verifying;
     engine.update_repair_progress(JobId(501), progress).await;
-    engine.export_job(JobId(501)).await.unwrap();
+    engine.export_ready(JobId(501)).await.unwrap();
     assert_eq!(
         engine.snapshot().jobs[0]
             .repair_progress
@@ -2333,10 +2760,10 @@ async fn transient_repair_progress_is_attempt_fenced_and_absent_after_terminal_s
             .attempt_id,
         "new"
     );
-    let mut job = engine.export_job(JobId(501)).await.unwrap().unwrap();
+    let mut job = engine.export_ready(JobId(501)).await.unwrap().unwrap();
     job.params
         .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into()));
-    engine.import_job(job, false, false).await.unwrap();
+    engine.import_ready(job, false, false).await.unwrap();
     assert!(engine.snapshot().jobs[0].repair_progress.is_none());
     let wire = serde_json::to_value(&engine.snapshot().jobs[0]).unwrap();
     assert!(
@@ -2351,7 +2778,7 @@ async fn mirrored_repair_progress_is_optional_node_fenced_and_cleared_on_replace
     let temp = tempfile::tempdir().unwrap();
     let engine = spawn_engine(temp.path(), vec![]).await;
     engine
-        .import_job(
+        .import_ready(
             transfer_job(502, "remote-progress", JobStatus::Completed),
             false,
             false,
@@ -2379,7 +2806,7 @@ async fn mirrored_repair_progress_is_optional_node_fenced_and_cleared_on_replace
         ..Default::default()
     };
     engine.mirror_progress_from(JobId(502), "worker-a".into(), stats.clone());
-    engine.export_job(JobId(502)).await.unwrap();
+    engine.export_ready(JobId(502)).await.unwrap();
     assert_eq!(
         engine.snapshot().jobs[0]
             .repair_progress
@@ -2393,13 +2820,119 @@ async fn mirrored_repair_progress_is_optional_node_fenced_and_cleared_on_replace
         .await
         .unwrap();
     engine.mirror_progress_from(JobId(502), "worker-a".into(), stats.clone());
-    engine.export_job(JobId(502)).await.unwrap();
+    engine.export_ready(JobId(502)).await.unwrap();
     assert!(engine.snapshot().jobs[0].repair_progress.is_none());
     engine.mirror_progress_from(JobId(502), "worker-b".into(), stats);
-    engine.export_job(JobId(502)).await.unwrap();
+    engine.export_ready(JobId(502)).await.unwrap();
     assert!(engine.snapshot().jobs[0].repair_progress.is_some());
     engine.mirror_progress_from(JobId(502), "worker-b".into(), MirrorStats::default());
-    engine.export_job(JobId(502)).await.unwrap();
+    engine.export_ready(JobId(502)).await.unwrap();
     assert!(engine.snapshot().jobs[0].repair_progress.is_none());
+    engine.shutdown().await;
+}
+
+/// Review #297 r2: a persisted hold survives a restart as `held` and the
+/// hold recovery task releases it; a 0.5.0 snapshot (`paused` + a held
+/// control) loads as `held`; a `held` row that lost its control loads as a
+/// plain pause.
+#[tokio::test]
+async fn a_persisted_hold_reloads_held_and_recovers_and_a_050_snapshot_loads_held() {
+    fn rewrite_snapshot(dir: &Path, job: u32, edit: impl Fn(&mut serde_json::Value)) {
+        let path = dir.join("state/queue.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let row = doc["jobs"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["id"] == job)
+            .unwrap();
+        edit(row);
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for legacy in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        let mut job = transfer_job(993, "held-restart", JobStatus::Held);
+        job.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
+            version: 1,
+            revision: "3".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "download_write".into(),
+            retry_policy: "scheduled_retry".into(),
+            message: "No space left on device (os error 28)".into(),
+            instance: "restart".into(),
+            previous_status: Some(JobStatus::Downloading),
+            manual_pause: false,
+            retry_attempt: 1,
+            // Due now: the first recovery pass after boot releases it.
+            next_retry_at_unix: Some(now - 1),
+            blocked_since_unix: Some(now - 60),
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: Some(now + 86_400),
+        });
+        engine.import_ready(job, false, false).await.unwrap();
+        engine.shutdown().await;
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("state/queue.json")).unwrap())
+                .unwrap();
+        let row = snapshot["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == 993)
+            .unwrap();
+        assert_eq!(
+            row["status"], "held",
+            "the hold is persisted as its own status"
+        );
+        if legacy {
+            rewrite_snapshot(tmp.path(), 993, |row| row["status"] = "paused".into());
+        }
+        let engine = spawn_engine(tmp.path(), vec![]).await;
+        let reloaded = engine.export_ready(JobId(993)).await.unwrap().unwrap();
+        assert!(reloaded.held(), "legacy={legacy}");
+        assert_eq!(reloaded.status, JobStatus::Held, "legacy={legacy}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let job = engine.export_ready(JobId(993)).await.unwrap().unwrap();
+            if !job.held() {
+                assert_eq!(job.status, JobStatus::Queued, "legacy={legacy}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "hold recovery never released the reloaded hold (legacy={legacy}): {:?}",
+                job.control()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        engine.shutdown().await;
+    }
+
+    // A `held` row whose control is gone: a stop without a hold.
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path(), vec![]).await;
+    engine
+        .import_ready(
+            transfer_job(994, "lost-control", JobStatus::Paused),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    engine.shutdown().await;
+    rewrite_snapshot(tmp.path(), 994, |row| row["status"] = "held".into());
+    let engine = spawn_engine(tmp.path(), vec![]).await;
+    let job = engine.export_ready(JobId(994)).await.unwrap().unwrap();
+    assert!(!job.held());
+    assert_eq!(job.status, JobStatus::Paused);
     engine.shutdown().await;
 }

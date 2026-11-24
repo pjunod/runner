@@ -353,7 +353,7 @@ fn same_copy(
 ) -> bool {
     left.owner_node == right.owner_node && left.copy == right.copy
 }
-fn authority_source(
+pub(crate) fn authority_source(
     job: &nzbd_types::Job,
 ) -> Result<Option<crate::delivery::AuthoritySourceCopy>, String> {
     let mut values = job
@@ -421,7 +421,10 @@ async fn prove_grant(
         || original.fence != request.token.fence
         || request.token.revision < original.revision
         || request.token.expires_at_unix_ms < original.expires_at_unix_ms
-        || !matches!(grant.kind.as_str(), "download" | "post" | "assemble")
+        || !matches!(
+            grant.kind.as_str(),
+            "download" | "post" | "segment" | "assemble"
+        )
         || grant.issued_at_unix_ms > removal.at_ms
     {
         return Err("cancellation does not match the immutable historical grant".into());
@@ -619,7 +622,6 @@ fn cancellation_record(
         delivery: nzbd_state::artifacts::Delivery {
             protocol_version: 1,
             sequence: 0,
-            status: "internal_cleanup".into(),
             delivery_id: decision.cleanup_id.clone(),
             publication_generation: request.result_id.clone(),
             artifact_id: format!("cancelled-generation:{}", request.result_id),
@@ -651,8 +653,7 @@ fn cancellation_record(
             runner_stages: None,
             lifecycle_timing: None,
             ready_at: decision.accepted_at_ms / 1000,
-            accepted_at: None,
-            consumer_receipt_id: None,
+            manifest: None,
             source_cleanup:serde_json::from_value(serde_json::json!({"status":if removing{"pending"}else{"retained"},"error":decision.reason,"attempts":0,"nextRetryAt":null,"blockedSince":null,"warning":null,"startedAt":null,"lastAttemptAt":null,"completedAt":null,"attemptHistory":[]})).map_err(|error|error.to_string())?,
         },
     })
@@ -712,7 +713,7 @@ pub(crate) async fn decide(
     let identity = fingerprint(request)?;
     let writes=vec![crate::control::authority_statement(issuer)?,
         ("INSERT INTO cluster_cancellation_decisions(receipt_id,fingerprint,job_id,incarnation,removal_revision,cleanup_id,data) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE NOT EXISTS(SELECT 1 FROM cluster_deliveries WHERE cleanup_only=0 AND json_extract(data,'$.result_id')=?8) ON CONFLICT(receipt_id) DO NOTHING".into(),params!(&request.receipt_id,&identity,i64::from(request.job_id),&request.job_incarnation,removal.applied_revision as i64,&decision.cleanup_id,serde_json::to_string(&decision).map_err(|error|error.to_string())?,&request.result_id)),
-        ("INSERT INTO cluster_deliveries(id,data,public_data,accepted_at,cleanup_only,request_token) SELECT ?1,?2,?3,?4,1,?5 WHERE EXISTS(SELECT 1 FROM cluster_cancellation_decisions WHERE receipt_id=?6 AND fingerprint=?7 AND cleanup_id=?1) ON CONFLICT(id) DO NOTHING".into(),params!(&decision.cleanup_id,data,public,record.delivery.accepted_at,&record.delivery.request_token,&request.receipt_id,&identity))];
+        ("INSERT INTO cluster_deliveries(id,data,public_data,accepted_at,cleanup_only,request_token) SELECT ?1,?2,?3,?4,1,?5 WHERE EXISTS(SELECT 1 FROM cluster_cancellation_decisions WHERE receipt_id=?6 AND fingerprint=?7 AND cleanup_id=?1) ON CONFLICT(id) DO NOTHING".into(),params!(&decision.cleanup_id,data,public,None::<i64>,&record.delivery.request_token,&request.receipt_id,&identity))];
     crate::delivery::bounded_transaction(&writes)?;
     control
         .client
@@ -814,8 +815,16 @@ async fn acknowledge_owner_stop_policy(
         .cancellation_removal(ack.job_id, &ack.job_incarnation)
         .await?
         .ok_or("owner stop has no current exact removal")?;
-    if removal.mode != RemovalMode::DeleteFiles
-        || removal.applied_revision != ack.removal_applied_revision
+    if removal.applied_revision != ack.removal_applied_revision
+        || (removal.mode != RemovalMode::DeleteFiles
+            && !control
+                .explicit_disposition_covers(
+                    &ack.cleanup_id,
+                    ack.job_id,
+                    &ack.job_incarnation,
+                    ack.removal_applied_revision,
+                )
+                .await?)
     {
         return Err("owner-stop removal scope changed".into());
     }

@@ -62,6 +62,7 @@ const POST_STAGE_SECTIONS: Record<PostStage, QueueSectionKey> = {
   rar_rename: 'renaming',
   post_unpack_rename: 'renaming',
   par_verify: 'verifying',
+  publication_verify: 'verifying',
   par_repair: 'repairing',
   unpack: 'extracting',
   cleanup: 'cleaning',

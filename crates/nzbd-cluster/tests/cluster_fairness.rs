@@ -8,9 +8,10 @@ use axum::response::Response;
 use nzbd_cluster::{ClusterConfig, ClusterRuntime, ControlPeer};
 use nzbd_engine::{EngineHandle, Tuning};
 use nzbd_nserv::{build_post, prng_bytes, NservBuilder};
-use nzbd_types::{CertLevel, JobStatus, ServerDef, ServerId, TlsMode};
+use nzbd_types::{CertLevel, JobId, JobStatus, ServerDef, ServerId, TlsMode};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -28,7 +29,58 @@ struct PollObservation {
     granted_kinds: Vec<String>,
 }
 
-type Observations = Arc<Mutex<Vec<PollObservation>>>;
+#[derive(Debug, Default)]
+struct ObservationLog {
+    polls: Vec<PollObservation>,
+    errors: Vec<String>,
+    active_leases: HashMap<String, JobId>,
+}
+type Observations = Arc<Mutex<ObservationLog>>;
+
+async fn checked_post_candidates(
+    engine: &EngineHandle,
+    node: &str,
+    observations: &Observations,
+) -> HashSet<JobId> {
+    let snapshot = engine.snapshot();
+    let mut ready = HashSet::new();
+    if snapshot.post_paused {
+        return ready;
+    }
+    let leased: HashSet<_> = observations
+        .lock()
+        .unwrap()
+        .active_leases
+        .values()
+        .copied()
+        .collect();
+    for summary in snapshot.jobs.iter().filter(|job| {
+        matches!(job.status, JobStatus::Completed)
+            && !job.pp_done
+            && !leased.contains(&job.id)
+            && job.assigned_node.as_deref() == Some(node)
+    }) {
+        match engine.export_job(summary.id).await {
+            Ok(Some(job)) => {
+                if matches!(job.status, JobStatus::Completed)
+                    && !job.params.iter().any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                {
+                    ready.insert(job.id);
+                }
+            }
+            Ok(None) => {} // The candidate left the queue before the read.
+            Err(nzbd_engine::EngineError::Lifecycle(reason))
+                if reason == "job verification or writer retirement is still in progress; retry later" => {}
+            Err(error) => {
+                let error = format!("observe PP readiness for job {}: {error}", summary.id.0);
+                // Connection-task panics need not propagate to the test task.
+                observations.lock().unwrap().errors.push(error.clone());
+                panic!("{error}");
+            }
+        }
+    }
+    ready
+}
 
 async fn observe_poll(
     request: Request,
@@ -36,6 +88,17 @@ async fn observe_poll(
     engine: EngineHandle,
     observations: Observations,
 ) -> Response {
+    if request.uri().path() == "/cluster/v1/work/complete" {
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, 32 * 1024 * 1024).await.unwrap();
+        let complete: Value = serde_json::from_slice(&body).unwrap();
+        let lease = complete["lease_id"].as_str().unwrap().to_owned();
+        let response = next.run(Request::from_parts(parts, Body::from(body))).await;
+        if response.status().is_success() {
+            observations.lock().unwrap().active_leases.remove(&lease);
+        }
+        return response;
+    }
     if request.uri().path() != "/cluster/v1/work/poll" {
         return next.run(request).await;
     }
@@ -49,31 +112,47 @@ async fn observe_poll(
         .iter()
         .filter(|job| matches!(job.status, JobStatus::Queued))
         .count();
-    let eligible_post_jobs = snapshot
-        .jobs
-        .iter()
-        .filter(|job| {
-            matches!(job.status, JobStatus::Completed)
-                && !job.pp_done
-                && job.assigned_node.as_deref() == Some(node)
-        })
-        .count();
+    // A published Completed summary can precede an in-flight projection's
+    // verification fence. The real grant path requires checked export too.
+    let ready_before = checked_post_candidates(&engine, node, &observations).await;
     let response = next.run(Request::from_parts(parts, Body::from(body))).await;
     let (parts, body) = response.into_parts();
     let body = to_bytes(body, 32 * 1024 * 1024).await.unwrap();
     if parts.status.is_success() {
         let value: Value = serde_json::from_slice(&body).unwrap();
+        let ready_after = checked_post_candidates(&engine, node, &observations).await;
+        let mut eligible: HashSet<_> = ready_before.intersection(&ready_after).copied().collect();
+        // Do not count a transient recovery block as a bypass. A returned
+        // Post grant is itself positive evidence even if its row changed
+        // while the request was running.
+        for grant in value["grants"].as_array().unwrap() {
+            if grant["kind"] == "post" {
+                eligible.insert(serde_json::from_value(grant["job"]["id"].clone()).unwrap());
+            }
+        }
+        // A checked Completed row with an outstanding Download/Post lease is
+        // not grantable. Track actual grants and successful completion receipts
+        // so the observer applies that same scheduler boundary.
+        {
+            let mut seen = observations.lock().unwrap();
+            for grant in value["grants"].as_array().unwrap() {
+                seen.active_leases.insert(
+                    grant["lease_id"].as_str().unwrap().to_owned(),
+                    serde_json::from_value(grant["job"]["id"].clone()).unwrap(),
+                );
+            }
+        }
         let granted_kinds = value["grants"]
             .as_array()
             .unwrap()
             .iter()
             .map(|grant| grant["kind"].as_str().unwrap().to_string())
             .collect();
-        observations.lock().unwrap().push(PollObservation {
+        observations.lock().unwrap().polls.push(PollObservation {
             free_download_slots: poll["free_download_slots"].as_u64().unwrap(),
             free_pp_slots: poll["free_pp_slots"].as_u64().unwrap(),
             queued_backlog,
-            eligible_post_jobs,
+            eligible_post_jobs: eligible.len(),
             granted_kinds,
         });
     }
@@ -113,7 +192,11 @@ async fn start_node(
         download: mixed_worker,
         max_download_jobs: if mixed_worker { 8 } else { 0 },
         post_process: mixed_worker,
-        pp_slots: 1,
+        // Keep more than one Post slot available while an actual Post runs.
+        // The scheduler counts assigned Post jobs in this node's download
+        // load, so a single Post slot otherwise hides lane competition behind
+        // the active Post occupying that only slot.
+        pp_slots: 3,
         lease_interval: Duration::from_millis(100),
         takeover_after: Duration::from_millis(900),
         worker_ttl: Duration::from_secs(2),
@@ -130,6 +213,8 @@ async fn start_node(
         pp_weight: 1,
         disk_guard_roots: vec![],
         torrent_payload_roots: vec![],
+        workspace_dir: None,
+        keep_failed_downloads: false,
     };
     let local = shared.join(format!("local-{name}"));
     std::fs::create_dir_all(&local).unwrap();
@@ -246,6 +331,14 @@ async fn wait_for(mut condition: impl FnMut() -> bool, description: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_available() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "nzbd_cluster=info,nzbd_cluster::leader=debug,nzbd_engine=warn".into()
+            }),
+        )
+        .with_test_writer()
+        .try_init();
     let tmp = tempfile::tempdir().unwrap();
     let payload = prng_bytes(9201, 16_000);
     let post = build_post("fairness", &[("payload.mkv", payload)], 20_000);
@@ -267,6 +360,32 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
         "authority elected",
     )
     .await;
+    // Build a real Post backlog through the public pause control first.
+    // Otherwise fast Post grants usually arrive while every download slot is
+    // occupied, which proves progress but never exercises competing lanes.
+    wait_for(
+        || {
+            let (status, body) = http(
+                &authority.url,
+                "POST",
+                "/api/v1/queue/actions/pause-post",
+                b"",
+            );
+            if status == 200 {
+                return true;
+            }
+            assert!(
+                status == 503
+                    && serde_json::from_str::<Value>(&body)
+                        .is_ok_and(|error| error["error"]
+                            == "queue authority is still being adopted; retry"),
+                "pause Post for readiness setup: {status}: {body}"
+            );
+            false
+        },
+        "pause Post after initial authority adoption",
+    )
+    .await;
     // No executor exists yet. Seed enough real jobs to keep the download lane
     // continuously runnable while several PP attempts complete on the same node.
     for index in 0..96 {
@@ -281,29 +400,106 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
             if status == 201 {
                 break;
             }
-            assert_eq!(status, 503, "admission failed: {body}");
+            assert_eq!(
+                status,
+                503,
+                "admission failed at seed {index}: {body}; snapshot={:?}",
+                authority.runtime.engine.snapshot()
+            );
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "admission stayed unavailable: {body}"
+                "admission stayed unavailable at seed {index}: {body}; snapshot={:?}",
+                authority.runtime.engine.snapshot()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
     let worker = start_node(tmp.path(), "mixed", true, provider.port(), seen.clone()).await;
-    let history_path = tmp.path().join(".nzbd-cluster/history/history.mixed.jsonl");
     wait_for(
         || {
-            let history = std::fs::read_to_string(&history_path).unwrap_or_default();
-            history
-                .lines()
-                .filter(|line| line.contains("\"SUCCESS\""))
-                .count()
-                >= 3
+            let completed = authority
+                .runtime
+                .engine
+                .snapshot()
+                .jobs
+                .iter()
+                .filter(|job| matches!(job.status, JobStatus::Completed) && !job.pp_done)
+                .count();
+            completed >= 4
                 && provider.total_hits() >= 8
+                && seen.lock().unwrap().polls.last().is_some_and(|poll| {
+                    poll.free_download_slots > 0
+                        && poll.free_pp_slots > 0
+                        && poll.queued_backlog > 0
+                })
         },
-        "three actual remote post-processing successes under mixed load",
+        "actual completed Post backlog and free competing lanes",
     )
     .await;
+    wait_for(
+        || {
+            let (status, body) = http(
+                &authority.url,
+                "POST",
+                "/api/v1/queue/actions/resume-post",
+                b"",
+            );
+            if status == 200 {
+                return true;
+            }
+            assert!(
+                status == 503
+                    && serde_json::from_str::<Value>(&body)
+                        .is_ok_and(|error| error["error"] == "queue_projection_unavailable"),
+                "resume Post for competing load: {status}: {body}"
+            );
+            false
+        },
+        "resume Post after existing projection verification",
+    )
+    .await;
+    let history_path = tmp.path().join(".nzbd-cluster/history/history.mixed.jsonl");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let history = std::fs::read_to_string(&history_path);
+        let successes = history
+            .as_ref()
+            .map(|history| {
+                history
+                    .lines()
+                    .filter(|line| line.contains("\"SUCCESS\""))
+                    .count()
+            })
+            .unwrap_or(0);
+        // A completed Post can have been granted while the download lane
+        // was full. Keep observing until three grants actually competed with
+        // a free download lane; all observed grant-order windows remain checked.
+        let competing_post_grants = seen
+            .lock()
+            .unwrap()
+            .polls
+            .iter()
+            .filter(|poll| {
+                poll.free_download_slots > 0
+                    && poll.free_pp_slots > 0
+                    && poll.queued_backlog > 0
+                    && poll.eligible_post_jobs > 0
+                    && poll.granted_kinds.iter().any(|kind| kind == "post")
+            })
+            .count();
+        if successes >= 3 && provider.total_hits() >= 8 && competing_post_grants >= 3 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: three actual remote post-processing successes under mixed load; successes={successes}, provider_hits={}, history_path={history_path:?}, history={history:?}, authority={:?}, worker={:?}, polls={:?}",
+            provider.total_hits(),
+            authority.runtime.engine.snapshot(),
+            worker.runtime.engine.snapshot(),
+            seen.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let backlog = authority
         .runtime
         .engine
@@ -316,9 +512,15 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
     worker.stop().await;
     authority.stop().await;
     let observed = seen.lock().unwrap();
+    assert!(
+        observed.errors.is_empty(),
+        "poll observer failed: {:?}",
+        observed.errors
+    );
+    let observed = &observed.polls;
     eprintln!(
         "actual mixed poll observations: {}",
-        serde_json::to_string(&*observed).unwrap()
+        serde_json::to_string(observed).unwrap()
     );
     assert!(
         hits >= 8,
@@ -346,12 +548,54 @@ async fn mixed_worker_grants_post_while_fast_downloads_keep_slots_and_backlog_av
             >= 3,
         "PP was not repeatedly granted under continuous competing load: {eligible:?}"
     );
-    for window in eligible.windows(2) {
-        assert!(
-            window
-                .iter()
-                .any(|poll| poll.granted_kinds.iter().any(|kind| kind == "post")),
-            "two eligible polls bypassed PP: {window:?}"
-        );
+    assert_bounded_post_progress(observed);
+}
+
+fn assert_bounded_post_progress(observed: &[PollObservation]) {
+    let mut bypasses = 0;
+    for poll in observed {
+        // Every actual Post grant proves progress, including one issued while
+        // the download lane is full. Filtering those grants out first would
+        // incorrectly reject Download, Post, Download as two Post bypasses.
+        if poll.granted_kinds.iter().any(|kind| kind == "post") {
+            bypasses = 0;
+        } else if poll.free_download_slots > 0
+            && poll.free_pp_slots > 0
+            && poll.queued_backlog > 0
+            && poll.eligible_post_jobs > 0
+        {
+            bypasses += 1;
+            assert!(
+                bypasses < 2,
+                "two eligible polls bypassed PP without an intervening Post grant: {observed:?}"
+            );
+        }
     }
+}
+
+#[test]
+fn fairness_window_credits_actual_post_progress_and_refuses_repeated_bypass() {
+    let poll = |free_download_slots, kinds: &[&str]| PollObservation {
+        free_download_slots,
+        free_pp_slots: 1,
+        queued_backlog: 10,
+        eligible_post_jobs: 1,
+        granted_kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
+    };
+    assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(0, &["post"]),
+        poll(1, &["download"]),
+    ]);
+    assert!(std::panic::catch_unwind(|| assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(1, &["download"]),
+    ]))
+    .is_err());
+    assert!(std::panic::catch_unwind(|| assert_bounded_post_progress(&[
+        poll(1, &["download"]),
+        poll(0, &[]),
+        poll(1, &["download"]),
+    ]))
+    .is_err());
 }

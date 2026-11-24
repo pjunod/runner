@@ -15,6 +15,7 @@ mod admissions;
 pub mod automatic_control;
 pub mod backend;
 mod cluster_stop;
+pub mod disk_io;
 mod download_capacity;
 pub mod events;
 pub mod failover;
@@ -24,6 +25,7 @@ mod hold_release;
 pub mod queue;
 pub mod rate;
 pub mod snapshot;
+pub mod terminal;
 pub mod torrent_acquisitions;
 pub mod torrent_runtime;
 pub mod volumes;
@@ -34,6 +36,9 @@ pub use lifecycle::frozen_lifecycle_timing;
 mod owner;
 mod pool;
 mod recovery;
+mod space_probe;
+pub mod startup_phases;
+mod url_dispatch;
 mod writer;
 
 pub use events::Event;
@@ -48,7 +53,7 @@ use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
 use nzbd_types::{Job, JobId, ServerDef, TlsMode};
 use owner::{EngineMsg, Owner, QueueCommand};
 use rate::{RateLimiter, SpeedMeter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -56,23 +61,6 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use volumes::DiskGuardRoot;
-
-/// Does this error message name an out-of-space condition?
-///
-/// Matched on the message because that is what survives every layer this
-/// has to cross — `std::io::Error` stringified by a writer task, the fsx
-/// wrappers' `op path: source`, a subprocess's stderr. ENOSPC and the
-/// quota variant both count: a gluster or NFS mount answers `EDQUOT` for
-/// exactly the same condition, and the whole point of this signal is that
-/// it does not depend on which lie statvfs is telling.
-pub fn is_out_of_space(msg: &str) -> bool {
-    let lower = msg.to_ascii_lowercase();
-    lower.contains("no space left on device")
-        || lower.contains("os error 28")
-        || lower.contains("disk quota exceeded")
-        || lower.contains("os error 122")
-        || lower.contains("no storage space")
-}
 
 #[cfg(test)]
 type UrlPreparationGate = Option<(
@@ -125,26 +113,201 @@ fn url_storage_error(error: nzbd_state::artifacts::Error) -> EngineError {
     }
 }
 
-/// The storage under a path stopped answering: a network or FUSE mount lost
-/// its transport, a stale handle after a server-side remount, a device that
-/// went away, a remote that timed out or reset, or the generic EIO such
-/// mounts report meanwhile. Nothing about the job is wrong; the same
-/// operation succeeds once the volume is back, so these holds retry on
-/// their own ([`nzbd_types::HoldCause::StorageUnavailable`]).
+/// W10 drain: set while a restart waits for post-processing to reach a
+/// resumable boundary. No new PAR repair or extraction starts while it is
+/// set (a job holds at that stage boundary), so the running ones drain and
+/// the restart cannot wait behind a backlog. Process-wide: it survives an
+/// in-process reload, and the API clears it when the restart runs, expires
+/// or is cancelled.
+static RESTART_DRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a pending restart is draining repair/extraction admission.
+pub fn restart_drain() -> bool {
+    RESTART_DRAIN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Start or end the restart drain (the API's restart deferral owns it).
+pub fn set_restart_drain(on: bool) {
+    RESTART_DRAIN.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// [`nzbd_types::Job::normalize_hold_status`] for a row read from storage
+/// (the queue snapshot, an import, a replicated row): a `held` row that no
+/// longer has a holding control becomes `paused`, and that is logged with
+/// the control found — a damaged hold must not turn into a person's pause
+/// without a trace (contract §2.3). Returns what changed.
+pub fn normalize_stored_hold_status(
+    job: &mut nzbd_types::Job,
+    whence: &str,
+) -> nzbd_types::HoldStatusChange {
+    let change = job.normalize_hold_status();
+    if change == nzbd_types::HoldStatusChange::LostHold {
+        tracing::warn!(
+            job = job.id.0,
+            whence,
+            control = ?job.control(),
+            "a held job has no holding control; it is now paused and waits for a person"
+        );
+    }
+    change
+}
+
+/// Contract §2.3 — the environmental hold an errno names, or `None` when
+/// retrying the same call cannot help (a refused permission, a missing file:
+/// the job's terminal `failed/io`, §2.2).
 ///
-/// Matched only on the std `(os error N)` suffix every `io::Error` Display
-/// ends with — the error has usually crossed a `to_string()` by the time a
-/// hold is classified, and free text (payload names, extractor output) must
-/// not steer the cause.
-pub fn is_storage_unavailable(msg: &str) -> bool {
-    // EIO ENXIO EAGAIN ENODEV ENOLINK ECONNABORTED ECONNRESET ENOTCONN
-    // ETIMEDOUT ECONNREFUSED EHOSTDOWN EHOSTUNREACH ESTALE EREMOTEIO
-    const ERRNOS: [u16; 14] = [
-        5, 6, 11, 19, 67, 103, 104, 107, 110, 111, 112, 113, 116, 121,
-    ];
-    ERRNOS
-        .iter()
-        .any(|n| msg.contains(&format!("(os error {n})")))
+/// A full volume is `capacity` (`ENOSPC`) or `quota` (`EDQUOT`; a gluster or
+/// NFS mount answers it for the same condition). A volume that stopped
+/// answering is `storage_unavailable`: a network or FUSE mount that lost its
+/// transport, a stale handle after a server-side remount, a device that went
+/// away, a remote that timed out or reset, a network that went down under a
+/// network mount, the generic `EIO` such mounts report meanwhile, or a
+/// volume that turned read-only (`EROFS`: ext4 `errors=remount-ro`, an
+/// export flipped read-only — both heal on remount). Nothing about the job is
+/// wrong in any of these; the same call succeeds once the volume is back, so
+/// these holds retry on their own (and end `failed/hold_expired` at their
+/// deadline if it never is).
+///
+/// Everything else is terminal `failed/io`, bytes parked. That includes
+/// `EACCES`/`EPERM`/`ENOENT` (a configuration or a vanished file, which a
+/// retry repeats; a vanished *root* is caught earlier by the volume guard as
+/// `mount_unavailable`) and `EMFILE`/`ENFILE`/`ENOMEM`: those name a fault
+/// in this daemon or host, not the volume, and a hold would hide it.
+pub fn errno_hold_cause(errno: i32) -> Option<nzbd_types::HoldCause> {
+    use nzbd_types::HoldCause;
+    match errno {
+        libc::ENOSPC => Some(HoldCause::Capacity),
+        libc::EDQUOT => Some(HoldCause::Quota),
+        libc::EIO
+        | libc::ENXIO
+        | libc::EAGAIN
+        | libc::ENODEV
+        | libc::ENOLINK
+        | libc::ECONNABORTED
+        | libc::ECONNRESET
+        | libc::ENOTCONN
+        | libc::ETIMEDOUT
+        | libc::ECONNREFUSED
+        | libc::EHOSTDOWN
+        | libc::EHOSTUNREACH
+        | libc::ENETDOWN
+        | libc::ENETUNREACH
+        | libc::ESTALE
+        | libc::EROFS => Some(HoldCause::StorageUnavailable),
+        #[cfg(target_os = "linux")]
+        libc::EREMOTEIO => Some(HoldCause::StorageUnavailable),
+        _ => None,
+    }
+}
+
+/// [`errno_hold_cause`] for an `io::Error`: its `raw_os_error()`, else the
+/// error it wraps, else the kind std mapped the errno to. An error built
+/// from a kind (`io::Error::new(e.kind(), ..)`) carries no errno, so the
+/// kind table mirrors the errno table; `EIO` has no kind of its own
+/// (`Uncategorized`) and survives only by keeping the original error as a
+/// `source()` — which is why storage paths must not rewrap.
+pub fn io_error_hold_cause(error: &std::io::Error) -> Option<nzbd_types::HoldCause> {
+    use std::io::ErrorKind as K;
+    if let Some(errno) = error.raw_os_error() {
+        return errno_hold_cause(errno);
+    }
+    if let Some(cause) = error
+        .get_ref()
+        .and_then(|inner| error_hold_cause(inner as &(dyn std::error::Error + 'static)))
+    {
+        return Some(cause);
+    }
+    match error.kind() {
+        K::StorageFull => Some(nzbd_types::HoldCause::Capacity),
+        K::QuotaExceeded => Some(nzbd_types::HoldCause::Quota),
+        K::StaleNetworkFileHandle
+        | K::NotConnected
+        | K::TimedOut
+        | K::ConnectionReset
+        | K::ConnectionAborted
+        | K::ConnectionRefused
+        | K::HostUnreachable
+        | K::NetworkUnreachable
+        | K::NetworkDown
+        | K::WouldBlock
+        | K::ReadOnlyFilesystem => Some(nzbd_types::HoldCause::StorageUnavailable),
+        _ => None,
+    }
+}
+
+/// [`errno_hold_cause`] for any error: the first `io::Error` (by errno) or
+/// SQLite failure (by result code — a full or failing volume under the
+/// state database) along its `source()` chain. Typed errors only; a message
+/// is never read, so a payload name can never steer the cause.
+pub fn error_hold_cause(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<nzbd_types::HoldCause> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return io_error_hold_cause(io);
+        }
+        if let Some(rusqlite::Error::SqliteFailure(failure, _)) =
+            error.downcast_ref::<rusqlite::Error>()
+        {
+            return match failure.code {
+                rusqlite::ErrorCode::DiskFull => Some(nzbd_types::HoldCause::Capacity),
+                rusqlite::ErrorCode::SystemIoFailure => {
+                    Some(nzbd_types::HoldCause::StorageUnavailable)
+                }
+                _ => None,
+            };
+        }
+        current = error.source();
+    }
+    None
+}
+
+/// The one text classifier: a subprocess's stderr (par2, unrar, 7z, a post
+/// script) reaches this process as words, with no `io::Error` behind them,
+/// so the errno is read from what the tool printed — the std
+/// `(os error N)` suffix, or the libc wording of `ENOSPC`/`EDQUOT`.
+///
+/// Also the last resort, named at each call site, for the few errors that
+/// arrive here already rendered with no errno attached: a torrent backend's
+/// error string, a persisted operation error, an `EngineError::Lifecycle`
+/// message. Everything holding an `io::Error` uses [`io_error_hold_cause`].
+pub fn stderr_hold_cause(stderr: &str) -> Option<nzbd_types::HoldCause> {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("disk quota exceeded") {
+        return Some(nzbd_types::HoldCause::Quota);
+    }
+    // `capacity::CapacityShortfall`'s own wording, for when a refused
+    // reservation reaches here already rendered to text.
+    if lower.contains("no space left on device")
+        || lower.contains("no storage space")
+        || lower.contains("not enough free space forecast on ")
+    {
+        return Some(nzbd_types::HoldCause::Capacity);
+    }
+    // Only the std suffix names an errno; free text (payload names,
+    // extractor chatter) must not.
+    let mut rest = stderr;
+    while let Some(at) = rest.find("(os error ") {
+        let tail = &rest[at + "(os error ".len()..];
+        let digits = tail.split(')').next().unwrap_or("");
+        if let Ok(errno) = digits.parse::<i32>() {
+            if let Some(cause) = errno_hold_cause(errno) {
+                return Some(cause);
+            }
+        }
+        rest = tail;
+    }
+    None
+}
+
+/// True for a full volume or exhausted quota — the ground truth that stops
+/// intake as well as holding the job.
+pub fn out_of_space(cause: Option<&nzbd_types::HoldCause>) -> bool {
+    matches!(
+        cause,
+        Some(nzbd_types::HoldCause::Capacity | nzbd_types::HoldCause::Quota)
+    )
 }
 
 /// How long a hold release waits on a filesystem probe (custody check,
@@ -200,20 +363,8 @@ async fn bounded_probe_deadline<T: Send + 'static>(
     }
 }
 
-/// The hold cause for a failed write or filesystem step, by errno.
-pub fn io_hold_cause(msg: &str) -> nzbd_types::HoldCause {
-    if is_out_of_space(msg) {
-        if msg.to_lowercase().contains("quota") {
-            nzbd_types::HoldCause::Quota
-        } else {
-            nzbd_types::HoldCause::Capacity
-        }
-    } else if is_storage_unavailable(msg) {
-        nzbd_types::HoldCause::StorageUnavailable
-    } else {
-        nzbd_types::HoldCause::Io
-    }
-}
+/// The param a failed URL resolution carries its typed fetch cause in.
+pub const FETCH_CAUSE_PARAM: &str = "*Fetch:Cause";
 
 fn fetch_retry_state(job: &Job) -> crate::fetch::FetchRetryState {
     let value = |key: &str| {
@@ -253,6 +404,23 @@ pub enum EngineError {
     OwnershipLost,
     #[error("engine is shutting down")]
     Closed,
+    /// The owner may still apply an issued command after this deadline.
+    /// Callers must reconcile mutations rather than assume they were cancelled.
+    #[error("engine request timed out while {0}")]
+    Timeout(&'static str),
+}
+
+/// The owner cannot answer for the job yet (boot verification, journal
+/// loading or writer retirement). It answers once the queue changes.
+const EXPORT_DEFERRED: &str =
+    "job verification or writer retirement is still in progress; retry later";
+
+impl EngineError {
+    /// True for an export the owner deferred until its next queue change
+    /// (see [`EngineHandle::queue_changes`]).
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, EngineError::Lifecycle(message) if message == EXPORT_DEFERRED)
+    }
 }
 
 /// Behavioral knobs, defaulting to NZBGet's values (ARCHITECTURE.md §3.3).
@@ -276,12 +444,28 @@ pub struct Tuning {
     pub monthly_quota_bytes: u64,
     /// Day of month the monthly quota window starts (1–28).
     pub quota_start_day: u32,
-    /// Abort a download the moment its health falls below critical health
-    /// (unrepairable even with all par2): remaining segments are failed
-    /// instead of downloaded, and the job finishes as Failed — the PP
-    /// health gate then parks/deletes per `[post] health_action`. Wired
-    /// from `health_action != "none"`.
+    /// End a below-critical download immediately, canceling active writers.
+    /// Failed payload retention is a separate operator setting.
     pub health_abort: bool,
+    /// Contract §2.3: how long an environmental hold may last before the
+    /// hold-recovery task ends it `failed/hold_expired` (`[post]
+    /// hold_deadline_secs`).
+    pub hold_deadline: Duration,
+    /// The same for `password_required` holds (`[post]
+    /// password_hold_deadline_secs`).
+    pub password_hold_deadline: Duration,
+}
+
+impl Tuning {
+    /// Seconds a hold for `cause` may last before it expires.
+    pub fn hold_deadline_secs(&self, cause: &nzbd_types::HoldCause) -> i64 {
+        let deadline = if *cause == nzbd_types::HoldCause::PasswordRequired {
+            self.password_hold_deadline
+        } else {
+            self.hold_deadline
+        };
+        i64::try_from(deadline.as_secs()).unwrap_or(i64::MAX).max(1)
+    }
 }
 
 impl Default for Tuning {
@@ -299,6 +483,10 @@ impl Default for Tuning {
             monthly_quota_bytes: 0,
             quota_start_day: 1,
             health_abort: false,
+            hold_deadline: Duration::from_secs(nzbd_types::HOLD_DEADLINE_SECONDS_DEFAULT as u64),
+            password_hold_deadline: Duration::from_secs(
+                nzbd_types::PASSWORD_HOLD_DEADLINE_SECONDS_DEFAULT as u64,
+            ),
         }
     }
 }
@@ -314,12 +502,18 @@ pub struct EngineConfig {
     pub state_dir: PathBuf,
     /// Node-local lifecycle database, separate from cluster journals.
     pub artifact_dir: Option<PathBuf>,
+    /// Transform workspace root (`paths.workspace_dir`); `None` keeps the
+    /// default `<artifact/state dir>/transform-workspaces`.
+    pub workspace_dir: Option<PathBuf>,
     /// Independently enrolled inventory identity; never create a new store on mismatch.
     pub expected_installation_id: Option<String>,
     /// Completed jobs are written to `<dest_dir>/<job name>/`.
     pub dest_dir: PathBuf,
     /// Ordered configured torrent payload roots used only for removal safety.
     pub torrent_payload_roots: Vec<PathBuf>,
+    /// Configured payload roots outside `dest_dir` (completed, failed,
+    /// category destinations) reconciled at startup with the recorded ones.
+    pub payload_roots: Vec<PathBuf>,
     /// Durable terminal history. Torrent removal is not retired from the
     /// queue until this store confirms its append+fsync protocol.
     pub history: Option<Arc<nzbd_state::history::HistoryDb>>,
@@ -358,6 +552,7 @@ impl EngineConfig {
             download_enabled: true,
             state_dir,
             artifact_dir: None,
+            workspace_dir: None,
             expected_installation_id: None,
             disk_guard_roots: vec![DiskGuardRoot {
                 label: "downloads".into(),
@@ -365,6 +560,7 @@ impl EngineConfig {
             }],
             dest_dir,
             torrent_payload_roots: Vec::new(),
+            payload_roots: Vec::new(),
             history: None,
             tuning,
             max_active_downloads: None,
@@ -382,6 +578,8 @@ impl Engine {
     /// Recover state, spawn the owner task and one connection task per
     /// configured connection, and return the handle.
     pub async fn spawn(cfg: EngineConfig) -> Result<EngineHandle, EngineError> {
+        // The boot clock starts at the latest here (`nzbd run` starts it first).
+        let _ = startup_phases::boot_instant();
         let shared = new_shared_snapshot();
         let (events, _) = broadcast::channel(512);
         let (epoch_tx, epoch_rx) = watch::channel(0u64);
@@ -435,9 +633,10 @@ impl Engine {
         }
 
         let owner_heartbeat = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let owner = Owner::recover(
+        let mut owner = Owner::recover(
             &cfg.state_dir,
             cfg.artifact_dir.as_deref(),
+            cfg.workspace_dir.as_deref(),
             cfg.expected_installation_id.as_deref(),
             cfg.dest_dir.clone(),
             cfg.torrent_payload_roots.clone(),
@@ -462,6 +661,7 @@ impl Engine {
             cancel.clone(),
             owner_heartbeat.clone(),
         )?;
+        owner.configured_payload_roots = cfg.payload_roots.clone();
         // Seed the shared snapshot with recovered state synchronously, so
         // the API never serves an empty queue in the window before the
         // async run loop's first publish (UI "queue is empty" flash).
@@ -489,23 +689,27 @@ impl Engine {
         let shutdown_complete = owner.shutdown_complete.clone();
         {
             let inventory = artifacts.clone();
+            let history = cfg.history.clone();
             let stop = cancel.clone();
             tracker.spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     tokio::select! { _ = stop.cancelled() => break, _ = interval.tick() => {} }
                     let inventory = inventory.clone();
-                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || inventory.tick()).await
+                    let history = history.clone();
+                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || {
+                        inventory.tick_with_history(history.as_deref())
+                    })
+                    .await
                     {
                         tracing::error!(error = %e, "file lifecycle maintenance failed");
                     }
                 }
             });
         }
-        // Jobs recovered mid-fetch: their fetch tasks died with the old
-        // process — re-spawn one per unique URL below (once the handle
-        // exists) and fail same-URL pile-ups as duplicates.
-        let (refetch, refetch_dupes) =
+        // Preserve the one-shot legacy duplicate decision. Normal execution
+        // is reconciled from the snapshot by the URL dispatcher below.
+        let (_, refetch_dupes) =
             crate::owner::plan_url_refetches_scoped(owner.pending_url_fetches());
 
         // Multi-root free-space prober — OFF the owner loop and startup
@@ -550,6 +754,16 @@ impl Engine {
                     }
                 }
             });
+        }
+
+        // Storage throughput for the dashboard: procfs only, on its own
+        // thread, following the capacity probe's filesystems.
+        if !cfg.disk_guard_roots.is_empty() {
+            crate::disk_io::spawn_sampler(
+                owner.disk_guard_handle(),
+                &owner.disk_io_handle(),
+                cancel.clone(),
+            );
         }
 
         tracker.spawn(owner.run(engine_rx));
@@ -597,6 +811,8 @@ impl Engine {
             backend_adapter: Arc::new(std::sync::Mutex::new(Some(backend_adapter))),
             budget_tracker,
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
+            url_fetch_wakeup: Arc::new(tokio::sync::Notify::new()),
+            url_retry_kicks: Default::default(),
             hold_probes: Arc::new(Mutex::new(HashSet::new())),
             recovery_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             post_scope: None,
@@ -606,28 +822,14 @@ impl Engine {
         };
 
         // Automatic hold recovery: one task, off the owner loop, for every
-        // policy that releases without a person (docs/HELD_JOBS_PLAN.md §4.5).
+        // policy that releases without a person (docs/archive/HELD_JOBS_PLAN.md §4.5).
         handle
             .tracker
             .spawn(hold_recovery::run(handle.clone(), handle.cancel.clone()));
 
-        for (job, url) in refetch {
-            tracing::info!(job = job.0, %url, "re-spawning NZB fetch for job recovered mid-fetch");
-            // Startup verification may still own this recovered row. The
-            // fetch task reads its durable retry state once that row is ready.
-            handle.spawn_url_fetch(job, url, crate::fetch::FetchRetryState::default());
-        }
-        for (job, original) in refetch_dupes {
-            let h = handle.clone();
-            handle.tracker.spawn(async move {
-                let _ = h
-                    .fail_url_fetch(
-                        job,
-                        format!("duplicate of job #{} (same URL was re-added)", original.0),
-                    )
-                    .await;
-            });
-        }
+        handle
+            .tracker
+            .spawn(url_dispatch::run(handle.clone(), refetch_dupes));
 
         Ok(handle)
     }
@@ -699,6 +901,15 @@ pub struct PostAdmission {
     pub cancellation: CancellationToken,
 }
 
+/// Permission to resume an existing failed-source deletion. This grants no
+/// verified payload reads, download progress, repair or publication authority.
+#[derive(Clone, Debug)]
+pub struct FailedCleanupAdmission {
+    pub admission: PostAdmission,
+    pub job: nzbd_types::Job,
+    pub cleanup: nzbd_state::artifacts::FailedCleanupProof,
+}
+
 /// Cloneable handle to a running engine.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -718,6 +929,8 @@ pub struct EngineHandle {
     backend_adapter: Arc<std::sync::Mutex<Option<backend::BackendAdapterPort>>>,
     budget_tracker: Arc<pool::BudgetTracker>,
     url_fetches: Arc<Mutex<HashSet<JobId>>>,
+    url_fetch_wakeup: Arc<tokio::sync::Notify>,
+    url_retry_kicks: Arc<UrlRetryKicks>,
     hold_probes: Arc<Mutex<HashSet<JobId>>>,
     recovery_cursor: Arc<std::sync::atomic::AtomicUsize>,
     post_scope: Option<PostAdmission>,
@@ -726,16 +939,98 @@ pub struct EngineHandle {
     shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Operator "retry now" for URL jobs waiting on the NZB fetch ladder. A
+/// worker parked in a backoff wait registers its kick in `waiting`; a row
+/// whose worker exited and sits in the dispatcher's own backoff is named in
+/// `dispatch`, which the dispatcher drains on its next pass.
+#[derive(Default)]
+pub(crate) struct UrlRetryKicks {
+    waiting: Mutex<HashMap<JobId, Arc<crate::fetch::FetchKick>>>,
+    dispatch: Mutex<HashSet<JobId>>,
+}
+
+impl UrlRetryKicks {
+    fn register(&self, job: JobId) -> Arc<crate::fetch::FetchKick> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(job)
+            .or_default()
+            .clone()
+    }
+
+    fn release(&self, job: JobId) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&job);
+    }
+
+    /// Ends a ladder wait on the published `deadline`, if a worker is in it.
+    fn kick_fetch(&self, job: JobId, deadline: i64) -> bool {
+        let kick = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&job)
+            .cloned();
+        kick.is_some_and(|kick| kick.kick(deadline))
+    }
+
+    fn kick_dispatch(&self, job: JobId) {
+        self.dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job);
+    }
+
+    pub(crate) fn take_dispatch(&self) -> HashSet<JobId> {
+        std::mem::take(
+            &mut *self
+                .dispatch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
 struct UrlFetchGuard {
+    kicks: Arc<UrlRetryKicks>,
     jobs: Arc<Mutex<HashSet<JobId>>>,
     job: JobId,
+    wakeup: Arc<tokio::sync::Notify>,
+    phase: &'static str,
+    identity: Option<String>,
+    shared: SharedSnapshot,
+    cancel: CancellationToken,
 }
 
 impl Drop for UrlFetchGuard {
     fn drop(&mut self) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.remove(&self.job);
+        self.kicks.release(self.job);
+        match self.jobs.lock() {
+            Ok(mut jobs) => {
+                jobs.remove(&self.job);
+            }
+            Err(poisoned) => {
+                tracing::error!(job = self.job.0, "URL executor set poisoned during release");
+                poisoned.into_inner().remove(&self.job);
+            }
         }
+        let pending = self
+            .shared
+            .load()
+            .jobs
+            .iter()
+            .any(|job| job.id == self.job && job.status == nzbd_types::JobStatus::Fetching);
+        if pending && !self.cancel.is_cancelled() {
+            tracing::warn!(job=self.job.0, identity=?self.identity, phase=self.phase,
+                panicking=std::thread::panicking(), "URL fetch worker exited with admission still pending");
+        } else {
+            tracing::debug!(job=self.job.0, identity=?self.identity, phase=self.phase,
+                "URL fetch worker exited");
+        }
+        self.wakeup.notify_one();
     }
 }
 
@@ -765,7 +1060,30 @@ impl EngineHandle {
         let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::BeginPostAdmission { job, reply })
             .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
+    }
+
+    /// Acquire metadata-only replay permission as the current queue authority.
+    /// Worker cleanup requires a separate current-grant capability.
+    pub async fn begin_failed_cleanup_admission(
+        &self,
+        job: JobId,
+    ) -> Result<Option<FailedCleanupAdmission>, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::BeginFailedCleanupAdmission { job, reply })
+            .await?;
+        owner_reply(rx).await
+    }
+
+    pub async fn failed_cleanup_metadata(&self) -> Result<Option<nzbd_types::Job>, EngineError> {
+        let admission = self
+            .post_scope
+            .clone()
+            .ok_or_else(|| EngineError::Lifecycle("failed cleanup scope is absent".into()))?;
+        let (reply, rx) = oneshot::channel();
+        self.send(QueueCommand::FailedCleanupMetadata { admission, reply })
+            .await?;
+        owner_reply(rx).await
     }
     /// Wait for the current lifetime's verified PP custody. Queue changes
     /// wake retries; cancellation never drops an issued admission request.
@@ -809,7 +1127,17 @@ impl EngineHandle {
     pub async fn recovery_document(&self) -> Result<nzbd_state::QueueSnapshotDoc, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(QueueCommand::RecoveryDocument { reply }).await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
+    }
+    /// Queue metadata for control operations and deletion history. This does
+    /// not grant payload access or establish that downloaded bytes are valid.
+    pub async fn queue_job_metadata(&self, job: JobId) -> Result<Option<Job>, EngineError> {
+        Ok(self
+            .recovery_document()
+            .await?
+            .jobs
+            .into_iter()
+            .find(|record| record.id == job))
     }
     pub async fn remove_orphan_torrent_source(&self, job: JobId) -> Result<bool, EngineError> {
         self.roundtrip_bool(|reply| QueueCommand::RemoveOrphanTorrentSource { job, reply })
@@ -881,10 +1209,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx)
-            .await
-            .map_err(|_| EngineError::Closed)?
-            .map_err(EngineError::State)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
 
     pub async fn commit_torrent_admission(
@@ -983,10 +1308,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::CancelTorrentAdmission { job, reply: tx })
             .await?;
-        owner_reply(rx)
-            .await
-            .map_err(|_| EngineError::Closed)?
-            .map_err(EngineError::State)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
     /// Parse and enqueue an NZB. Parsing happens on the caller's task so a
     /// large or hostile NZB never stalls the queue owner.
@@ -1050,14 +1372,9 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        let (id, created) = rx.await.map_err(|_| EngineError::Closed)??;
-        if created {
-            self.spawn_url_fetch(
-                id,
-                url.to_string(),
-                crate::fetch::FetchRetryState::default(),
-            );
-        }
+        let (id, _created) = rx.await.map_err(|_| EngineError::Closed)??;
+        // Dispatch follows the owner's committed snapshot/epoch, independently
+        // of whether this caller survives to receive the admission reply.
         Ok(id)
     }
 
@@ -1073,46 +1390,82 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     /// Background NZB download for a URL job. Shutdown-aware: an in-flight
     /// fetch aborts on cancel instead of holding graceful shutdown open for
     /// up to the 60 s hop timeout.
-    fn spawn_url_fetch(&self, id: JobId, url: String, _retry_state: crate::fetch::FetchRetryState) {
-        if !self
-            .url_fetches
-            .lock()
-            .is_ok_and(|mut jobs| jobs.insert(id))
-        {
-            return;
+    fn spawn_url_fetch(&self, id: JobId) -> bool {
+        self.spawn_url_acquisition(id, None)
+    }
+
+    fn spawn_url_acquisition(&self, id: JobId, duplicate_of: Option<JobId>) -> bool {
+        let mut jobs = self.url_fetches.lock().unwrap_or_else(|poisoned| {
+            tracing::error!(job = id.0, "URL executor set poisoned during acquisition");
+            poisoned.into_inner()
+        });
+        if self.shared.load().job_disposition_fences.contains_key(&id) || !jobs.insert(id) {
+            return false;
         }
+        drop(jobs);
         let handle = self.clone();
         self.tracker.spawn(async move {
-            let _fetch_guard = UrlFetchGuard { jobs: handle.url_fetches.clone(), job: id };
+            let mut fetch_guard = UrlFetchGuard {
+                kicks: handle.url_retry_kicks.clone(),
+                jobs: handle.url_fetches.clone(), job: id,
+                wakeup: handle.url_fetch_wakeup.clone(), phase: "initial owner lookup",
+                identity: None, shared: handle.shared.clone(), cancel: handle.cancel.clone(),
+            };
+            if let Some(original) = duplicate_of {
+                fetch_guard.phase = "startup duplicate disposition";
+                if let Err(error) = handle.fail_url_fetch(id,
+                    format!("duplicate of job #{} (same URL was re-added)", original.0)).await {
+                    tracing::warn!(job=id.0, %error, "startup URL duplicate disposition interrupted");
+                }
+                return;
+            }
             let mut changes = handle.queue_changes.clone();
             let origin = loop {
                 match handle.export_job(id).await {
                     Ok(Some(origin)) => break origin,
-                    Err(EngineError::Lifecycle(message)) if message == "job verification or writer retirement is still in progress; retry later" => {
+                    Err(error) if error.is_deferred() => {
                         tokio::select! {
                             _ = handle.cancel.cancelled() => return,
                             result = changes.changed() => if result.is_err() { return; },
                         }
                     }
-                    _ => return,
+                    Ok(None) => { tracing::debug!(job=id.0, "URL admission disappeared before fetch"); return; }
+                    Err(error) => { tracing::warn!(job=id.0, %error, "URL source lookup interrupted; pending admission will retry"); return; }
                 }
+            };
+            if origin.status != nzbd_types::JobStatus::Fetching || origin.held() {
+                fetch_guard.phase = "admission resolved or held";
+                return;
+            }
+            let Some(url) = origin.params.iter().find(|(key, _)| key == "*URL")
+                .map(|(_, url)| url.clone()) else {
+                tracing::error!(job=id.0, "fetching URL admission has no source URL"); return;
             };
             let retry_state = fetch_retry_state(&origin);
             let identity = match nzbd_state::artifacts::url_source_identity(&origin) { Ok(identity) => identity, Err(_) => return };
+            fetch_guard.identity = Some(identity.clone());
+            fetch_guard.phase = "cached source read";
             let mut storage_retry = nzbd_state::artifacts::UrlStorageRetry::default();
             let retry_store = handle.url_resolutions.clone(); let retry_id = identity.clone();
             if let Ok(Ok(Some(retry))) = tokio::task::spawn_blocking(move || retry_store.retry(&retry_id)).await {
                 let seconds = retry.next_retry_at.saturating_sub(url_retry_now()).max(0) as u64;
                 storage_retry = retry;
-                tokio::select! { _ = handle.cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(seconds)) => {} }
+                tokio::select! {
+                    _ = handle.cancel.cancelled() => return,
+                    _ = handle.wait_disposition_fence(id) => return,
+                    _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                }
             }
             let mut failure = None;
+            // Contract §2.2: the fetcher types its own failure. A local
+            // storage refusal of the cached source has no fetch cause.
+            let mut fetch_cause: Option<nzbd_types::FetchCause> = None;
             let mut received = loop {
                 let store = handle.url_resolutions.clone(); let cached_origin = origin.clone();
                 match tokio::task::spawn_blocking(move || store.source(&cached_origin)).await {
@@ -1125,9 +1478,12 @@ impl EngineHandle {
                 }
             };
             if received.is_none() && failure.is_none() {
+                fetch_guard.phase = "HTTP acquisition";
                 let mut events = handle.subscribe();
+                let kick = handle.url_retry_kicks.register(id);
                 let fetched = tokio::select! {
                     _ = handle.cancel.cancelled() => return,
+                    _ = handle.wait_disposition_fence(id) => return,
                     _ = async {
                         loop { match events.recv().await {
                             Ok(Event::JobDeleted { job }) if job == id => break,
@@ -1143,25 +1499,42 @@ impl EngineHandle {
                             let handle = progress_handle.clone(); let origin = progress_origin.clone(); let identity = progress_identity.clone();
                             async move {
                                 let mut retry = nzbd_state::artifacts::UrlStorageRetry::default();
+                                let mut coordination_attempt = 0;
                                 loop {
                                     if handle.cancel.is_cancelled() { return false; }
                                     match handle.record_url_fetch_progress(id, progress.clone()).await {
                                         Ok(active) => return active,
                                         Err(EngineError::OwnershipLost | EngineError::Closed) => return false,
+                                        Err(error @ EngineError::Timeout(_)) => {
+                                            if !handle.wait_url_coordination_retry(id, &error, coordination_attempt).await { return false; }
+                                            coordination_attempt = coordination_attempt.saturating_add(1);
+                                        }
                                         Err(error) => if !handle.wait_url_storage_retry_after(&origin, &identity, &error.to_string(), &mut retry, progress.next_retry_at).await { return false; },
                                     }
                                 }
                             }
                         }
-                    }) => result,
+                    }, kick) => result,
                 };
                 match fetched {
                     Ok(bytes) => received = Some(bytes),
                     Err(crate::fetch::FetchError::Cancelled) => return,
-                    Err(error) => failure = Some(error.to_string()),
+                    Err(error) => {
+                        fetch_cause = Some(crate::fetch::cause_of(&error));
+                        failure = Some(error.to_string());
+                    }
                 }
             }
+            // An NZB larger than the durable cache accepts is the indexer
+            // item itself being unusable: `fetch{gone}`, typed here rather
+            // than read back from the cache's conflict message.
+            if received.as_ref().is_some_and(|bytes| bytes.len() > nzbd_state::artifacts::MAX_URL_SOURCE_BYTES) {
+                fetch_cause = Some(nzbd_types::FetchCause::Gone);
+                failure = Some("fetched NZB exceeds supported durable size".into());
+                received = None;
+            }
             if let Some(mut bytes) = received {
+                fetch_guard.phase = "source cache publication";
                 loop {
                     let store = handle.url_resolutions.clone(); let source_origin = origin.clone();
                     // Move the one received buffer through storage retries;
@@ -1170,7 +1543,9 @@ impl EngineHandle {
                     match tokio::task::spawn_blocking(move || { let result = store.cache_source(&source_origin, &candidate); (result, candidate) }).await {
                         Ok((Ok(_), _)) => break,
                         Ok((Err(nzbd_state::artifacts::Error::NotFound), _)) => return,
-                        Ok((Err(nzbd_state::artifacts::Error::Conflict(message)), _)) => { failure = Some(message); break; }
+                        // Any other cache refusal is local (a missing source
+                        // param, the writer lock): never the release's fault,
+                        // so it takes the storage-retry lane with its deadline.
                         Ok((Err(error), retained)) => {
                             bytes = retained;
                             if !handle.wait_url_storage_retry(&origin, &identity, &error.to_string(), &mut storage_retry).await { return; }
@@ -1179,18 +1554,28 @@ impl EngineHandle {
                     }
                 }
             }
+            let mut coordination_attempt = 0;
             loop {
                 if handle.cancel.is_cancelled() { return; }
-                let prepared = match handle.prepare_url_resolution(&origin, failure.clone()).await {
+                fetch_guard.phase = "resolution preparation";
+                let prepared = match handle.prepare_url_resolution(&origin, failure.clone(), fetch_cause).await {
                     Ok(prepared) => prepared,
                     Err(EngineError::OwnershipLost | EngineError::Closed) => return,
+                    Err(error @ EngineError::Timeout(_)) => {
+                        if !handle.wait_url_coordination_retry(id, &error, coordination_attempt).await { return; }
+                        coordination_attempt = coordination_attempt.saturating_add(1);
+                        continue;
+                    }
                     Err(EngineError::Lifecycle(message)) => {
                         // Size/identity/parse constraints are permanent for this
                         // input. Persist an actionable failed disposition once.
                         if failure.as_deref() == Some(&message) {
-                            let _ = handle.hold_job(id, nzbd_types::HoldCause::IdentityConflict, "url_fetch", &message).await;
-                            tracing::error!(job=id.0, %message, "URL source retained for review"); return;
+                            // The indexer's item itself is unusable (size,
+                            // identity or parse): a `fetch{gone}` terminal.
+                            let _ = handle.fail_job(id, nzbd_types::FailureReason::Fetch, Some(nzbd_types::FetchCause::Gone), "fetch", &message).await;
+                            tracing::error!(job=id.0, %message, "URL source is unusable; job failed"); return;
                         }
+                        fetch_cause = Some(nzbd_types::FetchCause::Gone);
                         failure = Some(message); continue;
                     }
                     Err(error) => {
@@ -1199,10 +1584,18 @@ impl EngineHandle {
                     }
                 };
                 let (tx, rx) = oneshot::channel();
-                if handle.send(QueueCommand::CompleteUrlFetch { job: id, source_identity: identity.clone(), prepared: Box::new(prepared), reply: tx }).await.is_err() { return; }
+                fetch_guard.phase = "resolution enqueue";
+                if let Err(error) = handle.send(QueueCommand::CompleteUrlFetch { job: id, source_identity: identity.clone(), prepared: Box::new(prepared), reply: tx }).await {
+                    tracing::warn!(job=id.0, identity=%identity, %error, "URL resolution enqueue interrupted; cached source retained for retry");
+                    return;
+                }
+                fetch_guard.phase = "resolution acknowledgement";
+                // This is an issued mutation, not a disposable read. Receive
+                // its actual result so retry never overlaps a pending commit.
                 match rx.await {
                     Ok(Ok(true)) => {
                         if !handle.url_outbox_external {
+                            fetch_guard.phase = "outbox compaction";
                             loop {
                                 let store = handle.url_resolutions.clone(); let acknowledgement = identity.clone();
                                 match tokio::task::spawn_blocking(move || store.acknowledge(&acknowledgement)).await {
@@ -1218,6 +1611,32 @@ impl EngineHandle {
                 }
             }
         });
+        true
+    }
+
+    async fn wait_disposition_fence(&self, job: JobId) {
+        let mut changes = self.queue_changes.clone();
+        while !self.shared.load().job_disposition_fences.contains_key(&job) {
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn wait_url_coordination_retry(
+        &self,
+        job: JobId,
+        error: &EngineError,
+        attempt: u32,
+    ) -> bool {
+        let delay = url_dispatch::retry_delay(attempt);
+        tracing::warn!(job=job.0, %error, delay_secs=delay.as_secs(),
+            "URL coordination interrupted; retrying without a storage failure");
+        tokio::select! {
+            _ = self.cancel.cancelled() => false,
+            _ = self.wait_disposition_fence(job) => false,
+            _ = tokio::time::sleep(delay) => true,
+        }
     }
 
     async fn wait_url_storage_retry(
@@ -1291,13 +1710,18 @@ impl EngineHandle {
             return false;
         }
         let seconds = retry.next_retry_at.saturating_sub(url_retry_now()).max(0) as u64;
-        tokio::select! { _ = self.cancel.cancelled() => false, _ = tokio::time::sleep(Duration::from_secs(seconds)) => true }
+        tokio::select! {
+            _ = self.cancel.cancelled() => false,
+            _ = self.wait_disposition_fence(origin.id) => false,
+            _ = tokio::time::sleep(Duration::from_secs(seconds)) => true,
+        }
     }
 
     async fn prepare_url_resolution(
         &self,
         origin: &Job,
         failure: Option<String>,
+        fetch_cause: Option<nzbd_types::FetchCause>,
     ) -> Result<nzbd_state::artifacts::UrlResolutionRecord, EngineError> {
         let store = self.url_resolutions.clone();
         let source_origin = origin.clone();
@@ -1383,7 +1807,10 @@ impl EngineHandle {
                 }
                 Err(error) => {
                     staging.jobs[0].status = nzbd_types::JobStatus::Failed;
-                    staging.jobs[0].params.extend([("Failure:Stage".into(), "url_fetch".into()), ("Failure:Reason".into(), error.chars().take(2048).collect())]);
+                    staging.jobs[0].params.extend([("Failure:Stage".into(), "fetch".into()), ("Failure:Reason".into(), error.chars().take(2048).collect())]);
+                    if let Some(cause) = fetch_cause {
+                        staging.jobs[0].params.push((FETCH_CAUSE_PARAM.into(), cause.as_str().into()));
+                    }
                 }
             }
             store.stage(&origin, &staging.jobs[0])
@@ -1428,17 +1855,65 @@ impl EngineHandle {
     /// job remains `Fetching`, and the control adapter revision-checks the
     /// single winning resolution.
     pub async fn resume_url_fetches(&self) -> Result<(), EngineError> {
-        for summary in &self.snapshot().jobs {
-            if summary.status != nzbd_types::JobStatus::Fetching {
-                continue;
-            }
-            if let Some(job) = self.export_job(summary.id).await? {
-                if let Some((_, url)) = job.params.iter().find(|(key, _)| key == "*URL") {
-                    self.spawn_url_fetch(job.id, url.clone(), fetch_retry_state(&job));
-                }
-            }
-        }
+        // A single slow row must not prevent the remaining rows from resuming.
+        // The dispatcher reads the local snapshot without owner round trips.
+        self.url_fetch_wakeup.notify_one();
         Ok(())
+    }
+
+    /// Operator "retry now" for a URL job still fetching its NZB: ends the
+    /// current backoff wait (fetch ladder or dispatcher) so the request goes
+    /// out at once. A repeat refusal continues up the ladder. `false` when
+    /// nothing would happen: not a fetching URL job, held (its retry is the
+    /// hold release), a request already in flight, or no queue authority on
+    /// this node.
+    pub fn retry_url_fetch_now(&self, job: JobId) -> bool {
+        let snapshot = self.shared.load();
+        let Some(row) = snapshot.jobs.iter().find(|row| {
+            row.id == job
+                && row.kind == nzbd_types::JobKind::Url
+                && row.status == nzbd_types::JobStatus::Fetching
+        }) else {
+            return false;
+        };
+        let held = row
+            .control
+            .as_ref()
+            .is_some_and(|control| control.lifecycle == "held" || control.version != 1);
+        // The dispatcher's own authority test: without it nothing fetches.
+        let authority = !self.url_outbox_external
+            || (snapshot.queue_authority
+                && self
+                    .owner_persist_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard()));
+        if held || !authority {
+            return false;
+        }
+        let deadline = row
+            .url_fetch
+            .as_ref()
+            .and_then(|retry| retry.next_retry_at_unix);
+        let has_worker = self
+            .url_fetches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&job);
+        let retried = if has_worker {
+            deadline.is_some_and(|deadline| self.url_retry_kicks.kick_fetch(job, deadline))
+        } else {
+            // No worker: the row is in (or about to enter) the dispatcher's
+            // backoff, which the dispatcher clears on its next pass.
+            self.url_retry_kicks.kick_dispatch(job);
+            self.url_fetch_wakeup.notify_one();
+            true
+        };
+        tracing::info!(
+            job = job.0,
+            retried,
+            "operator requested an immediate NZB fetch retry"
+        );
+        retried
     }
 
     async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {
@@ -1447,7 +1922,9 @@ impl EngineHandle {
         };
         let source_identity = nzbd_state::artifacts::url_source_identity(&origin)
             .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
-        let prepared = self.prepare_url_resolution(&origin, Some(error)).await?;
+        let prepared = self
+            .prepare_url_resolution(&origin, Some(error), None)
+            .await?;
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::CompleteUrlFetch {
             job,
@@ -1498,10 +1975,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx)
-            .await
-            .map_err(|_| EngineError::Closed)?
-            .map_err(EngineError::State)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
 
     pub async fn pause_job(&self, job: JobId) -> Result<bool, EngineError> {
@@ -1638,7 +2112,13 @@ impl EngineHandle {
                 .ok_or_else(|| "the allocation hold could not be released".to_string()));
         }
         if cause.is_storage() && !control.post_side() {
-            if by == RetryBy::Recovery && self.snapshot().disk_low {
+            // W5a: a finalize that ran out of space is retried by its own
+            // job while the latch holds — that retry is the evidence.
+            let snapshot = self.snapshot();
+            if by == RetryBy::Recovery
+                && snapshot.disk_low
+                && !snapshot.space_retry_jobs.contains(&job)
+            {
                 return Ok(Err("waiting for free space".into()));
             }
             return self
@@ -1690,7 +2170,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     /// Capacity/quota release: the owner's probe backoff, then an admission
@@ -1762,6 +2242,130 @@ impl EngineHandle {
         hold_recovery::pass(self, true).await
     }
 
+    /// Atomically freeze the exact worker control before reporting expiry.
+    /// The local checkpoint survives restart; a changed or revoked grant
+    /// cannot select a terminal. No payload IO or ownership upgrade occurs.
+    pub async fn prepare_worker_hold_expiry(
+        &self,
+        job: JobId,
+        revision: String,
+        notice: String,
+        authority: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<bool, EngineError> {
+        if !authority() {
+            return Ok(false);
+        }
+        let Some(record) = self.queue_job_metadata(job).await? else {
+            return Ok(false);
+        };
+        let source = self
+            .artifacts()
+            .for_job(job.0)
+            .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
+        let guard =
+            hold_release::HoldReleaseGuard::prepare(&record, source.as_ref(), Some(authority));
+        self.roundtrip_bool(|reply| QueueCommand::PrepareWorkerHoldExpiry {
+            job,
+            revision,
+            notice,
+            guard,
+            reply,
+        })
+        .await
+    }
+
+    /// Contract §2.3: end a hold that passed its deadline as
+    /// `failed/hold_expired`. False when the hold changed or is not due.
+    pub async fn expire_hold(&self, job: JobId, revision: String) -> Result<bool, EngineError> {
+        self.roundtrip_bool(|reply| QueueCommand::ExpireHold {
+            job,
+            revision,
+            reply,
+        })
+        .await
+    }
+
+    /// End `job` as `failed/<reason>` (contract §2.2): the terminal record,
+    /// history, markers and `job_pp_finished` in that order. False when the
+    /// job is gone, already terminal, or its terminal is already in flight.
+    pub async fn fail_job(
+        &self,
+        job: JobId,
+        reason: nzbd_types::FailureReason,
+        fetch_cause: Option<nzbd_types::FetchCause>,
+        stage: &str,
+        message: &str,
+    ) -> Result<bool, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::FailJob {
+            job,
+            reason,
+            fetch_cause,
+            stage: stage.into(),
+            message: message.into(),
+            reply: tx,
+        })
+        .await?;
+        Ok(terminal_reply(rx).await?.is_some())
+    }
+
+    /// Record a terminal a producer outside the owner built (post-processing
+    /// success and failure, the operator delete). Returns the row once the
+    /// event has been emitted, or `None` when any step did not land (the row
+    /// is replayed).
+    pub async fn record_terminal(
+        &self,
+        terminal: nzbd_state::artifacts::JobTerminal,
+    ) -> Result<Option<nzbd_state::artifacts::JobTerminal>, EngineError> {
+        self.record_terminal_in(terminal, None).await
+    }
+
+    /// [`EngineHandle::record_terminal`] writing history to the producer's
+    /// own store (post-processing is handed one; in the daemon it is the
+    /// engine's).
+    pub async fn record_terminal_in(
+        &self,
+        terminal: nzbd_state::artifacts::JobTerminal,
+        history: Option<Arc<nzbd_state::history::HistoryDb>>,
+    ) -> Result<Option<nzbd_state::artifacts::JobTerminal>, EngineError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(QueueCommand::RecordTerminal {
+            terminal: Box::new(terminal),
+            history: history.map(TerminalHistory),
+            reply: tx,
+        })
+        .await?;
+        terminal_reply(rx).await
+    }
+
+    /// Replay unfinished terminal rows now (boot and the tick also do).
+    pub async fn replay_terminals(&self) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::ReplayTerminals { reply })
+            .await
+    }
+
+    /// Announce a salvage publication (contract §2.2). Not a terminal.
+    pub fn emit_publication_ready(&self, job: JobId, publication: nzbd_types::Publication) {
+        let transfer = self
+            .snapshot()
+            .jobs
+            .iter()
+            .find(|row| row.id == job)
+            .and_then(|row| row.transfer.clone())
+            .or_else(|| {
+                self.artifacts()
+                    .terminal(job.0)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.transfer)
+            });
+        self.emit(Event::JobPublicationReady {
+            job,
+            transfer,
+            publication,
+        });
+    }
+
     /// Move an automatic hold's next attempt out, recording why.
     pub async fn reschedule_hold(
         &self,
@@ -1823,7 +2427,35 @@ impl EngineHandle {
         .await
     }
 
+    pub async fn advance_job_disposition(
+        &self,
+        job: JobId,
+        request: nzbd_state::artifacts::JobDispositionRequest,
+        native_joined: bool,
+    ) -> Result<nzbd_state::artifacts::JobDisposition, EngineError> {
+        let url_joined = !self
+            .url_fetches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&job);
+        let (reply, result) = oneshot::channel();
+        self.send(QueueCommand::AdvanceJobDisposition {
+            job,
+            request,
+            native_joined,
+            url_joined,
+            reply,
+        })
+        .await?;
+        owner_reply(result).await?
+    }
+
     pub async fn delete_job(&self, job: JobId, delete_files: bool) -> Result<bool, EngineError> {
+        if self.shared.load().job_disposition_fences.contains_key(&job) {
+            return Err(EngineError::Lifecycle(
+                "exact job disposition already owns this source".into(),
+            ));
+        }
         let torrent = self
             .snapshot()
             .jobs
@@ -1831,7 +2463,7 @@ impl EngineHandle {
             .find(|j| j.id == job)
             .is_some_and(|j| j.torrent_role == Some("seed"));
         let native = self
-            .export_job(job)
+            .queue_job_metadata(job)
             .await?
             .filter(torrent_acquisitions::is_acquisition);
         if native.is_some()
@@ -2005,9 +2637,59 @@ impl EngineHandle {
             .await
     }
 
+    /// Recheck disk-full failures without changing either lane's pause state.
+    pub async fn retry_storage(&self) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::RetryStorage { reply })
+            .await?;
+        let snapshot = self.snapshot();
+        let mut retries = tokio::task::JoinSet::new();
+        for job in snapshot
+            .jobs
+            .iter()
+            .filter(|job| job.assigned_node.is_none())
+        {
+            let Some(control) = job.control.as_ref().filter(|control| {
+                control.lifecycle == "held"
+                    && !control.manual_pause
+                    && (control.hold_cause().is_storage()
+                        || control.hold_cause() == nzbd_types::HoldCause::StorageUnavailable)
+            }) else {
+                continue;
+            };
+            let handle = self.clone();
+            let (id, revision) = (job.id, control.revision.clone());
+            retries
+                .spawn(async move { handle.release_hold(id, revision, RetryBy::Operator).await });
+            if retries.len() >= 8 {
+                break;
+            }
+        }
+        while let Some(result) = retries.join_next().await {
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(reason))) => tracing::info!(%reason, "storage retry remains held"),
+                Ok(Err(error)) => return Err(error),
+                Err(error) => tracing::warn!(%error, "storage retry task stopped"),
+            }
+        }
+        Ok(())
+    }
+
     pub async fn resume_all(&self, source: &str) -> Result<(), EngineError> {
         let source = source.to_string();
         self.roundtrip_unit(|reply| QueueCommand::ResumeAll { source, reply })
+            .await
+    }
+
+    pub async fn pause_post(&self, source: &str) -> Result<(), EngineError> {
+        let source = source.to_string();
+        self.roundtrip_unit(|reply| QueueCommand::PausePost { source, reply })
+            .await
+    }
+
+    pub async fn resume_post(&self, source: &str) -> Result<(), EngineError> {
+        let source = source.to_string();
+        self.roundtrip_unit(|reply| QueueCommand::ResumePost { source, reply })
             .await
     }
 
@@ -2036,7 +2718,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::SetMaxActiveDownloads { n, reply: tx })
             .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     // -- cluster operations (used by nzbd-cluster; harmless elsewhere) ------
@@ -2217,17 +2899,26 @@ impl EngineHandle {
         self.send(QueueCommand::ExportJob { job, reply: tx })
             .await?;
         let result = owner_reply(rx).await?.map(|job| *job);
-        if result.is_none()
-            && self
-                .recovery_document()
-                .await?
-                .jobs
-                .iter()
-                .any(|record| record.id == job)
-        {
-            return Err(EngineError::Lifecycle(
-                "job verification or writer retirement is still in progress; retry later".into(),
-            ));
+        if result.is_none() {
+            // Cleanup scopes deliberately cannot read the full recovery
+            // document. Their explicit metadata capability still distinguishes
+            // a fenced row from an absent job without granting payload export.
+            let cleanup_exists = if self.post_scope.is_some() {
+                self.failed_cleanup_metadata().await?.is_some()
+            } else {
+                false
+            };
+            let exists = cleanup_exists
+                || self
+                    .recovery_document()
+                    .await?
+                    .jobs
+                    .iter()
+                    .any(|record| record.id == job);
+            if !exists {
+                return Ok(None);
+            }
+            return Err(EngineError::Lifecycle(EXPORT_DEFERRED.into()));
         }
         Ok(result)
     }
@@ -2292,7 +2983,7 @@ impl EngineHandle {
         }
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
             job,
-            accepted_context: None,
+            retirement: None,
             reply,
         })
         .await
@@ -2306,9 +2997,31 @@ impl EngineHandle {
         job: JobId,
         context: nzbd_state::artifacts::WorkerControlContext,
     ) -> Result<bool, EngineError> {
+        if self.post_scope.is_some() {
+            return Ok(false);
+        }
         self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
             job,
-            accepted_context: Some(context),
+            retirement: Some(owner::WorkerRetirement::Accepted(context)),
+            reply,
+        })
+        .await
+    }
+
+    /// Revoke only the exact imported worker grant after its execution has
+    /// stopped. Shared resume journals survive expiry/cancellation; same-ID
+    /// successors remain protected through the durable retirement barrier.
+    pub async fn retire_worker_job(
+        &self,
+        job: JobId,
+        context: nzbd_state::artifacts::WorkerControlContext,
+    ) -> Result<bool, EngineError> {
+        if self.post_scope.is_some() {
+            return Ok(false);
+        }
+        self.roundtrip_bool(|reply| QueueCommand::RemoveJobSilent {
+            job,
+            retirement: Some(owner::WorkerRetirement::Revoked(context)),
             reply,
         })
         .await
@@ -2385,7 +3098,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::SetServerConnectionCaps { caps, reply: tx })
             .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     /// Become the queue authority (cluster leader took office).
@@ -2393,10 +3106,7 @@ impl EngineHandle {
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::AdoptAuthority { reply: tx })
             .await?;
-        owner_reply(rx)
-            .await
-            .map_err(|_| EngineError::Closed)?
-            .map_err(EngineError::State)
+        owner_reply(rx).await?.map_err(EngineError::State)
     }
 
     pub async fn adopt_replicated_authority(
@@ -2431,30 +3141,7 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
-    }
-
-    /// Persist an automatic retry schedule only while the observed hold still owns this job.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn schedule_post_retry(
-        &self,
-        job: JobId,
-        revision: String,
-        retry_attempt: u8,
-        next_retry: i64,
-        blocked_since: i64,
-        message: String,
-    ) -> Result<bool, EngineError> {
-        self.roundtrip_bool(|reply| QueueCommand::SchedulePostRetry {
-            job,
-            revision,
-            retry_attempt,
-            next_retry,
-            blocked_since,
-            message,
-            reply,
-        })
-        .await
+        owner_reply(rx).await
     }
 
     /// Operator retry from post-processing's own surfaces (restart, Retry):
@@ -2550,7 +3237,13 @@ impl EngineHandle {
             reply: tx,
         })
         .await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
+    }
+
+    /// Changes whenever the owner's queue state changes: the wake for a
+    /// caller whose request the owner deferred ([`EngineError::is_deferred`]).
+    pub fn queue_changes(&self) -> watch::Receiver<u64> {
+        self.queue_changes.clone()
     }
 
     /// Lock-free snapshot of the queue (never blocks the engine).
@@ -2578,6 +3271,35 @@ impl EngineHandle {
     pub fn report_out_of_space(&self, whence: impl Into<String>) {
         let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
             whence: whence.into(),
+            dir: None,
+            job: None,
+        });
+    }
+
+    /// [`Self::report_out_of_space`] with the path whose write failed, for an
+    /// unattributed write: the latch clears only after probe writes succeed
+    /// in that directory (W5a).
+    pub fn report_out_of_space_at(&self, whence: impl Into<String>, path: &std::path::Path) {
+        let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
+            whence: whence.into(),
+            dir: Some(crate::space_probe::dir_of(path)),
+            job: None,
+        });
+    }
+
+    /// A post-processing write for `job` ran out of space. That job's own
+    /// retry is the evidence that clears it (W5a): the failure clears when
+    /// the job's terminal lands or the job leaves the queue.
+    pub fn report_out_of_space_for(
+        &self,
+        job: JobId,
+        whence: impl Into<String>,
+        path: Option<&std::path::Path>,
+    ) {
+        let _ = self.cmd_tx.try_send(EngineMsg::OutOfSpace {
+            whence: whence.into(),
+            dir: path.map(crate::space_probe::dir_of),
+            job: Some(job),
         });
     }
 
@@ -2621,7 +3343,7 @@ impl EngineHandle {
             self.cmd_tx.send(self.command_message(cmd)),
         )
         .await
-        .map_err(|_| EngineError::Closed)?
+        .map_err(|_| EngineError::Timeout("waiting to enqueue a command"))?
         .map_err(|_| EngineError::Closed)
     }
 
@@ -2631,7 +3353,7 @@ impl EngineHandle {
     ) -> Result<bool, EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(make(tx)).await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
 
     async fn roundtrip_unit(
@@ -2640,8 +3362,25 @@ impl EngineHandle {
     ) -> Result<(), EngineError> {
         let (tx, rx) = oneshot::channel();
         self.send(make(tx)).await?;
-        owner_reply(rx).await.map_err(|_| EngineError::Closed)
+        owner_reply(rx).await
     }
+}
+
+/// A producer's own history store, carried on a terminal command.
+pub struct TerminalHistory(pub Arc<nzbd_state::history::HistoryDb>);
+
+impl std::fmt::Debug for TerminalHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TerminalHistory")
+    }
+}
+
+/// A terminal chain can wait on two durable writes and a snapshot commit;
+/// bound the wait like any other control reply.
+async fn terminal_reply(
+    rx: oneshot::Receiver<Option<nzbd_state::artifacts::JobTerminal>>,
+) -> Result<Option<nzbd_state::artifacts::JobTerminal>, EngineError> {
+    owner_reply(rx).await
 }
 
 /// Bound control-plane waits independently of a storage worker's lifetime.
@@ -2649,7 +3388,7 @@ impl EngineHandle {
 async fn owner_reply<T>(reply: oneshot::Receiver<T>) -> Result<T, EngineError> {
     tokio::time::timeout(Duration::from_secs(10), reply)
         .await
-        .map_err(|_| EngineError::Closed)?
+        .map_err(|_| EngineError::Timeout("waiting for the owner reply"))?
         .map_err(|_| EngineError::Closed)
 }
 
@@ -2693,6 +3432,73 @@ fn validate_torrent_tags(tags: &[String]) -> Result<(), EngineError> {
 }
 
 #[cfg(test)]
+mod owner_deadline_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn owner_reply_distinguishes_timeout_from_closed_channel() {
+        let (reply, rx) = oneshot::channel::<bool>();
+        let error = owner_reply(rx).await.unwrap_err();
+        assert!(matches!(error, EngineError::Timeout(_)));
+        assert!(error.to_string().contains("timed out"));
+        assert!(!error.to_string().contains("shutting down"));
+        assert!(
+            reply.send(true).is_err(),
+            "a late reply is not an acknowledgement"
+        );
+
+        let (reply, rx) = oneshot::channel::<bool>();
+        drop(reply);
+        assert!(matches!(owner_reply(rx).await, Err(EngineError::Closed)));
+
+        let (reply, rx) = oneshot::channel();
+        reply.send(true).unwrap();
+        assert!(owner_reply(rx).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn public_requests_preserve_enqueue_and_reply_deadlines() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut handle = Engine::spawn(EngineConfig::single_node(
+            vec![],
+            temp.path().join("state"),
+            temp.path().join("dest"),
+            Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        assert!(handle.shutdown().await);
+        tokio::time::pause();
+        for full in [false, true] {
+            let (sender, receiver) = mpsc::channel(1);
+            handle.cmd_tx = sender;
+            if full {
+                let (reply, _rx) = oneshot::channel();
+                assert!(handle
+                    .cmd_tx
+                    .send(handle.command_message(QueueCommand::ExportJob {
+                        job: JobId(1),
+                        reply,
+                    }))
+                    .await
+                    .is_ok());
+            }
+            let error = handle.adopt_authority().await.unwrap_err();
+            assert!(matches!(error, EngineError::Timeout(_)), "{error}");
+            assert!(error
+                .to_string()
+                .contains(if full { "enqueue" } else { "owner reply" }));
+            drop(receiver);
+            assert!(matches!(
+                handle.adopt_authority().await,
+                Err(EngineError::Closed)
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 mod hold_probe_tests {
     use super::*;
     #[tokio::test]
@@ -2722,12 +3528,15 @@ mod hold_probe_tests {
         tokio::task::spawn_blocking(move || gate.wait())
             .await
             .unwrap();
-        for _ in 0..100 {
-            if probes.lock().unwrap().is_empty() {
-                break;
+        // The barrier partner can return before the original blocking task
+        // drops its lease. Await that actual release, not a count of yields.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !probes.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("finished blocking probe must release its singleflight lease");
         assert!(timeout.is_err());
         assert!(second.unwrap_err().contains("previous probe"));
         assert!(probes.lock().unwrap().is_empty());
@@ -2742,54 +3551,184 @@ mod hold_probe_tests {
 #[cfg(test)]
 mod out_of_space_tests {
     use super::*;
+    use nzbd_types::HoldCause;
+
+    const UNAVAILABLE: &[i32] = &[
+        libc::EIO,
+        libc::ENXIO,
+        libc::EAGAIN,
+        libc::ENODEV,
+        libc::ENOLINK,
+        libc::ECONNABORTED,
+        libc::ECONNRESET,
+        libc::ENOTCONN,
+        libc::ETIMEDOUT,
+        libc::ECONNREFUSED,
+        libc::EHOSTDOWN,
+        libc::EHOSTUNREACH,
+        libc::ENETDOWN,
+        libc::ENETUNREACH,
+        libc::ESTALE,
+        libc::EROFS,
+        #[cfg(target_os = "linux")]
+        libc::EREMOTEIO,
+    ];
 
     #[test]
-    fn storage_unavailable_matches_dropped_volumes_by_errno_only() {
-        for n in [
-            5, 6, 11, 19, 67, 103, 104, 107, 110, 111, 112, 113, 116, 121,
-        ] {
-            let msg = format!("write /processing/x.part: whatever (os error {n})");
-            assert!(is_storage_unavailable(&msg), "{msg}");
+    fn io_errors_are_classified_by_errno_not_by_message() {
+        for &errno in UNAVAILABLE {
+            let error = std::io::Error::from_raw_os_error(errno);
             assert_eq!(
-                io_hold_cause(&msg),
-                nzbd_types::HoldCause::StorageUnavailable
+                io_error_hold_cause(&error),
+                Some(HoldCause::StorageUnavailable),
+                "{error}"
+            );
+        }
+        let full = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        assert_eq!(io_error_hold_cause(&full), Some(HoldCause::Capacity));
+        let quota = std::io::Error::from_raw_os_error(libc::EDQUOT);
+        assert_eq!(io_error_hold_cause(&quota), Some(HoldCause::Quota));
+        for errno in [
+            libc::EACCES,
+            libc::ENOENT,
+            libc::EPERM,
+            libc::EINVAL,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+        ] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(io_error_hold_cause(&error), None, "{error} is failed/io");
+        }
+        // A message that reads like a full disk is not one.
+        let lying = std::io::Error::other("No space left on device (os error 28)");
+        assert_eq!(io_error_hold_cause(&lying), None);
+        // A kind without an errno, and an errno wrapped in a custom error.
+        let kind = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        assert_eq!(io_error_hold_cause(&kind), Some(HoldCause::Capacity));
+        // An error rebuilt from its kind (the errno is gone) holds by kind.
+        // (`EIO` & co. map to no kind of their own: only `source()` carries
+        // them, which is why storage paths keep the original error.)
+        for errno in [
+            libc::ESTALE,
+            libc::ENOTCONN,
+            libc::ETIMEDOUT,
+            libc::ECONNRESET,
+            libc::ECONNABORTED,
+            libc::ECONNREFUSED,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::ENETDOWN,
+            libc::EAGAIN,
+            libc::EROFS,
+        ] {
+            let original = std::io::Error::from_raw_os_error(errno);
+            let rebuilt = std::io::Error::new(original.kind(), "context");
+            assert_eq!(
+                io_error_hold_cause(&rebuilt),
+                Some(HoldCause::StorageUnavailable),
+                "{original} rebuilt as {:?}",
+                original.kind()
+            );
+        }
+        let wrapped = std::io::Error::other(std::io::Error::from_raw_os_error(libc::ESTALE));
+        assert_eq!(
+            io_error_hold_cause(&wrapped),
+            Some(HoldCause::StorageUnavailable)
+        );
+    }
+
+    #[test]
+    fn error_chains_reach_the_io_error_and_sqlite_codes() {
+        let state = nzbd_state::StateError::Io {
+            op: "write",
+            path: "/processing/x.part".into(),
+            source: std::io::Error::from_raw_os_error(libc::ENOSPC),
+        };
+        assert_eq!(error_hold_cause(&state), Some(HoldCause::Capacity));
+        let artifact =
+            nzbd_state::artifacts::Error::Io(std::io::Error::from_raw_os_error(libc::ENOTCONN));
+        assert_eq!(
+            error_hold_cause(&artifact),
+            Some(HoldCause::StorageUnavailable)
+        );
+        let sqlite = |code| {
+            nzbd_state::artifacts::Error::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+        };
+        assert_eq!(
+            error_hold_cause(&sqlite(rusqlite::ffi::SQLITE_FULL)),
+            Some(HoldCause::Capacity)
+        );
+        assert_eq!(
+            error_hold_cause(&sqlite(rusqlite::ffi::SQLITE_IOERR)),
+            Some(HoldCause::StorageUnavailable)
+        );
+        assert_eq!(
+            error_hold_cause(&sqlite(rusqlite::ffi::SQLITE_CONSTRAINT)),
+            None
+        );
+        let conflict =
+            nzbd_state::artifacts::Error::Conflict("payload (os error 28) no space left".into());
+        assert_eq!(error_hold_cause(&conflict), None, "messages are never read");
+    }
+
+    /// Every shape a subprocess prints a full or dropped volume in.
+    #[test]
+    fn stderr_is_read_for_the_errno_suffix_and_the_libc_wording() {
+        assert_eq!(
+            stderr_hold_cause("No space left on device (os error 28)"),
+            Some(HoldCause::Capacity)
+        );
+        assert_eq!(
+            stderr_hold_cause(
+                "write /working/monarr/completed/x.part05.rar.part: no storage space"
+            ),
+            Some(HoldCause::Capacity)
+        );
+        assert_eq!(
+            stderr_hold_cause("io: No space left on device"),
+            Some(HoldCause::Capacity)
+        );
+        let shortfall = nzbd_state::capacity::CapacityShortfall {
+            root: "/processing".into(),
+            needed: 1,
+            claimed: 2,
+            headroom: 3,
+            free: 4,
+        };
+        assert_eq!(
+            stderr_hold_cause(&format!("relocate: {shortfall}")),
+            Some(HoldCause::Capacity),
+            "a reservation shortfall rendered to text is still a capacity hold"
+        );
+        assert_eq!(
+            stderr_hold_cause("Disk quota exceeded (os error 122)"),
+            Some(HoldCause::Quota)
+        );
+        for errno in UNAVAILABLE {
+            let line = format!("write /processing/x.part: whatever (os error {errno})");
+            assert_eq!(
+                stderr_hold_cause(&line),
+                Some(HoldCause::StorageUnavailable),
+                "{line}"
             );
         }
         for no in [
             "Permission denied (os error 13)",
             "os error 57",
-            "(os error 50)",
+            "(os error 22)",
             "(os error 1107)",
             "a release named Transport endpoint is not connected",
             "finalize: complete checkpoint digest differs",
+            "connection reset by peer",
         ] {
-            assert!(!is_storage_unavailable(no), "{no}");
-            assert_eq!(io_hold_cause(no), nzbd_types::HoldCause::Io, "{no}");
+            assert_eq!(stderr_hold_cause(no), None, "{no} is not environmental");
         }
-        assert_eq!(
-            io_hold_cause("No space left on device (os error 28)"),
-            nzbd_types::HoldCause::Capacity
-        );
-        assert_eq!(
-            io_hold_cause("Disk quota exceeded (os error 122)"),
-            nzbd_types::HoldCause::Quota
-        );
-    }
-    use super::is_out_of_space;
-
-    /// Every shape this string arrives in — the writer's stringified
-    /// `io::Error`, the fsx wrapper's `op path: source`, the quota variant
-    /// a gluster/NFS mount answers instead of ENOSPC.
-    #[test]
-    fn recognises_the_shapes_a_full_volume_arrives_in() {
-        assert!(is_out_of_space("No space left on device (os error 28)"));
-        assert!(is_out_of_space(
-            "write /working/monarr/completed/x.part05.rar.part: no storage space"
-        ));
-        assert!(is_out_of_space("io: No space left on device"));
-        assert!(is_out_of_space("Disk quota exceeded (os error 122)"));
-        assert!(!is_out_of_space("Permission denied (os error 13)"));
-        assert!(!is_out_of_space("connection reset by peer"));
+        assert!(out_of_space(Some(&HoldCause::Quota)));
+        assert!(!out_of_space(Some(&HoldCause::StorageUnavailable)));
     }
 }
 

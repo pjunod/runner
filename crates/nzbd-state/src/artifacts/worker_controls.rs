@@ -485,13 +485,22 @@ impl Inventory {
                                     local.control.revision.parse::<u64>().unwrap_or(0);
                                 if local_revision >= completed_revision {
                                     checkpoint.job.set_control(&local.control);
-                                    checkpoint.job.status = if local.control.lifecycle == "held"
-                                        || local.control.manual_pause
-                                    {
+                                    checkpoint.job.status = if local.control.lifecycle == "held" {
+                                        nzbd_types::JobStatus::Held
+                                    } else if local.control.manual_pause {
                                         nzbd_types::JobStatus::Paused
                                     } else {
                                         checkpoint.job.status
                                     };
+                                    if checkpoint.job.normalize_hold_status()
+                                        == nzbd_types::HoldStatusChange::LostHold
+                                    {
+                                        tracing::warn!(
+                                            job,
+                                            control = ?checkpoint.job.control(),
+                                            "an adopted held job has no holding control; it is now paused"
+                                        );
+                                    }
                                     probe_params = local.probe_params.clone();
                                     local.context = context.clone();
                                     tx.execute(
@@ -517,6 +526,7 @@ impl Inventory {
                         )?;
                         tx.commit()?;
                         let control = checkpoint.job.control().unwrap_or(nzbd_types::JobControl {
+                            expiry_pending: false,
                             version: 1,
                             revision: "0".into(),
                             lifecycle: "running".into(),
@@ -531,6 +541,8 @@ impl Inventory {
                             next_retry_at_unix: None,
                             blocked_since_unix: None,
                             released_at_unix: None,
+                            deadline_in_s: None,
+                            deadline_unix: None,
                         });
                         return Ok(Some(WorkerRetryAdoption {
                             source,
@@ -657,6 +669,22 @@ impl Inventory {
         job: &nzbd_types::Job,
         expected_revision: &str,
     ) -> Result<()> {
+        self.checkpoint_worker_control_inner(job, expected_revision, None)
+    }
+    pub fn checkpoint_worker_hold_expiry(
+        &self,
+        job: &nzbd_types::Job,
+        expected_revision: &str,
+        notice: &str,
+    ) -> Result<()> {
+        self.checkpoint_worker_control_inner(job, expected_revision, Some(notice))
+    }
+    fn checkpoint_worker_control_inner(
+        &self,
+        job: &nzbd_types::Job,
+        expected_revision: &str,
+        notice: Option<&str>,
+    ) -> Result<()> {
         let _guard = self.mutation_guard()?;
         let context = WorkerControlContext::for_job(job)
             .ok_or_else(|| Error::Conflict("worker control has no lease authority".into()))?;
@@ -728,6 +756,48 @@ impl Inventory {
                 .collect(),
         };
         tx.execute("INSERT INTO worker_controls(job,data) VALUES(?1,?2) ON CONFLICT(job) DO UPDATE SET data=excluded.data", params![job.id.0, serde_json::to_string(&checkpoint)?])?;
+        if let Some(notice) = notice {
+            if notice.len() > 16384 || !checkpoint.control.expiry_pending {
+                return Err(Error::Conflict("invalid bounded expiry checkpoint".into()));
+            }
+            let mut value: serde_json::Value = serde_json::from_str(notice)?;
+            if value.get("job").and_then(|v| v.as_u64()) != Some(u64::from(job.id.0))
+                || serde_json::from_value::<WorkerControlContext>(value["context"].clone())?
+                    != checkpoint.context
+                || serde_json::from_value::<SourceGeneration>(value["source"].clone())?
+                    != checkpoint.source
+            {
+                return Err(Error::Conflict(
+                    "expiry notice changed its job, grant or source".into(),
+                ));
+            }
+            value["control"] = serde_json::to_value(&checkpoint.control)?;
+            value["fetched"] = serde_json::to_value(nzbd_types::Fetched::of(job))?;
+            let data = serde_json::to_string(&value)?;
+            if data.len() > 16384 {
+                return Err(Error::Conflict(
+                    "expiry notice exceeds metadata limit".into(),
+                ));
+            }
+            use sha2::{Digest, Sha256};
+            // Renewal/display epoch/fetched progress do not create a second
+            // notice. A genuinely new grant/source/episode gets its own key.
+            let identity = serde_json::to_vec(&(
+                job.id,
+                &checkpoint.context.lease_id,
+                &checkpoint.context.job_incarnation,
+                checkpoint.context.job_revision,
+                checkpoint.context.control_revision,
+                &checkpoint.control.instance,
+                &checkpoint.control.revision,
+                &checkpoint.source,
+            ))?;
+            let key = format!("expiry-outbox:{:x}", Sha256::digest(identity));
+            tx.execute(
+                "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+                params![key, data],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -875,6 +945,7 @@ mod tests {
             stages: Vec::new(),
         };
         let control = nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "2".into(),
             lifecycle: "held".into(),
@@ -889,6 +960,8 @@ mod tests {
             next_retry_at_unix: Some(999999),
             blocked_since_unix: Some(123),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         };
         job.status = nzbd_types::JobStatus::Downloading;
         job.params
@@ -1020,6 +1093,7 @@ mod tests {
         inventory.bind_worker_context(42, &context).unwrap();
         inventory.checkpoint_worker_completion(&job).unwrap();
         let control = nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "2".into(),
             lifecycle: "held".into(),
@@ -1034,6 +1108,8 @@ mod tests {
             next_retry_at_unix: Some(999999),
             blocked_since_unix: Some(123),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         };
         job.set_control(&control);
         inventory.checkpoint_worker_control(&job, "1").unwrap();
@@ -1056,7 +1132,7 @@ mod tests {
         );
         assert_eq!(
             adopted.completed_job.as_ref().unwrap().status,
-            nzbd_types::JobStatus::Paused
+            nzbd_types::JobStatus::Held
         );
         let late = adopted.completed_job.as_ref().unwrap().clone();
         let source = SourceGeneration {

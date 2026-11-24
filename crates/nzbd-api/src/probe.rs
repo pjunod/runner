@@ -1,5 +1,5 @@
 //! `POST /api/v1/probe` — the decoded head of a release's main file, for
-//! Curator's pre-flight measurement (Curator ADR 0026 §6) — and
+//! Curator's pre-flight measurement (Curator ADR 0031 §6) — and
 //! `GET /api/v1/probes`, the recent probes for the UI.
 //!
 //! Bytes, not opinions: the handler fetches the NZB the caller names (the

@@ -328,6 +328,7 @@ impl ControlStore {
         let store = Self { client };
         crate::cancellation::install_schema(&store).await?;
         crate::cluster_keep::install_schema(&store).await?;
+        crate::job_disposition::install_schema(&store).await?;
         Ok(store)
     }
 
@@ -343,6 +344,21 @@ impl ControlStore {
         // mutation: a minority can retain a stale leader view after losing
         // its peers. Force a linearizable quorum round trip so callers fail
         // closed until a majority has acknowledged the current term.
+        let Ok(metrics) = self.client.metrics_db().await else {
+            return false;
+        };
+        // A learner can forward a successful quorum read before joining the
+        // fixed voter set. That is not evidence this voter can survive a peer
+        // loss; wait for its own committed membership before advertising ready.
+        if metrics.running_state.is_err()
+            || metrics.state.is_learner()
+            || !metrics
+                .membership_config
+                .voter_ids()
+                .any(|id| id == metrics.id)
+        {
+            return false;
+        }
         tokio::time::timeout(Duration::from_secs(2), self.client.db_quorum_watermark())
             .await
             .is_ok_and(|result| result.is_ok())
@@ -696,7 +712,7 @@ impl ControlStore {
         let row=self.client.query_consistent_map::<ControlJobRow,_>("SELECT intent_json,revision,incarnation FROM control_jobs WHERE job_id=?1 AND result_id=?2 AND deleted=0",params!(i64::from(job),result)).await.map_err(|error|error.to_string())?.into_iter().next();
         row.map(|row| {
             Ok((
-                serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?,
+                decode_intent(&row.intent_json).map_err(|error| error.to_string())?,
                 u64::try_from(row.revision).map_err(|error| error.to_string())?,
             ))
         })
@@ -714,7 +730,7 @@ impl ControlStore {
             .map_err(|error| format!("load replicated jobs: {error}"))?;
         rows.into_iter()
             .map(|row| {
-                let job = serde_json::from_str(&row.intent_json)
+                let job = decode_intent(&row.intent_json)
                     .map_err(|error| format!("decode replicated job: {error}"))?;
                 let revision = u64::try_from(row.revision)
                     .map_err(|error| format!("invalid replicated job revision: {error}"))?;
@@ -828,6 +844,26 @@ impl ControlStore {
         authority: Option<(&str, &str, u64)>,
         removals: &std::collections::BTreeMap<u32, crate::cancellation::RemovalMode>,
     ) -> Result<(), String> {
+        self.commit_job_delta_with_statements(
+            changes,
+            expected_rows,
+            admissions,
+            authority,
+            removals,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_job_delta_with_statements(
+        &self,
+        changes: &[(u64, Option<nzbd_types::Job>)],
+        expected_rows: &std::collections::HashMap<u64, u64>,
+        admissions: &[nzbd_state::UrlAdmissionReceipt],
+        authority: Option<(&str, &str, u64)>,
+        removals: &std::collections::BTreeMap<u32, crate::cancellation::RemovalMode>,
+        additional: Vec<(String, hiqlite::Params)>,
+    ) -> Result<(), String> {
         let now = unix_ms()?;
         let mut statements: Vec<(String, hiqlite::Params)> = Vec::new();
         if let Some(authority) = authority {
@@ -921,6 +957,7 @@ impl ControlStore {
             }
         }
         statements.extend(crate::admissions::admission_statements(admissions)?);
+        statements.extend(additional);
         if statements.is_empty() {
             return Ok(());
         }
@@ -956,7 +993,7 @@ impl ControlStore {
             .into_iter()
             .next()
             .ok_or_else(|| "URL placeholder is not durable".to_owned())?;
-        let prior: nzbd_types::Job = serde_json::from_str(&row.intent_json)
+        let prior: nzbd_types::Job = decode_intent(&row.intent_json)
             .map_err(|error| format!("decode URL placeholder: {error}"))?;
         if row.deleted
             || prior.status != nzbd_types::JobStatus::Fetching
@@ -994,13 +1031,6 @@ impl ControlStore {
     /// Drain the durable URL outbox against current replicated intent. Events
     /// are wake hints only; the immutable resolution ID is the command key.
     /// True means durable acceptance/replay or a definite durable cancellation.
-    #[cfg(test)]
-    pub(crate) async fn commit_url_outbox(
-        &self,
-        record: &nzbd_state::artifacts::UrlResolutionRecord,
-    ) -> Result<bool, String> {
-        self.commit_url_outbox_with_source(record, None).await
-    }
     pub(crate) async fn commit_url_outbox_with_source(
         &self,
         record: &nzbd_state::artifacts::UrlResolutionRecord,
@@ -1033,13 +1063,15 @@ impl ControlStore {
             return Ok(true);
         }
         let prior: nzbd_types::Job =
-            serde_json::from_str(&row.intent_json).map_err(|error| error.to_string())?;
+            decode_intent(&row.intent_json).map_err(|error| error.to_string())?;
         if url_source_identity(&prior).ok().as_deref() != Some(record.source_identity.as_str()) {
             return Ok(true); // The durable row names another request/incarnation.
         }
         if !matches!(
             prior.status,
-            nzbd_types::JobStatus::Fetching | nzbd_types::JobStatus::Paused
+            nzbd_types::JobStatus::Fetching
+                | nzbd_types::JobStatus::Paused
+                | nzbd_types::JobStatus::Held
         ) || !prior.files.is_empty()
         {
             // A previous authority already resolved this exact admission (or
@@ -1063,11 +1095,11 @@ impl ControlStore {
         next.totals = record.resolved.totals;
         next.status = if record.resolved.status == nzbd_types::JobStatus::Failed {
             nzbd_types::JobStatus::Failed
+        } else if prior.held() {
+            nzbd_types::JobStatus::Held
         } else if prior.status == nzbd_types::JobStatus::Paused
             || prior.params.iter().any(|(key, _)| key == "*AddPaused")
-            || prior
-                .control()
-                .is_some_and(|control| control.manual_pause || control.lifecycle == "held")
+            || prior.control().is_some_and(|control| control.manual_pause)
         {
             nzbd_types::JobStatus::Paused
         } else {
@@ -1105,6 +1137,42 @@ impl ControlStore {
             MutationOutcome::Applied{..}|MutationOutcome::Duplicate{..}=>Ok(true),
             MutationOutcome::Conflict=>Ok(false),
         }
+    }
+
+    /// Atomically select an expired worker hold's terminal intent and revoke
+    /// its exact lease. Release-then-CAS would allow a new grant in between.
+    pub(crate) async fn expire_worker_hold(
+        &self,
+        receipt: &str,
+        lease: &DurableLease,
+        next: &nzbd_types::Job,
+        issuer: (&str, &str, u64),
+    ) -> Result<bool, String> {
+        if self.command_receipt(receipt).await?.is_some() {
+            return Ok(true);
+        }
+        let now = unix_ms()?;
+        let token = &lease.token;
+        let envelope = serde_json::json!({"command":{"op":"worker_hold_expired"},"next_intent":serde_json::to_string(next).map_err(|e|e.to_string())?,"deleted":false}).to_string();
+        let statements = vec![
+            authority_statement(issuer)?,
+            ("INSERT INTO command_receipts(command_id,job_id,expected_revision,applied_revision,command_json,applied_at_ms)
+              SELECT ?1,w.job_id,w.job_revision,w.job_revision+1,?2,?3 FROM work_leases w JOIN control_jobs j ON j.job_id=w.job_id
+              WHERE w.resource=?4 AND w.owner_node_id=?5 AND w.owner_incarnation=?6 AND w.fence=?7 AND w.revision=?8 AND w.expires_at_ms=?9
+              AND w.terminal=0 AND w.expires_at_ms>?3 AND w.job_id=?10 AND w.job_incarnation=?11 AND w.job_revision=?12
+              AND j.incarnation=w.job_incarnation AND j.revision=w.job_revision AND j.deleted=0".into(),
+             params!(receipt,envelope,now,&token.resource,&token.owner_node_id,&token.owner_incarnation,i64_value("fence",token.fence)?,i64_value("lease revision",token.revision)?,token.expires_at_unix_ms,i64_value("job",lease.job_id)?,&lease.job_incarnation,i64_value("job revision",lease.job_revision)?)),
+            ("UPDATE work_leases SET terminal=1,revision=revision+1,updated_at_ms=?1 WHERE resource=?2 AND EXISTS(SELECT 1 FROM command_receipts WHERE command_id=?3)".into(), params!(now,&token.resource,receipt))
+        ];
+        let results = self
+            .client
+            .txn(statements)
+            .await
+            .map_err(|e| format!("expire worker hold: {e}"))?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(results.get(1).copied() == Some(1))
     }
 
     pub async fn apply_command(
@@ -1401,11 +1469,16 @@ impl ControlStore {
         cluster_id: &str,
         revision: u64,
         state_json: &str,
+        issuer: (&str, &str, u64),
     ) -> Result<(), String> {
-        self.client
+        let changed = self
+            .client
             .execute(
                 "INSERT INTO provider_budget_state(cluster_id,revision,state_json,updated_at_ms)
-                 VALUES($1,$2,$3,$4)
+                 SELECT $1,$2,$3,$4 WHERE EXISTS (
+                   SELECT 1 FROM work_leases WHERE resource='cluster/leader'
+                     AND cluster_id=$1 AND owner_node_id=$5 AND owner_incarnation=$6
+                     AND fence=$7 AND terminal=0 AND expires_at_ms>$4)
                  ON CONFLICT(cluster_id) DO UPDATE SET
                    revision=excluded.revision,state_json=excluded.state_json,
                    updated_at_ms=excluded.updated_at_ms
@@ -1414,19 +1487,54 @@ impl ControlStore {
                     cluster_id,
                     i64_value("budget revision", revision)?,
                     state_json,
-                    unix_ms()?
+                    unix_ms()?,
+                    issuer.0,
+                    issuer.1,
+                    i64_value("issuer fence", issuer.2)?
                 ),
             )
             .await
             .map_err(|error| format!("persist provider budget state: {error}"))?;
-        Ok(())
+        if changed == 1 {
+            return Ok(());
+        }
+        // A retry after a lost acknowledgement may encounter its exact saved
+        // row. It still needs current issuer authority; matching old bytes do
+        // not let a queued previous leader acknowledge or replace a new term.
+        let saved = self
+            .client
+            .query_consistent_map::<BudgetStateRow, _>(
+                "SELECT revision,state_json FROM provider_budget_state WHERE cluster_id=$1
+                 AND EXISTS (SELECT 1 FROM work_leases WHERE resource='cluster/leader'
+                   AND cluster_id=$1 AND owner_node_id=$2 AND owner_incarnation=$3
+                   AND fence=$4 AND terminal=0 AND expires_at_ms>$5)",
+                params!(
+                    cluster_id,
+                    issuer.0,
+                    issuer.1,
+                    i64_value("issuer fence", issuer.2)?,
+                    unix_ms()?
+                ),
+            )
+            .await
+            .map_err(|error| format!("confirm provider budget state: {error}"))?;
+        if saved.into_iter().next().is_some_and(|saved| {
+            u64::try_from(saved.revision).ok() == Some(revision) && saved.state_json == state_json
+        }) {
+            Ok(())
+        } else {
+            Err(
+                "provider budget issuer lost authority or snapshot conflicts with durable state"
+                    .into(),
+            )
+        }
     }
 
     pub async fn load_budget_state(&self, cluster_id: &str) -> Result<Option<String>, String> {
         let rows = self
             .client
             .query_consistent_map::<BudgetStateRow, _>(
-                "SELECT state_json FROM provider_budget_state WHERE cluster_id=$1",
+                "SELECT revision,state_json FROM provider_budget_state WHERE cluster_id=$1",
                 params!(cluster_id),
             )
             .await
@@ -1434,7 +1542,7 @@ impl ControlStore {
         Ok(rows.into_iter().next().map(|row| row.state_json))
     }
 
-    async fn command_receipt(&self, command_id: &str) -> Result<Option<u64>, String> {
+    pub(crate) async fn command_receipt(&self, command_id: &str) -> Result<Option<u64>, String> {
         self.scalar_revision(
             "SELECT applied_revision AS revision FROM command_receipts WHERE command_id=$1",
             command_id,
@@ -1790,6 +1898,7 @@ struct RangeResultRow {
     result_ref: String,
 }
 struct BudgetStateRow {
+    revision: i64,
     state_json: String,
 }
 struct ScriptStateRow {
@@ -1805,6 +1914,7 @@ impl From<&mut Row<'_>> for ScriptStateRow {
 impl From<&mut Row<'_>> for BudgetStateRow {
     fn from(row: &mut Row<'_>) -> Self {
         Self {
+            revision: row.get("revision"),
             state_json: row.get("state_json"),
         }
     }
@@ -1892,16 +2002,78 @@ pub(crate) fn unix_ms_public() -> i64 {
     unix_ms().unwrap_or(0)
 }
 
+/// A replicated job row, its status agreeing with its hold record: a row a
+/// 0.5.0 node wrote stores a hold as `paused` + a held control.
+///
+/// A `held` row without a holding control is logged once per job and
+/// control revision: replicated rows are decoded on every read.
+pub(crate) fn decode_intent(json: &str) -> serde_json::Result<nzbd_types::Job> {
+    /// (job id, control revision) already logged as a lost hold.
+    type Logged = std::sync::Mutex<std::collections::HashSet<(u32, Option<String>)>>;
+    static LOGGED: std::sync::LazyLock<Logged> = std::sync::LazyLock::new(Default::default);
+    let mut job: nzbd_types::Job = serde_json::from_str(json)?;
+    if job.normalize_hold_status() == nzbd_types::HoldStatusChange::LostHold {
+        let control = job.control();
+        let key = (job.id.0, control.as_ref().map(|c| c.revision.clone()));
+        if LOGGED.lock().unwrap().insert(key) {
+            tracing::warn!(
+                job = job.id.0,
+                ?control,
+                "a replicated held job has no holding control; it is now paused"
+            );
+        }
+    }
+    Ok(job)
+}
+
 #[cfg(test)]
-mod coordinator_protocol_tests {
+pub(crate) mod coordinator_protocol_tests {
     use super::*;
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn legacy_coordinator_scope_cannot_claim_or_renew_but_current_scope_takes_over() {
-        let temp = tempfile::tempdir().unwrap();
+
+    /// A row a 0.5.0 node replicated stores a hold as `paused` + a held
+    /// control; it decodes as `held`. A person's pause stays `paused`.
+    #[test]
+    fn a_050_replicated_hold_decodes_as_held() {
+        let mut job = nzbd_types::Job {
+            id: nzbd_types::JobId(7),
+            kind: nzbd_types::JobKind::Nzb,
+            name: "job".into(),
+            dir_name: "job".into(),
+            name_provisional: false,
+            delivery_lifecycle: false,
+            queued_at_unix: 0,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: nzbd_types::DupeInfo::default(),
+            params: Vec::new(),
+            files: Vec::new(),
+            totals: nzbd_types::JobTotals::default(),
+            status: nzbd_types::JobStatus::Paused,
+            torrent: None,
+            stages: Vec::new(),
+        };
+        let paused = serde_json::to_string(&job).unwrap();
+        assert_eq!(
+            decode_intent(&paused).unwrap().status,
+            nzbd_types::JobStatus::Paused
+        );
+        job.params.push((
+            nzbd_types::CONTROL_PARAM.into(),
+            r#"{"version":1,"revision":"3","lifecycle":"held","cause":"capacity","stage":"download_write","retry_policy":"scheduled_retry","message":"","instance":"i"}"#.into(),
+        ));
+        let held = serde_json::to_string(&job).unwrap();
+        assert!(held.contains("\"paused\""));
+        assert_eq!(
+            decode_intent(&held).unwrap().status,
+            nzbd_types::JobStatus::Held
+        );
+    }
+    pub(crate) async fn test_store(temp: &tempfile::TempDir, cluster_id: &str) -> ControlStore {
         let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let cfg = ClusterConfig {
-            cluster_id: "protocol-test".into(),
+            cluster_id: cluster_id.into(),
             node_name: "new".into(),
             shared_dir: temp.path().join("shared"),
             advertise_url: "http://127.0.0.1:1".into(),
@@ -1924,10 +2096,171 @@ mod coordinator_protocol_tests {
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);
-        let store = ControlStore::start(&cfg).await.unwrap();
+        ControlStore::start(&cfg).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn budget_snapshot_retries_require_the_exact_durable_revision_and_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp, "budget-postcondition").await;
+        let scope =
+            serde_json::json!({"lifecycleProtocol":crate::proto::LIFECYCLE_PROTOCOL}).to_string();
+        let LeaseClaim::Acquired(old) = store
+            .acquire(
+                "cluster/leader",
+                "budget-postcondition",
+                1,
+                "cluster-leader",
+                "old",
+                "old-process",
+                "leader",
+                &scope,
+                1,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("initial coordinator must acquire authority")
+        };
+        let issuer = (&*old.owner_node_id, &*old.owner_incarnation, old.fence);
+        let first = r#"{"revision":1,"commands":{"worker":{"provider":4}}}"#;
+        let second = r#"{"revision":2,"commands":{"worker":{"provider":2}}}"#;
+        store
+            .save_budget_state("budget-postcondition", 1, first, issuer)
+            .await
+            .unwrap();
+        // A lost acknowledgement may retry the exact already-committed row.
+        store
+            .save_budget_state("budget-postcondition", 1, first, issuer)
+            .await
+            .unwrap();
+        assert!(store
+            .save_budget_state("budget-postcondition", 1, second, issuer)
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .load_budget_state("budget-postcondition")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first)
+        );
+        store
+            .save_budget_state("budget-postcondition", 2, second, issuer)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .save_budget_state("budget-postcondition", 1, first, issuer)
+                .await
+                .is_err(),
+            "a newer durable row cannot acknowledge an older unpersisted command"
+        );
+        assert!(
+            store
+                .save_budget_state("budget-postcondition", 1, second, issuer)
+                .await
+                .is_err(),
+            "matching bytes alone cannot acknowledge a different revision"
+        );
+        store
+            .save_budget_state("budget-postcondition", 2, second, issuer)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_budget_state("budget-postcondition")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(second)
+        );
+        assert!(store.release(&old).await.unwrap());
+        let LeaseClaim::Acquired(current) = store
+            .acquire(
+                "cluster/leader",
+                "budget-postcondition",
+                1,
+                "cluster-leader",
+                "new",
+                "new-process",
+                "leader",
+                &scope,
+                1,
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("successor must acquire authority")
+        };
+        assert!(current.fence > old.fence);
+        assert!(
+            store
+                .save_budget_state("budget-postcondition", 3, first, issuer)
+                .await
+                .is_err(),
+            "a queued old-authority higher revision cannot overwrite successor state"
+        );
+        let current_issuer = (
+            &*current.owner_node_id,
+            &*current.owner_incarnation,
+            current.fence,
+        );
+        store
+            .save_budget_state("budget-postcondition", 3, first, current_issuer)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .save_budget_state("budget-postcondition", 4, second, issuer)
+                .await
+                .is_err(),
+            "an old higher revision cannot overwrite the successor's saved snapshot"
+        );
+        assert!(
+            store
+                .save_budget_state("budget-postcondition", 3, first, issuer)
+                .await
+                .is_err(),
+            "exact duplicate bytes cannot acknowledge a stale issuer"
+        );
+        for wrong_issuer in [
+            ("old", &*current.owner_incarnation, current.fence),
+            (&*current.owner_node_id, "old-process", current.fence),
+            (
+                &*current.owner_node_id,
+                &*current.owner_incarnation,
+                old.fence,
+            ),
+        ] {
+            assert!(store
+                .save_budget_state("budget-postcondition", 4, second, wrong_issuer)
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            store
+                .load_budget_state("budget-postcondition")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(first)
+        );
+        store.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_coordinator_scope_cannot_claim_or_renew_but_current_scope_takes_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = test_store(&temp, "protocol-test").await;
         for scope in [
             "{}",
             r#"{"lifecycleProtocol":1}"#,

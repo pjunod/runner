@@ -324,6 +324,7 @@ async fn refreshed(control: &ControlStore, job: u32) -> Result<Preference, Strin
                 nzbd_types::JobStatus::Fetching
                     | nzbd_types::JobStatus::Queued
                     | nzbd_types::JobStatus::Paused
+                    | nzbd_types::JobStatus::Held
             )
         })
         .map(|(job, _, _)| {

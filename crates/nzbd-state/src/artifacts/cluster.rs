@@ -10,6 +10,10 @@ pub struct ClusterArtifactCopy {
     pub source: SourceGeneration,
     pub job_id: u32,
     pub selected: bool,
+    /// Exact owned raw members, distinct from selected publication output.
+    /// Omitted on historical descriptors to preserve their accepted identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_files: Option<Vec<DeliveryFile>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,6 +24,54 @@ pub struct ClusterCopyCleanup {
 }
 
 impl Inventory {
+    /// Inventory is used only to detect omitted copies. Its presence never
+    /// grants deletion authority. Completed consumer publication ownership
+    /// requires the exact succeeded materialization and replicated READY.
+    pub fn cluster_disposition_candidates(
+        &self,
+        job: u32,
+        transfer: &str,
+        protected_results: &[String],
+    ) -> Result<Vec<SourceGeneration>> {
+        let protected = serde_json::to_string(protected_results)?;
+        let db = self.db.lock().unwrap();
+        let mut rows = db.prepare(
+            "SELECT a.id,json_extract(a.data,'$.generation') FROM artifacts a
+             WHERE (
+                 a.job=?1 OR EXISTS(SELECT 1 FROM operations o
+                    WHERE json_extract(o.data,'$.kind') IN ('par_repair','extract')
+                      AND json_extract(json_extract(o.data,'$.request'),'$.source.job')=?1
+                      AND json_extract(json_extract(o.data,'$.request'),'$.scratch.id')=a.id
+                      AND json_extract(json_extract(o.data,'$.request'),'$.scratch.generation')=json_extract(a.data,'$.generation'))
+             )
+               AND (a.state NOT IN ('deleted','source_gone') OR json_extract(a.data,'$.gone_reason') IS NOT NULL)
+               AND NOT EXISTS(SELECT 1 FROM operations o
+                  WHERE o.artifact=a.id AND o.state='succeeded'
+                    AND json_extract(o.data,'$.kind')='materialize_generation'
+                    AND json_extract(json_extract(o.data,'$.request'),'$.selected.id')=a.id
+                    AND json_extract(json_extract(o.data,'$.request'),'$.selected.generation')=json_extract(a.data,'$.generation')
+                    AND json_extract(json_extract(o.data,'$.request'),'$.accepted.result_id') IN (SELECT value FROM json_each(?2)))
+               AND NOT EXISTS(SELECT 1 FROM deliveries d
+                  WHERE d.artifact=a.id AND d.generation=json_extract(a.data,'$.generation')
+                    AND json_extract(d.data,'$.requestToken')=?3)
+             ORDER BY a.id LIMIT 129",
+        )?;
+        let candidates = rows
+            .query_map(params![job, protected, transfer], |row| {
+                Ok(SourceGeneration {
+                    artifact: row.get(0)?,
+                    generation: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if candidates.len() > 128 {
+            return Err(Error::Conflict(
+                "source custody exceeds the supported disposition bound".into(),
+            ));
+        }
+        Ok(candidates)
+    }
+
     /// Grant provenance is separate from cleanup eligibility. Legacy/new
     /// nonconsumer jobs keep their existing retention policy while a worker
     /// can persist an exact unowned shadow retry under this owner generation.
@@ -43,6 +95,7 @@ impl Inventory {
             source,
             job_id: job,
             selected: false,
+            raw_files: None,
         }))
     }
 
@@ -102,6 +155,7 @@ impl Inventory {
             },
             job_id: job,
             selected,
+            raw_files: None,
         }))
     }
 
@@ -205,6 +259,7 @@ impl Inventory {
             source: copy.publication.clone(),
             job_id: copy.job_id,
             selected: false,
+            raw_files: None,
         };
         self.delete_cancelled_cluster_artifact_copy(&private, proof, files)
     }
@@ -225,11 +280,17 @@ impl Inventory {
         copy: &ClusterArtifactCopy,
         outcome: &str,
         proof: FinalizationProof,
-        unusable: bool,
+        failure_disposal_authorized: bool,
         raw_files: Option<&[DeliveryFile]>,
     ) -> Result<ClusterCopyCleanup> {
         self.retire_cluster_artifact_copy_policy(
-            copy, outcome, proof, unusable, raw_files, false, None,
+            copy,
+            outcome,
+            proof,
+            failure_disposal_authorized,
+            raw_files,
+            false,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -238,7 +299,7 @@ impl Inventory {
         copy: &ClusterArtifactCopy,
         outcome: &str,
         proof: FinalizationProof,
-        unusable: bool,
+        failure_disposal_authorized: bool,
         raw_files: Option<&[DeliveryFile]>,
         result: &str,
     ) -> Result<ClusterCopyCleanup> {
@@ -246,19 +307,40 @@ impl Inventory {
             copy,
             outcome,
             proof,
-            unusable,
+            failure_disposal_authorized,
             raw_files,
             false,
             Some(result),
         )
     }
+    /// Apply the authority's failure-retention choice without weakening exact
+    /// generation, byte-seal, ownership, active-use or live Keep checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_cluster_artifact_copy_with_failure_retention(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        raw_files: Option<&[DeliveryFile]>,
+        result: &str,
+        keep_failed_downloads: bool,
+    ) -> Result<ClusterCopyCleanup> {
+        if keep_failed_downloads && outcome != "SUCCESS" && !copy.selected {
+            return Ok(ClusterCopyCleanup {
+                status: "retained".into(),
+                error: Some("Keep failed downloads is enabled by the authority".into()),
+            });
+        }
+        self.retire_cluster_artifact_copy_with_result(copy, outcome, proof, true, raw_files, result)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn retire_cluster_artifact_copy_policy(
         &self,
         copy: &ClusterArtifactCopy,
         outcome: &str,
         proof: FinalizationProof,
-        unusable: bool,
+        failure_disposal_authorized: bool,
         raw_files: Option<&[DeliveryFile]>,
         explicit_cancellation: bool,
         result: Option<&str>,
@@ -270,7 +352,97 @@ impl Inventory {
                 "cluster cleanup belongs to another storage instance".into(),
             ));
         }
-        let mut artifact = self.get(&copy.publication.artifact)?;
+        let artifact = self.get(&copy.publication.artifact)?;
+        self.retire_cluster_artifact_copy_from_observation(
+            copy,
+            outcome,
+            proof,
+            failure_disposal_authorized,
+            raw_files,
+            explicit_cancellation,
+            result,
+            artifact,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retire_cluster_artifact_copy_from_observation(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        failure_disposal_authorized: bool,
+        raw_files: Option<&[DeliveryFile]>,
+        explicit_cancellation: bool,
+        result: Option<&str>,
+        artifact: Artifact,
+    ) -> Result<ClusterCopyCleanup> {
+        let first = self.retire_cluster_artifact_copy_once(
+            copy,
+            outcome,
+            proof.clone(),
+            failure_disposal_authorized,
+            raw_files,
+            explicit_cancellation,
+            result,
+            artifact,
+        );
+        let stale_filesystem = match &first {
+            Ok(result) => {
+                result.status == "retained"
+                    && result
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with("review required: raw "))
+            }
+            Err(Error::Io(error)) => error.kind() == std::io::ErrorKind::NotFound,
+            _ => false,
+        };
+        if stale_filesystem {
+            // A separate authorized disposal can finish after our initial
+            // artifact read and before the raw manifest scan. Serialize this
+            // observation with actual inventory mutations, then re-enter the
+            // complete policy once using its durable terminal state. A live,
+            // changed or unowned source never gains deletion authority here.
+            let current = {
+                let _guard = self.mutation_guard()?;
+                self.get(&copy.publication.artifact)?
+            };
+            if current.terminal() && current.generation == copy.publication.generation {
+                return self.retire_cluster_artifact_copy_once(
+                    copy,
+                    outcome,
+                    proof,
+                    failure_disposal_authorized,
+                    raw_files,
+                    explicit_cancellation,
+                    result,
+                    current,
+                );
+            }
+        }
+        first
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retire_cluster_artifact_copy_once(
+        &self,
+        copy: &ClusterArtifactCopy,
+        outcome: &str,
+        proof: FinalizationProof,
+        failure_disposal_authorized: bool,
+        raw_files: Option<&[DeliveryFile]>,
+        explicit_cancellation: bool,
+        result: Option<&str>,
+        mut artifact: Artifact,
+    ) -> Result<ClusterCopyCleanup> {
+        if copy.storage_instance_id != self.installation
+            || !matches!(proof, FinalizationProof::Cluster { .. })
+        {
+            return Err(Error::Conflict(
+                "cluster cleanup belongs to another storage instance".into(),
+            ));
+        }
         let predecessor = if artifact.job.is_none() && outcome == "SUCCESS" && !copy.selected {
             match result {
                 Some(result) => self.cluster_materialized_predecessor(copy, result)?,
@@ -306,9 +478,19 @@ impl Inventory {
             Err(Error::NotFound) => None,
             Err(error) => return Err(error),
         };
+        // Finding 12: every hold has an automatic exit (`exits`), so a held
+        // copy — a delete in review, say — is not retained: the ledger keeps
+        // asking (`retry`) and records `removed` once the exit lands.
+        if !artifact.terminal() {
+            if let Some(hold) = &artifact.hold {
+                return Ok(ClusterCopyCleanup {
+                    status: "retry".into(),
+                    error: Some(format!("held ({hold}); retried after its exit")),
+                });
+            }
+        }
         if !artifact.terminal()
             && ((artifact.keep && !explicit_cancellation)
-                || artifact.hold.is_some()
                 || (!explicit_cancellation
                     && !copy.selected
                     && outcome != "SUCCESS"
@@ -316,9 +498,7 @@ impl Inventory {
         {
             return Ok(ClusterCopyCleanup {
                 status: "retained".into(),
-                error: Some(artifact.hold.clone().unwrap_or_else(|| {
-                    "this exact source is retained by its current Keep setting".into()
-                })),
+                error: Some("this exact source is retained by its current Keep setting".into()),
             });
         }
         if let Some(operation) = existing.as_ref().filter(|_| !copy.selected) {
@@ -336,14 +516,20 @@ impl Inventory {
             return Ok(ClusterCopyCleanup {
                 status: match operation.state.as_str() {
                     "succeeded" => "removed",
-                    "cancelled" | "review" => "retained",
+                    // A delete in review takes its exit (retried or
+                    // cancelled): ask again rather than record `retained`.
+                    "cancelled" => "retained",
                     _ => "retry",
                 }
                 .into(),
                 error: operation.error,
             });
         }
-        if !copy.selected && outcome != "SUCCESS" && !unusable && !artifact.terminal() {
+        if !copy.selected
+            && outcome != "SUCCESS"
+            && !failure_disposal_authorized
+            && !artifact.terminal()
+        {
             return Ok(ClusterCopyCleanup { status: "retained".into(), error: Some(
                 "partial failure publication does not prove every raw source dependency redundant; retain this exact source until recovery is resolved".into()) });
         }
@@ -467,6 +653,7 @@ impl Inventory {
             ) {
                 Ok(true) => None,
                 Ok(false) => Some("source retirement remains pending".to_string()),
+                Err(Error::CleanupBlocked(reason)) => Some(reason),
                 Err(Error::Conflict(reason))
                     if reason.starts_with("blocked:")
                         || reason.starts_with(
@@ -594,6 +781,94 @@ mod tests {
         })
         .collect()
     }
+    #[test]
+    fn failed_copy_retention_policy_applies_after_exact_raw_seal() {
+        for reason in [
+            nzbd_types::FailureReason::Health,
+            nzbd_types::FailureReason::Io,
+            nzbd_types::FailureReason::Identity,
+            nzbd_types::FailureReason::HoldExpired,
+        ] {
+            for keep_failed in [false, true] {
+                let (_temp, inventory, source, copy) = fixture();
+                let result = inventory
+                    .retire_cluster_artifact_copy_with_failure_retention(
+                        &copy,
+                        reason.history_status(),
+                        proof(),
+                        Some(&raw_seal()),
+                        "result",
+                        keep_failed,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    result.status,
+                    if keep_failed { "retained" } else { "removed" }
+                );
+                assert_eq!(source.exists(), keep_failed);
+            }
+        }
+    }
+
+    #[test]
+    fn default_failed_copy_deletion_still_requires_live_keep_and_exact_bytes() {
+        for protect in [true, false] {
+            let (_temp, inventory, source, copy) = fixture();
+            if protect {
+                inventory.set_keep_on_failure(7, true).unwrap();
+            } else {
+                std::fs::write(source.join("readme.txt"), b"replacement bytes").unwrap();
+            }
+            let result = inventory
+                .retire_cluster_artifact_copy_with_failure_retention(
+                    &copy,
+                    "FAILURE/IO",
+                    proof(),
+                    Some(&raw_seal()),
+                    "result",
+                    false,
+                )
+                .unwrap();
+            assert_eq!(result.status, "retained");
+            assert!(source.exists());
+        }
+    }
+
+    #[test]
+    fn raw_copy_seal_is_identity_bound_and_refuses_unrecorded_members() {
+        let (_temp, inventory, source, mut copy) = fixture();
+        let historical = serde_json::to_value(&copy).unwrap();
+        assert!(historical.get("rawFiles").is_none());
+        let decoded: ClusterArtifactCopy = serde_json::from_value(historical.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), historical);
+        let identity = |copy: &ClusterArtifactCopy| {
+            super::super::external_generation_identity::<DeliveryFile>(
+                3,
+                7,
+                "incarnation",
+                "worker",
+                1,
+                "job-hash",
+                &[],
+                &Some(copy.clone()),
+                &Some((1, 2)),
+                &[],
+                &None,
+            )
+            .unwrap()
+        };
+        let old_identity = identity(&copy);
+        copy.raw_files = Some(inventory.cluster_owned_copy_file_seal(&copy, &[]).unwrap());
+        assert_eq!(copy.raw_files.as_ref().unwrap().len(), 2);
+        assert_ne!(identity(&copy), old_identity);
+        let sealed_identity = identity(&copy);
+        copy.raw_files.as_mut().unwrap()[0].sha256 = "00".repeat(32);
+        assert_ne!(identity(&copy), sealed_identity);
+        std::fs::write(source.join("unknown.txt"), b"unowned bytes").unwrap();
+        assert!(inventory.cluster_owned_copy_file_seal(&copy, &[]).is_err());
+        assert!(source.join("unknown.txt").exists());
+    }
+
     #[test]
     fn explicit_cancel_overrides_only_selected_keep_and_replays_partial_delete_after_restart() {
         let (temp, mut inventory, source, copy) = fixture();
@@ -834,14 +1109,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        inventory
-            .accept_delivery(
-                &receipt.delivery_id,
-                &receipt.publication_generation,
-                &receipt.manifest_digest,
-                "durable-consumer-mapping",
-            )
-            .unwrap();
+        assert_eq!(receipt.kind(), "completed");
         assert_eq!(inventory.execute_delete(&op.id).unwrap().state, "review");
         assert!(source.exists());
         assert!(inventory
@@ -960,18 +1228,21 @@ mod tests {
             .retention(&selected.id, selected.revision, true, None)
             .unwrap();
         inventory.set_keep_on_failure(7, true).unwrap();
+        // Contract §2.5 (M3): the selection was renamed into the private
+        // generation, not copied — it holds the only copy of the episode, so
+        // the kept cancellation retains it rather than removing it.
         assert_eq!(
             inventory
                 .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
                 .unwrap()
                 .status,
-            "removed"
+            "retained"
         );
-        assert!(!target.exists());
         assert_eq!(
-            std::fs::read(source.join("episode.mkv")).unwrap(),
+            std::fs::read(target.join("episode.mkv")).unwrap(),
             b"verified payload"
         );
+        assert!(!source.join("episode.mkv").exists(), "never in two places");
         assert_eq!(std::fs::read(source.join("readme.txt")).unwrap(), b"junk");
         assert!(inventory.get(&copy.source.artifact).unwrap().keep);
         drop(inventory);
@@ -981,9 +1252,9 @@ mod tests {
                 .delete_cancelled_cluster_unpublished_publication(&copy, proof(), &files)
                 .unwrap()
                 .status,
-            "removed"
+            "retained"
         );
-        assert!(source.join("episode.mkv").exists());
+        assert!(target.join("episode.mkv").exists());
     }
     #[test]
     fn explicit_cancel_private_selection_refuses_any_durable_unaccepted_handoff() {
@@ -1018,7 +1289,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert!(delivery.accepted_at.is_none() && delivery.consumer_receipt_id.is_none());
+        assert_eq!(delivery.kind(), "completed");
         // A historical partially-applied state update cannot erase the durable
         // handoff. The executor must recheck the receipt, not only ownership.
         let mut stale_owned = inventory.get(&artifact.id).unwrap();
@@ -1036,10 +1307,8 @@ mod tests {
             std::fs::read(target.join("episode.mkv")).unwrap(),
             b"verified payload"
         );
-        assert_eq!(
-            std::fs::read(source.join("episode.mkv")).unwrap(),
-            b"verified payload"
-        );
+        // M3: the selected file was moved, not copied.
+        assert!(!source.join("episode.mkv").exists());
     }
     #[test]
     fn accepted_selected_cluster_copy_drains_and_replays_without_payload() {
@@ -1231,8 +1500,40 @@ mod tests {
                 Some(&expected),
             )
             .unwrap();
-        assert_eq!(resumed.status, "retained");
-        assert_eq!(std::fs::read(remaining).unwrap(), b"replacement bytes");
+        // Finding 12: a delete in review is not `retained`: it takes its
+        // exit, and the ledger keeps asking until the copy is removed.
+        assert_eq!(resumed.status, "retry");
+        assert_eq!(std::fs::read(&remaining).unwrap(), b"replacement bytes");
+        let mut held = inventory.get(&copy.publication.artifact).unwrap();
+        held.updated_at = now() - 2 * super::super::exits::HOLD_EXIT_SECONDS;
+        save_artifact(&inventory.db.lock().unwrap(), &held).unwrap();
+        inventory
+            .exit_wedged_states(super::super::exits::HOLD_EXIT_SECONDS, true)
+            .unwrap();
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let mut operation = inventory.operation(&key).unwrap();
+            operation.next_retry = 0;
+            save_operation(&inventory.db.lock().unwrap(), &operation).unwrap();
+            let asked = inventory
+                .retire_cluster_artifact_copy_with_disposition(
+                    &copy,
+                    "SUCCESS",
+                    proof(),
+                    false,
+                    Some(&expected),
+                )
+                .unwrap();
+            statuses.push(asked.status.clone());
+            if asked.status == "removed" {
+                break;
+            }
+        }
+        assert_eq!(
+            statuses.last().map(String::as_str),
+            Some("removed"),
+            "{statuses:?}"
+        );
     }
     #[test]
     fn raw_copy_seal_refuses_added_or_changed_bytes_then_drains_exact_match() {
@@ -1296,6 +1597,71 @@ mod tests {
     }
 
     #[test]
+    fn raw_retirement_acknowledges_a_concurrent_exact_durable_delete() {
+        let (_temp, inventory, source, copy) = fixture();
+        let expected = raw_seal();
+        inventory
+            .accept_cluster_completion(&copy.publication, "SUCCESS", proof())
+            .unwrap();
+        let stale = inventory.get(&copy.publication.artifact).unwrap();
+        // Create this while the original is alive, so immediate inode/file-ID
+        // reuse cannot make the replacement directory look like that source.
+        let replacement = source.with_file_name("preexisting-unrelated-directory");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(replacement.join("manual.pdf"), b"new unrelated bytes").unwrap();
+        inventory
+            .finish(copy.job_id, &source, source.parent().unwrap(), "completed")
+            .unwrap();
+        let ready = inventory.get(&copy.publication.artifact).unwrap();
+        inventory
+            .request_delete(&ready.id, ready.revision, "concurrent-local-disposal", 0)
+            .unwrap();
+        let deleted = inventory
+            .execute_delete("concurrent-local-disposal")
+            .unwrap();
+        assert_eq!(deleted.state, "succeeded");
+        assert!(!source.exists());
+        let result = inventory
+            .retire_cluster_artifact_copy_from_observation(
+                &copy,
+                "SUCCESS",
+                proof(),
+                false,
+                Some(&expected),
+                false,
+                None,
+                stale.clone(),
+            )
+            .unwrap();
+        assert_eq!(result.status, "removed", "{result:?}");
+        // The old allocation's tombstone cannot authorize deleting bytes
+        // subsequently created at that path by another owner.
+        std::fs::rename(&replacement, &source).unwrap();
+        let result = inventory.retire_cluster_artifact_copy_from_observation(
+            &copy,
+            "SUCCESS",
+            proof(),
+            false,
+            Some(&expected),
+            false,
+            None,
+            stale,
+        );
+        assert!(
+            matches!(result, Err(Error::Conflict(reason)) if reason == "payload identity changed; review required")
+        );
+        assert_eq!(
+            std::fs::read(source.join("manual.pdf")).unwrap(),
+            b"new unrelated bytes"
+        );
+
+        assert_eq!(
+            inventory.get(&copy.publication.artifact).unwrap().state,
+            "deleted"
+        );
+    }
+
+    #[test]
     fn raw_partial_copy_and_changed_storage_never_gain_deletion_authority() {
         let (_temp, inventory, source, copy) = fixture();
         assert_eq!(
@@ -1350,6 +1716,16 @@ pub fn remove_cluster_generation_copy(
             .file_name()
             .ok_or_else(|| Error::Conflict("generation name missing".into()))?,
     );
+    let parent_identity = fs::identity_for_file(&parent)?;
+    if parent_identity.device != expected_identity.0 {
+        return Err(Error::Conflict(
+            "sealed generation volume identity changed".into(),
+        ));
+    }
+    if fs::entry_missing_at(&parent, name.as_os_str())? {
+        fs::sync_directory(&parent)?;
+        return Ok(());
+    }
     let directory = fs::open_at(&parent, name, true)?;
     let identity = fs::identity_for_file(&directory)?;
     if (identity.device, identity.inode) != expected_identity {

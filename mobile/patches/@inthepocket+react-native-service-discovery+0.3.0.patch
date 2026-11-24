@@ -1,0 +1,37 @@
+diff --git a/node_modules/@inthepocket/react-native-service-discovery/android/src/main/java/com/servicediscovery/ServiceDiscoveryModule.kt b/node_modules/@inthepocket/react-native-service-discovery/android/src/main/java/com/servicediscovery/ServiceDiscoveryModule.kt
+--- a/node_modules/@inthepocket/react-native-service-discovery/android/src/main/java/com/servicediscovery/ServiceDiscoveryModule.kt
++++ b/node_modules/@inthepocket/react-native-service-discovery/android/src/main/java/com/servicediscovery/ServiceDiscoveryModule.kt
+@@ -308,7 +308,7 @@
+       try {
+         val hostname = NsdServiceInfo::class.java.getMethod("getHostname").invoke(serviceInfo) as? String
+         if (!hostname.isNullOrEmpty()) {
+-          return hostname
++          return "${hostname.removeSuffix(".").removeSuffix(".local")}.local."
+         }
+       } catch (e: ReflectiveOperationException) {
+         Log.w(NAME, "Could not read the service hostname", e)
+@@ -325,15 +325,16 @@
+       service.putString("domain", "local.")
+       service.putInt("port", serviceInfo.port)
+ 
+-      val host = serviceInfo.host
++      // getHost() returns only one address on dual-stack hosts.
++      val hosts = if (Build.VERSION.SDK_INT >= 34) {
++        serviceInfo.hostAddresses
++      } else {
++        listOfNotNull(serviceInfo.host)
++      }
+       service.putString("hostName", getHostName(serviceInfo))
+-      if (host != null) {
+-        service.putArray("addresses", WritableNativeArray().apply {
+-          pushString(host.hostAddress)
+-        })
+-      } else {
+-        service.putArray("addresses", WritableNativeArray())
+-      }
++      service.putArray("addresses", WritableNativeArray().apply {
++        hosts.mapNotNull { it.hostAddress }.distinct().forEach { pushString(it) }
++      })
+       val txt: WritableMap = WritableNativeMap()
+       for ((key, value) in serviceInfo.attributes ?: emptyMap()) {
+         if (value != null) {

@@ -33,6 +33,39 @@ speed limit control, history, log tail, settings, layouts and color schemes. It 
 over SSE at 1 Hz — progress bars, rates and the sparkline move without
 you touching anything.
 
+**Pausing: two lanes.** The **Downloads** and **Post-processing** toggles
+pause independently. Pausing downloads stops pulling articles; jobs stay
+queued and anything already downloaded keeps post-processing. Pausing
+post-processing lets downloads run while finished jobs wait in *Waiting to
+post-process*; a job that is mid-way finishes the stage it is in (a repair or
+extract is never cut off) and then holds — its row says *holds after this
+stage*, then *held*. A paused lane latches amber with a ▶; click it to resume.
+Each paused lane gets its own badge naming the client that paused it, and
+both survive a restart. The mobile app has the same two toggles.
+
+**Storage.** The Storage panel beside the rate tiles has one row per
+filesystem Runner writes to, named for what it holds: **processing** (state,
+working, failed, intermediate, temporary and watch folders, and torrent
+payloads, which download and seed in place) or **completed** (the downloads
+directory and category destinations). A
+filesystem holding both says **processing · completed**; hover the row for
+the exact roles, the path and used / total. The left half is capacity and
+free space. The right half graphs the last three minutes of writes (filled)
+and reads (line) at one point a second, with the current rates beside it and
+the busiest second in view printed at the graph's top-left. What the numbers
+cover depends on the filesystem, and the tooltip says which:
+
+- a local disk or a container bind mount of one is **device-wide**: every
+  program using that disk counts, not only Runner;
+- an NFS mount is **this machine's traffic** to the server; other clients of
+  the NAS are not visible from here;
+- a GlusterFS or other FUSE mount, an SMB share or an overlay has no kernel
+  counters, so the graph shows **Runner's own** reads and writes there:
+  article writes, par2 and unpacking, the copy to the completed folder, and
+  torrent transfer. Other programs using that filesystem are not included.
+
+A gap in a graph is a second that was not measured, never a claim of zero.
+
 **Adding downloads.** **+ add nzb** uploads one or more local NZB files.
 **+ add torrent** opens an inline form for a magnet link, remote `.torrent`
 URL, or local `.torrent` file, with category, priority, and add-paused options.
@@ -75,6 +108,59 @@ instead of offering the button, and lists the folder's own handoffs (with
 import receipt arrives or the handoff is cancelled. See
 [FILE_LIFECYCLE_OPERATIONS.md §2](FILE_LIFECYCLE_OPERATIONS.md) for the
 whole recovery flow.
+
+**Fetching NZB.** A URL job whose indexer refuses the NZB download (HTTP 429
+or 503) or doesn't answer stays in **Fetching NZB** and retries the same
+request after 1, 5, 10, then every 30 minutes until the indexer hands it over
+or answers for the item (404 and the like fail it). The row says what went
+wrong, when the next attempt is, and how long it has waited. An indexer's
+`Retry-After` of up to 30 minutes is honored as a minimum for that step; a
+longer one is shown on the row (`indexer asked to wait 12h`) but not obeyed —
+exhausted API quotas answer with 12–22 hour values. **retry now** on the job
+(web UI detail panel, or the app's expanded card) sends the request
+immediately; a repeat refusal continues up the ladder.
+
+**Held jobs.** A job stopped by its environment — storage not answering, a
+full disk, an exhausted quota, a missing extractor, a mount that came back
+empty, an archive waiting for a password — is **held**, not failed. The row
+says why, when the next automatic retry is, and when the hold runs out:
+`· storage unavailable: <Runner's message> … fails as hold expired in 23h 10m
+unless it recovers`. The cause is named first (storage unavailable, out of
+space, quota reached, allocation failed, mount unavailable, tool missing,
+engine unavailable, password required). The iPhone, iPad and Android app
+shows the same three lines on a held card, with the same pause/retry button. Runner retries every
+hold on its own; **pause** stops the retries and the button becomes
+**retry**, which sends the job back to the step it stopped in. Nothing a
+release contains ever holds a job, and no hold waits for a person: a hold
+that outlives `[post] hold_deadline_secs` (a day; a week for passwords) fails
+with reason `hold_expired` and its files follow the failure policy, even while the queue is
+paused. A newer cause replaces the shown one and restarts the clock. Over the
+API and SSE these jobs read `status: "held"` and emit
+`job_status_changed` on the way in and out.
+
+**Out of space.** Clear space and allow the automatic storage probes to
+retry; storage retry delays are capped at 30–60 seconds, including shortened
+persisted holds. **retry storage now** requests an immediate retry, including
+idle post failures. It preserves both manual lane pauses and the evidence
+latch: only a successful probe releases eligible work. Pausing or resuming a
+lane is a separate operator choice.
+
+**Parked sources in Files.** A failed job's folder shows state **failed ·
+parked** with a line saying why: the failure reason (`too few articles`,
+`fetch failed`, `PAR2 repair failed`, `unpack failed`, `script failed`,
+`publication failed`, `disk error`, `conflicting data`, `hold expired`), the
+assessment's text, and `salvage pending` while a salvage publication is still
+owed. The retention column gives its expiry (`expires <time>`), or `keep
+indefinitely` when keep is on. The same line is in the folder's details panel.
+**Needs attention** lists Runner rows a person should look at: an error, a
+blocked cleanup or an open publication intent (shown while their own exit
+runs), a hold with no automatic exit, and any row that has outlived its
+registered exit (a timed hold past its hour, a retention deadline past due,
+an in-progress state older than a day). A healthy row is never there. Folders Runner found but did not write are
+listed apart under **Not Runner's**: never deleted automatically, they block
+nothing; "release review hold" and adoption apply to them. Runner
+publications handed to Curator are `transferred`, never either. No job is
+ever held for review.
 
 **Torrent lifecycle.** Ready torrents share in **Seeding** and move to
 **Completed** when seeding stops. An idle seed is still available to peers;
@@ -215,7 +301,8 @@ Everything the *arr apps use is implemented against NZBGet's real wire
 behavior and locked with golden tests: `version`, `append` (v13+ and
 legacy call forms), `listgroups`, `history`, `editqueue`
 (`Group*`/`File*`/`History*` verbs), `status`, `config`, `rate`, pause
-family, `listfiles`, `log`/`writelog`, `scan`, `servervolumes`,
+family (`pausedownload` is the download lane, `pausepost` the post lane;
+`PostPaused` in `status` reflects it), `listfiles`, `log`/`writelog`, `scan`, `servervolumes`,
 `sysinfo`, `testserver`. Duplicate handling (dupe key/score/mode) and
 per-job passwords (`*Unpack:Password`) behave like NZBGet. XML-RPC
 (including `system.multicall`) is served on `/xmlrpc` for older tooling.
@@ -346,7 +433,7 @@ GET  /api/v1/jobs/{id}/nzb          the job's NZB, regenerated from queue state
 GET  /api/v1/jobs/{id}/torrent      torrent lifecycle and effective policy
 PUT  /api/v1/jobs/{id}/torrent/seed-policy   edit the effective policy
 POST /api/v1/jobs/{id}/actions/{action}     pause|resume|delete|delete-files|move-*
-POST /api/v1/queue/actions/{action}
+POST /api/v1/queue/actions/{action}    pause|resume (downloads) · pause-post|resume-post (post-processing) · retry-storage (probe storage)
 PUT  /api/v1/queue/speed-limit
 GET  /api/v1/history
 POST /api/v1/history/{id}/actions/{action}  hide|restore|delete|delete-files|requeue
@@ -358,10 +445,10 @@ POST /api/v1/probe                  head of a release's main file, without queue
                                        articles_missing, bytes, head(base64)}
                                     | {status:"unavailable", reason, detail}
 GET  /api/v1/probes                 recent probes and totals (the UI's Probes tab)
-GET  /api/v1/artifacts              folder inventory: ?filter=live|attention|owned|cleared|all
+GET  /api/v1/artifacts              folder inventory: ?filter=live|attention|foreign|owned|cleared|all
                                     &sort=updated|size|files|name &q=<name> &offset &limit(≤200)
                                     → entries[{artifact,files,bytes,measured,earliest_expiry}],
-                                      total, counts{live,attention,owned,cleared,all,live_bytes}, discovery
+                                      total, counts{live,attention,foreign,owned,cleared,all,live_bytes}, discovery
 POST /api/v1/artifacts/scan         walk the configured roots (202, runs immediately)
 GET  /api/v1/artifacts/{id}/files   manifest page (200 entries) + file_count, bytes, measured
 POST /api/v1/artifacts/{id}/inspect|adopt|release-review|retention|delete
@@ -471,8 +558,18 @@ The per-job pipeline and its knobs are described in
   header or v2 `manifest.json`), `NZBPP_*`/`NZBPR_*` environment,
   `[NZB] FINALDIR=…` and friends on stdout, exit codes 92–95. Point
   `post.scripts_dir` at your existing NZBGet scripts.
-- **Health actions**: failed-health jobs can be left (`none`), parked, or
-  deleted from disk (`delete`), mirroring NZBGet's HealthCheck.
+- **Health cancellation** always stops a download below critical health,
+  regardless of whether you retain failures. The owner records failure and
+  stops writers and NNTP waits immediately; restored jobs are reconciled too.
+- **Keep failed downloads** in Settings → Post-processing defaults off:
+  failed payload is deleted after salvage and cleanup custody settle. Enable
+  it to move failures to `failed_dir` for retention. A download's individual
+  **Keep on failure** retains its source indefinitely. Reasons and
+  recoverability do not override this choice; failed jobs remain in History.
+- **Every failure has a reason.** History and `job_pp_finished` name one of
+  `health`, `fetch`, `par`, `unpack`, `script`, `publish`, `io`, `identity`
+  or `hold_expired`. Any usable salvage is settled before source disposal;
+  failure alone never proves that writers stopped or remote custody ended.
 
 ## History, duplicates, quotas
 

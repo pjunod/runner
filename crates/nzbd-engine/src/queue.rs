@@ -25,6 +25,8 @@ pub struct QueueState {
     pub next_job_id: u32,
     pub next_file_id: u32,
     pub download_paused: bool,
+    /// The post-processing lane's pause — independent of `download_paused`.
+    pub post_paused: bool,
     pub speed_limit_bps: Option<u64>,
     /// How many jobs may download at once. `1` is the historical
     /// behavior: one job takes every connection until it runs out of
@@ -72,6 +74,7 @@ impl Default for QueueState {
             next_job_id: 0,
             next_file_id: 0,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: MIN_ACTIVE_DOWNLOADS,
         }
@@ -116,6 +119,7 @@ impl QueueState {
             next_job_id: doc.next_job_id,
             next_file_id: doc.next_file_id,
             download_paused: doc.download_paused,
+            post_paused: doc.post_paused,
             speed_limit_bps: doc.speed_limit_bps,
             // A snapshot written before this existed deserializes as 0,
             // which would read as "no job may download". Clamp on the way
@@ -217,6 +221,7 @@ impl QueueState {
             next_job_id: self.next_job_id,
             next_file_id: self.next_file_id,
             download_paused: self.download_paused,
+            post_paused: self.post_paused,
             speed_limit_bps: self.speed_limit_bps,
             max_active_downloads: self.max_active_downloads,
         }
@@ -231,18 +236,7 @@ impl QueueState {
                     .any(|(key, value)| key == "monarr-transfer" && value == &receipt.request_token)
             }) {
                 if receipt.custody_state != "curator" {
-                    receipt.outcome = match job.status {
-                        JobStatus::Fetching => "fetching",
-                        JobStatus::Queued => "queued",
-                        JobStatus::Downloading => "downloading",
-                        JobStatus::Paused => "paused",
-                        JobStatus::PostQueued => "post_queued",
-                        JobStatus::Post { .. } => "post_processing",
-                        JobStatus::Completed => "completed",
-                        JobStatus::Failed => "failed",
-                        JobStatus::Deleted => "deleted",
-                    }
-                    .to_string();
+                    receipt.outcome = job.status.as_str().to_string();
                 }
                 let param = |name: &str| {
                     job.params
@@ -254,10 +248,20 @@ impl QueueState {
                     if let Some(stage) = param("Failure:Stage") {
                         receipt.failure_stage = Some(stage);
                     }
-                    receipt.failure_cause = param("Failure:Reason")
+                    // Since contract v2 `Failure:Reason` is the typed reason
+                    // and `Failure:Message` the human text.
+                    let typed = param("Failure:Reason")
+                        .filter(|value| nzbd_types::FailureReason::parse(value).is_some());
+                    receipt.failure_cause = param("Failure:Message")
+                        .or_else(|| param("Failure:Reason").filter(|_| typed.is_none()))
                         .or_else(|| param("*Failure:Reason"))
                         .or_else(|| param("Failure:Files"));
                     receipt.terminal_outcome = param(nzbd_types::PP_DONE_PARAM);
+                    receipt.failure_reason = typed;
+                    receipt.fetch_cause = param("Failure:FetchCause");
+                    receipt.blames_release =
+                        param("Failure:BlamesRelease").and_then(|value| value.parse().ok());
+                    receipt.salvage = param("Failure:Salvage");
                 }
                 // Once source custody is pinned to an artifact generation,
                 // its live preference is authoritative. Queue params are only
@@ -482,13 +486,14 @@ impl QueueState {
         let paused = opts.paused;
         let mut params = crate::with_client(opts.params.clone(), opts.client.clone());
         let id = self.reserve_torrent_admission(source, opts);
+        let nonce = crate::admissions::generation_nonce();
         params.push((DEFAULTS_PARAM.into(), encoded_defaults));
         params.push((ACQUISITION_PARAM.into(), "1".into()));
         params.push((SUBMISSION_PARAM.into(), submission_sha256.clone()));
         params.push((SOURCE_READY_PARAM.into(), "0".into()));
         params.push((
             ADMISSION_GENERATION_PARAM.into(),
-            format!("{storage_instance}-torrent-{}", id.0),
+            format!("{storage_instance}-torrent-{}-{nonce}", id.0),
         ));
         params.push((METADATA_ATTEMPT_PARAM.into(), "0".into()));
         self.jobs.push(Job {
@@ -519,7 +524,7 @@ impl QueueState {
             request_token: token,
             submission_sha256,
             job_id: id.0,
-            generation: format!("{instance}-torrent-{}", id.0),
+            generation: format!("{instance}-torrent-{}-{nonce}", id.0),
             runner_instance_id: instance.into(),
             terminal_outcome: None,
             outcome: "fetching".into(),
@@ -531,6 +536,10 @@ impl QueueState {
             publication_path: None,
             source_artifact_id: None,
             source_generation: None,
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
         Ok(ManagedTorrentReservation {
             id,
@@ -653,7 +662,8 @@ impl QueueState {
                 record.payload_root = record
                     .payload_root
                     .join(format!(".runner-seed-{}", donor_id.0));
-                let gated = original.status == JobStatus::Paused || original.held();
+                let gated = matches!(original.status, JobStatus::Paused | JobStatus::Held)
+                    || original.held();
                 if gated {
                     record.control_intent = nzbd_types::TorrentControlIntent::Paused;
                 }
@@ -955,7 +965,10 @@ impl QueueState {
             .filter(|j| {
                 matches!(
                     j.status,
-                    JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+                    JobStatus::Queued
+                        | JobStatus::Downloading
+                        | JobStatus::Paused
+                        | JobStatus::Held
                 )
             })
             .map(|j| {
@@ -1703,10 +1716,13 @@ pub(crate) fn jobs_to_requeue_with_recovery(
         .collect()
 }
 
+/// Force priority overrides a person's pause (NZBGet semantics), never a
+/// hold: a held job waits for its own release.
 fn job_schedulable(job: &Job, download_paused: bool) -> bool {
     match job.status {
         JobStatus::Queued | JobStatus::Downloading => job.force_priority() || !download_paused,
         JobStatus::Paused => job.force_priority(),
+        JobStatus::Held => false,
         _ => false,
     }
 }
@@ -1942,6 +1958,10 @@ mod tests {
             // overwrite this durable control preference.
             source_artifact_id: Some("pinned-source".into()),
             source_generation: Some("pinned-gen".into()),
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
 
         state.sync_url_admission_receipts();
@@ -2641,6 +2661,7 @@ mod tests {
             next_job_id: 1,
             next_file_id: 1,
             download_paused: false,
+            post_paused: false,
             speed_limit_bps: None,
             max_active_downloads: 0,
         };
@@ -2737,6 +2758,23 @@ mod tests {
             jobs_to_requeue(&q, &none, false, 0).is_empty(),
             "a job with work in flight is never demoted"
         );
+    }
+
+    /// M6b: force priority overrides a person's pause, never a hold. While a
+    /// hold was persisted as `Paused`, a force-priority held job was handed
+    /// segments the same as a paused one.
+    #[test]
+    fn force_priority_runs_a_paused_job_but_not_a_held_one() {
+        let mut q = QueueState::default();
+        let id = q.admit_nzb("forced".into(), &sample_nzb(&[("a.bin", 2)]), None, 0, true);
+        let job = q.job_mut(id).unwrap();
+        job.priority = nzbd_types::PRIORITY_FORCE;
+        job.status = JobStatus::Paused;
+        assert!(job_schedulable(q.job(id).unwrap(), false));
+        assert!(job_schedulable(q.job(id).unwrap(), true));
+        q.job_mut(id).unwrap().status = JobStatus::Held;
+        assert!(!job_schedulable(q.job(id).unwrap(), false));
+        assert!(!job_schedulable(q.job(id).unwrap(), true));
     }
 
     #[test]

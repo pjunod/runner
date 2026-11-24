@@ -142,6 +142,8 @@ async fn pending_worker_crc_accepts_real_renewal_and_refuses_expired_or_replaced
             pp_weight: 1,
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
+            workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);

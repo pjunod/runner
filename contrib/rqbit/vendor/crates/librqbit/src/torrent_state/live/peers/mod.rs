@@ -1,7 +1,6 @@
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
-use backoff::backoff::Backoff;
 use dashmap::DashMap;
 use librqbit_core::lengths::ValidPieceIndex;
 use parking_lot::RwLock;

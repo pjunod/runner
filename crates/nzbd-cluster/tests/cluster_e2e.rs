@@ -219,6 +219,8 @@ async fn start_node_with_control(
             path: shared.join("complete"),
         }],
         torrent_payload_roots: Vec::new(),
+        workspace_dir: None,
+        keep_failed_downloads: false,
     };
     let tuning = Tuning {
         retry_interval: Duration::from_millis(400),
@@ -296,7 +298,9 @@ impl Node {
     /// heartbeats and its API all stop.
     async fn kill(self) {
         self.serve_cancel.cancel();
-        self.runtime.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(60), self.runtime.shutdown())
+            .await
+            .expect("cluster shutdown must join even after quorum loss");
         self.serve_task.abort();
         let _ = self.serve_task.await;
     }
@@ -753,7 +757,21 @@ async fn leader_retries_authority_adoption_after_snapshot_repair() {
         .unwrap();
     add_job(&node.url, "repaired", post.nzb.as_bytes()).await;
     wait_for("scheduling after snapshot repair", 20, || {
-        get_json(&node.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
+        let (code, body) = http(&node.url, "GET", "/api/v1/jobs", b"");
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("jobs after snapshot repair: {code}: {body}: {error}"));
+        if code == 503 {
+            assert!(
+                value == serde_json::json!({"error": "leadership is changing; retry"})
+                    || value == serde_json::json!({"error": "no leader elected yet; retry"}),
+                "jobs after snapshot repair: {code}: {body}"
+            );
+            // Election gaps are not queue observations. Keep the original
+            // deadline and require a real successful completion response.
+            return false;
+        }
+        assert_eq!(code, 200, "jobs after snapshot repair: {body}");
+        value["jobs"][0]["status"] == "completed"
     })
     .await;
 
@@ -909,10 +927,25 @@ async fn article_ranges_use_two_workers_and_one_authoritative_assembly() {
     add_job(&leader.url, "ranged", post.nzb.as_bytes()).await;
     let assembled = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            if get_json(&leader.url, "/api/v1/jobs")["jobs"][0]["status"] == "completed"
-                && tmp.path().join("complete/ranged/range.bin").is_file()
-            {
-                break;
+            let (code, body) = http(&leader.url, "GET", "/api/v1/jobs", b"");
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|error| {
+                panic!("jobs during range assembly: {code}: {body}: {error}")
+            });
+            if code == 503 {
+                assert!(
+                    value == serde_json::json!({"error": "leadership is changing; retry"})
+                        || value == serde_json::json!({"error": "no leader elected yet; retry"}),
+                    "jobs during range assembly: {code}: {body}"
+                );
+                // Election gaps are not queue observations. Keep the original
+                // deadline and require a real successful completion response.
+            } else {
+                assert_eq!(code, 200, "jobs during range assembly: {body}");
+                if value["jobs"][0]["status"] == "completed"
+                    && tmp.path().join("complete/ranged/range.bin").is_file()
+                {
+                    break;
+                }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1356,6 +1389,129 @@ async fn single_node_cluster_restart_keeps_the_queue() {
     a2.kill().await;
 }
 
+/// Plan M1a (i), review #280-6: a worker's post-processing failure is one
+/// terminal, recorded by the leader — exactly one `job_terminals` row (on
+/// the leader; the executing worker records none), one history row and one
+/// `job_pp_finished` — and the PP lease is released. The failure's bytes are
+/// disposed through the cluster cleanup ledger, not by a second node; the
+/// non-executing nodes hold no terminal row to dispose from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn worker_pp_failure_is_one_leader_terminal() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    if !require_tool("7z") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let files = vec![(
+        "broken.zip",
+        b"PK\x03\x04 this is not a complete zip archive".to_vec(),
+    )];
+    let post = build_post("brokenpp", &files, 20_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let node = |coordinator, priority, download, post_process| NodeOpts {
+        coordinator,
+        priority,
+        download,
+        max_download_jobs: if download { 2 } else { 0 },
+        post_process,
+        min_free_disk_bytes: 0,
+    };
+    // The authority runs post-processing too (the daemon's usual shape):
+    // only a node with a PP setup holds the shared history, and the leader
+    // must hold it to own the terminal.
+    let a = start_node(tmp.path(), "a", node(true, 0, false, true), ns.port(), 4).await;
+    let b = start_node(tmp.path(), "b", node(false, 5, true, false), ns.port(), 4).await;
+    let c = start_node(tmp.path(), "c", node(false, 9, false, true), ns.port(), 4).await;
+    wait_for("leader elected", 15, || {
+        get_json(&a.url, "/api/v1/cluster")["is_leader"].as_bool() == Some(true)
+    })
+    .await;
+    wait_for("all nodes registered", 15, || {
+        get_json(&a.url, "/api/v1/cluster")["nodes"]
+            .as_array()
+            .is_some_and(|n| n.len() == 3)
+    })
+    .await;
+    let mut events = a.runtime.engine.subscribe();
+    add_job(&a.url, "brokenpp", post.nzb.as_bytes()).await;
+    wait_for("worker PP failure recorded by the leader", 60, || {
+        a.runtime
+            .engine
+            .artifacts()
+            .terminal(1)
+            .unwrap()
+            .is_some_and(|terminal| terminal.emitted)
+    })
+    .await;
+    let terminal = a.runtime.engine.artifacts().terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Failed);
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    assert!(terminal.blames_release);
+    assert!(terminal.markers_stamped);
+    let seq = terminal.history_seq.expect("history row");
+    for other in [&b, &c] {
+        assert!(
+            other
+                .runtime
+                .engine
+                .artifacts()
+                .terminal(1)
+                .unwrap()
+                .is_none(),
+            "{}: only the leader records the terminal",
+            other.url
+        );
+    }
+    // One history row for the job across every node's shared history log.
+    let rows = std::fs::read_dir(tmp.path().join(".nzbd-cluster/history"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+        .flat_map(|entry| {
+            std::fs::read_to_string(entry.path())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<nzbd_state::HistoryEntry>(line).ok())
+                .filter(|row| row.name == "brokenpp")
+                .map(|row| (row.job, row.completed_at_unix, row.status))
+                .collect::<Vec<_>>()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(rows.len(), 1, "exactly one history row: {rows:?}");
+    wait_for("failed row retired from the leader's queue", 30, || {
+        get_json(&a.url, "/api/v1/jobs")["jobs"]
+            .as_array()
+            .is_some_and(|jobs| jobs.is_empty())
+    })
+    .await;
+    assert!(
+        get_json(&a.url, "/api/v1/cluster")["leases"]
+            .as_array()
+            .is_none_or(|leases| leases.is_empty()),
+        "the PP lease is released"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut finished = 0;
+    while let Ok(event) = events.try_recv() {
+        if let nzbd_engine::Event::JobPpFinished {
+            job, history_seq, ..
+        } = event
+        {
+            if job.0 == 1 {
+                assert_eq!(history_seq, seq);
+                finished += 1;
+            }
+        }
+    }
+    assert_eq!(finished, 1, "exactly one job_pp_finished");
+    a.kill().await;
+    b.kill().await;
+    c.kill().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pp_runs_on_idle_node_via_anti_affinity() {
     let _ = tracing_subscriber::fmt()
@@ -1472,7 +1628,29 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
     })
     .await;
 
+    // The authority's post pause holds remote post-processing too: the
+    // download finishes on b, but no worker is granted the post lease
+    // until the lane resumes.
+    let (code, body) = http(&a.url, "POST", "/api/v1/queue/actions/pause-post", b"");
+    assert_eq!(code, 200, "pause-post: {body}");
     add_job(&a.url, "pardl", post.nzb.as_bytes()).await;
+    wait_for("download finished while post is paused", 45, || {
+        get_json(&a.url, "/api/v1/jobs")["jobs"]
+            .as_array()
+            .and_then(|j| j.first().cloned())
+            .is_some_and(|j| j["remaining_bytes"] == 0 && j["status"] == "completed")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !tmp.path()
+            .join(".nzbd-cluster/history/history.c.jsonl")
+            .exists(),
+        "no remote post-processing may run while the post lane is paused"
+    );
+    assert_eq!(get_json(&a.url, "/api/v1/status")["post_paused"], true);
+    let (code, body) = http(&a.url, "POST", "/api/v1/queue/actions/resume-post", b"");
+    assert_eq!(code, 200, "resume-post: {body}");
 
     // Download completes on b (c can't download); PP is assigned to c,
     // executes there, and the stamped job comes back and is RETIRED to
@@ -1508,6 +1686,30 @@ async fn pp_runs_on_idle_node_via_anti_affinity() {
         .expect("node c must have appended shared history");
     assert!(hist.contains("\"SUCCESS\""), "history: {hist}");
     assert!(hist.contains("\"pardl\""), "history: {hist}");
+
+    // Contract §2.1 with post-processing off on the authority: the worker
+    // that writes the history row records the job's one terminal.
+    let recorded = [&a, &b, &c]
+        .iter()
+        .filter_map(|node| {
+            node.runtime
+                .engine
+                .artifacts()
+                .terminal(1)
+                .unwrap()
+                .map(|terminal| (node.url.clone(), terminal))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recorded.len(), 1, "exactly one terminal: {recorded:?}");
+    assert_eq!(
+        recorded[0].0, c.url,
+        "recorded where the history row is written"
+    );
+    assert_eq!(
+        recorded[0].1.outcome,
+        nzbd_types::TerminalOutcome::Completed
+    );
+    assert!(recorded[0].1.emitted);
 
     a.kill().await;
     b.kill().await;
@@ -1660,6 +1862,23 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
         std::fs::read(path.join(delivery["files"][0]["path"].as_str().unwrap())).unwrap(),
         bytes
     );
+    // Contract §2.5: the leader's publication directory is a publication —
+    // `.runner-manifest.json` written last, its digest the row's.
+    let runner_manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path.join(".runner-manifest.json")).expect("cluster publication manifest"),
+    )
+    .unwrap();
+    assert_eq!(runner_manifest["digest"], delivery["manifestDigest"]);
+    assert_eq!(
+        runner_manifest["generation"],
+        delivery["publicationGeneration"]
+    );
+    assert_eq!(runner_manifest["transfer"], "cluster-ready-token");
+    assert_eq!(runner_manifest["cross_volume"], true);
+    assert_eq!(
+        runner_manifest["files"].as_array().map(Vec::len),
+        delivery["files"].as_array().map(Vec::len)
+    );
     let id = delivery["deliveryId"].as_str().unwrap();
     let acceptance=serde_json::to_vec(&serde_json::json!({"protocolVersion":1,"publicationGeneration":delivery["publicationGeneration"],"manifestDigest":delivery["manifestDigest"],"consumerReceiptId":"curator-accepted-cluster"})).unwrap();
     let (status, accepted) = http_with_headers(
@@ -1669,8 +1888,11 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
         &acceptance,
         &[("Content-Type", "application/json")],
     );
-    assert_eq!(status, 200, "acceptance through worker proxy: {accepted}");
-    assert!(accepted.contains("sourceCopies"));
+    // Contract §2.5 (v2, runner M3): there is no acceptance. The route is
+    // gone, and answers so through the worker's proxy as well; source cleanup
+    // does not wait for a consumer receipt.
+    assert_eq!(status, 410, "acceptance through worker proxy: {accepted}");
+    assert!(accepted.contains("acceptance was removed"), "{accepted}");
     // Consumer is entitled to remove its transferred publication immediately.
     std::fs::remove_dir_all(&path).unwrap();
     let last_cleanup_progress = std::cell::RefCell::new(String::new());
@@ -1741,7 +1963,9 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
                 &format!("/api/v1/deliveries/{id}"),
                 b"",
             );
-            code == 200 && body.contains("curator-accepted-cluster")
+            // Contract v2: accept is a no-op, so the replayed row carries no
+            // consumer receipt; recovery is the row answering unchanged.
+            code == 200 && body.contains("deliveryId")
         },
     )
     .await;
@@ -1773,6 +1997,77 @@ async fn delivery_receipts_survive_authority_restart_and_consumer_removed_public
     downloader.kill().await;
     post_worker.kill().await;
     successor.kill().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_control_migration_decodes_compressed_snapshot_and_backs_up_original_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let job = nzbd_types::Job {
+        id: nzbd_types::JobId(700),
+        kind: nzbd_types::JobKind::Nzb,
+        name: "paused legacy".into(),
+        dir_name: "paused-legacy".into(),
+        name_provisional: false,
+        delivery_lifecycle: false,
+        queued_at_unix: 1,
+        original_name: String::new(),
+        category: None,
+        priority: 0,
+        dupe: Default::default(),
+        params: vec![("opaque-user-metadata".into(), "metadata".repeat(160_000))],
+        files: Vec::new(),
+        totals: Default::default(),
+        status: nzbd_types::JobStatus::Paused,
+        torrent: None,
+        stages: Vec::new(),
+    };
+    let snapshot = nzbd_state::QueueSnapshotDoc {
+        jobs: vec![job],
+        next_job_id: 700,
+        ..Default::default()
+    };
+    let state = tmp.path().join(".nzbd-cluster");
+    nzbd_state::SnapshotStore::open(&state)
+        .unwrap()
+        .save(&snapshot)
+        .unwrap();
+    let original = std::fs::read(state.join("queue.json")).unwrap();
+    assert!(original.starts_with(b"NZBDQZ01"));
+    let mut fingerprint = sha2::Sha256::new();
+    fingerprint.update(b"queue\0");
+    fingerprint.update(&original);
+    fingerprint.update(b"history\0");
+    let backup = tmp
+        .path()
+        .join("control-a/migration-backup")
+        .join(format!("{:x}", fingerprint.finalize()))
+        .join("queue.json");
+    let node = start_node(
+        tmp.path(),
+        "a",
+        NodeOpts {
+            coordinator: true,
+            priority: 0,
+            download: false,
+            max_download_jobs: 0,
+            post_process: false,
+            min_free_disk_bytes: 0,
+        },
+        9,
+        1,
+    )
+    .await;
+    assert_eq!(std::fs::read(backup).unwrap(), original);
+    wait_for("compressed legacy queue reaches authority", 15, || {
+        node.runtime
+            .engine
+            .snapshot()
+            .jobs
+            .iter()
+            .any(|job| job.id == nzbd_types::JobId(700))
+    })
+    .await;
+    node.kill().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2033,8 +2328,11 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
         &acceptance,
         &[("Content-Type", "application/json")],
     );
-    assert_eq!(status, 200, "acceptance through worker proxy: {accepted}");
-    assert!(accepted.contains("sourceCopies"));
+    // Contract §2.5 (v2, runner M3): there is no acceptance. The route is
+    // gone, and answers so through the worker's proxy as well; source cleanup
+    // does not wait for a consumer receipt.
+    assert_eq!(status, 410, "acceptance through worker proxy: {accepted}");
+    assert!(accepted.contains("acceptance was removed"), "{accepted}");
     // Consumer is entitled to remove its transferred publication immediately.
     std::fs::remove_dir_all(&path).unwrap();
     let last_cleanup_progress = std::cell::RefCell::new(String::new());
@@ -2167,7 +2465,9 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
                 &format!("/api/v1/deliveries/{id}"),
                 b"",
             );
-            code == 200 && body.contains("curator-accepted-cluster")
+            // Contract v2: accept is a no-op, so the replayed row carries no
+            // consumer receipt; recovery is the row answering unchanged.
+            code == 200 && body.contains("deliveryId")
         },
     )
     .await;
@@ -2190,7 +2490,10 @@ async fn delivery_receipts_and_copy_acks_survive_actual_majority_authority_chang
         !path.exists(),
         "replay must not republish a consumer-removed path"
     );
-    assert_eq!(replay["consumerReceiptId"], "curator-accepted-cluster");
+    assert!(
+        replay["consumerReceiptId"].is_null(),
+        "accept records nothing"
+    );
     assert_eq!(replay["sourceCleanup"]["status"], "succeeded");
     assert!(replay["sourceCopies"]
         .as_array()
@@ -2366,9 +2669,9 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
             );
         }
         worker.runtime.engine.snapshot().jobs.iter().any(|job| {
-            job.control.as_ref().is_some_and(|control| {
-                control.lifecycle == "held" && control.hold_cause().policy().automatic()
-            })
+            job.control
+                .as_ref()
+                .is_some_and(|control| control.lifecycle == "held")
         })
     })
     .await;
@@ -2420,9 +2723,9 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
         20,
         || {
             restarted.runtime.engine.snapshot().jobs.iter().any(|job| {
-                job.control.as_ref().is_some_and(|control| {
-                    control.lifecycle == "held" && control.hold_cause().policy().automatic()
-                })
+                job.control
+                    .as_ref()
+                    .is_some_and(|control| control.lifecycle == "held")
             })
         },
     )
@@ -2476,7 +2779,8 @@ async fn worker_restart_regrant_preserves_retry_deadline_and_private_generation(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn terminal_unusable_cluster_completion_drains_owned_copies_without_empty_delivery() {
+async fn terminal_unusable_cluster_completion_follows_failure_action_and_drains_sealed_generations()
+{
     terminal_empty_cluster_fixture(false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -2619,8 +2923,8 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         verified_paused(&authority.runtime.engine, nzbd_types::JobId(job_id as u32)).await;
     }
     // Reconciliation can start another verification after the readiness
-    // observation above. Retry only an empty transient 503 while the exact
-    // job still resolves to Paused; never replay an accepted Resume.
+    // observation above. Retry only this job's exact pre-handler verification
+    // refusal while it still resolves to Paused; never replay an accepted Resume.
     let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let (code, body) = http(
@@ -2632,7 +2936,18 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         if code == 200 {
             break;
         }
-        assert!(code == 503 && body.is_empty(), "Resume: {code}: {body}");
+        let expected = serde_json::json!({
+            "error": "queue_projection_unavailable",
+            "detail": format!("export queue projection for job {job_id}: file lifecycle: job verification or writer retirement is still in progress; retry later"),
+        });
+        assert!(
+            code == 503
+                && serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .as_ref()
+                    == Some(&expected),
+            "Resume: {code}: {body}"
+        );
         assert!(
             tokio::time::Instant::now() < resume_deadline,
             "Resume remained blocked by verification"
@@ -2681,7 +2996,12 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
     wait_for("exact terminal source disposition acknowledged",30,||{
         let (code,body)=http(&authority.url,"GET",&format!("/api/v1/deliveries/{id}"),b"");
         if cleanup_started.elapsed().as_secs()>12&&!cleanup_debug.replace(true){eprintln!("private copy disposition code={code} {body}; authority source={:?}; worker source={:?}",authority.runtime.engine.artifacts().for_job(entry.job.0).ok().flatten().map(|a|(a.id,a.generation,a.path,a.state,a.error)),worker.runtime.engine.artifacts().for_job(entry.job.0).ok().flatten().map(|a|(a.id,a.generation,a.path,a.state,a.error)));}
-        code==200&&serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|row|row["cleanupOnly"]==true&&row["sourceCleanup"]["status"]==if keep {"blocked"}else{"succeeded"})
+        // Contract v2 §2.2 (0.9.0): an empty/junk-only completion is
+        // `failed/publish`. Kept, its raw copies are retained; a curator-
+        // admitted job without Keep follows `failure_action` (delete) like
+        // single-node disposal, so every copy is removed.
+        let expected = if keep { "blocked" } else { "succeeded" };
+        code==200&&serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|row|row["cleanupOnly"]==true&&row["sourceCleanup"]["status"]==expected)
     }).await;
     let raw = authority
         .runtime
@@ -2693,17 +3013,14 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
     assert_eq!(
         raw.path.exists(),
         keep,
-        "exact admitted raw custody must follow explicitKeep: path={} state={} keep={} detail={}",
+        "a kept publish failure's raw custody is retained, an unkept one deleted: path={} state={} keep={} detail={}",
         raw.path.display(),
         raw.state,
         raw.keep_on_failure,
         get_json(&authority.url, &format!("/api/v1/deliveries/{id}"))
     );
-    if keep {
-        assert!(raw.keep_on_failure);
-    } else {
-        assert_eq!(raw.state, "deleted");
-    }
+    assert_eq!(raw.keep_on_failure, keep);
+    assert_eq!(raw.state == "deleted", !keep);
     let remaining = manifest_paths(&tmp.path().join(".nzbd-cluster/generations"));
     let remaining_files = remaining
         .iter()
@@ -2758,7 +3075,9 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
         &format!("/api/v1/deliveries/{id}/accept"),
         b"{}",
     );
-    assert_eq!(code, 409);
+    // Contract §2.5: there is no acceptance; the route is gone for every id
+    // (it answered 409 for a private cleanup row under v1).
+    assert_eq!(code, 410);
     worker.kill().await;
     downloader.kill().await;
     authority.kill().await;
@@ -2766,7 +3085,7 @@ async fn terminal_empty_cluster_fixture(keep: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn completed_text_document_is_retained_with_visible_review_action() {
+async fn completed_text_document_is_one_publish_failure_with_default_deletion() {
     let tmp = tempfile::tempdir().unwrap();
     let text=b"An intended plain text book. Chapter one. This complete document must remain available for review.".to_vec();
     let post = build_post("Text.Book", &[("Novel.txt", text.clone())], 20_000);
@@ -2806,24 +3125,39 @@ async fn completed_text_document_is_retained_with_visible_review_action() {
     })
     .await;
     post_until_created("text admission",15,||http(&authority.url,"POST","/api/v1/jobs?name=Text.Book&params=%7B%22monarr-delivery%22%3A%221%22%2C%22monarr-transfer%22%3A%22intended-text-token%22%7D",post.nzb.as_bytes())).await;
-    wait_for("intact unsupported text review", 25, || {
-        worker.runtime.engine.snapshot().jobs.iter().any(|job| {
-            job.control.as_ref().is_some_and(|control| {
-                control.lifecycle == "held"
-                    && control.message.contains("supported publication format")
-            })
+    // Contract v2 §2.2/§2.3: a completed download with nothing publishable
+    // is the terminal `failed/publish` (no review hold any more), recorded
+    // once — here by the worker, which holds the history store because the
+    // authority runs no post-processing. Its owned failed bytes follow the
+    // default deletion policy once terminal and custody settlement finish.
+    wait_for("unsupported text ends failed/publish", 25, || {
+        [&authority, &worker].iter().any(|node| {
+            node.runtime
+                .engine
+                .artifacts()
+                .terminal(1)
+                .unwrap()
+                .is_some_and(|terminal| terminal.emitted)
         })
     })
     .await;
-    let held = worker
-        .runtime
-        .engine
-        .snapshot()
-        .jobs
+    let recorded = [&authority, &worker]
         .iter()
-        .find(|job| job.control.is_some())
-        .unwrap()
-        .id;
+        .filter_map(|node| node.runtime.engine.artifacts().terminal(1).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(recorded.len(), 1, "exactly one terminal: {recorded:?}");
+    let terminal = &recorded[0];
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Publish));
+    assert!(!terminal.blames_release);
+    assert!(
+        terminal
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("supported publication format")),
+        "{:?}",
+        terminal.message
+    );
+    let held = nzbd_types::JobId(1);
     let source = worker
         .runtime
         .engine
@@ -2831,11 +3165,18 @@ async fn completed_text_document_is_retained_with_visible_review_action() {
         .for_job(held.0)
         .unwrap()
         .unwrap();
-    assert!(source.path.exists());
-    assert!(std::fs::read_dir(&source.path)
-        .unwrap()
-        .flatten()
-        .any(|entry| std::fs::read(entry.path()).ok().as_deref() == Some(text.as_slice())));
+    wait_for("unkept failed text bytes are deleted", 25, || {
+        worker
+            .runtime
+            .engine
+            .artifacts()
+            .get(&source.id)
+            .unwrap()
+            .state
+            == "deleted"
+            && !source.path.exists()
+    })
+    .await;
     assert!(get_json(
         &authority.url,
         "/api/v1/deliveries?after=0&includeAccepted=true"

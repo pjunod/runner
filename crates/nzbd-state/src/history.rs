@@ -99,7 +99,6 @@ fn unix_now() -> i64 {
 
 pub struct HistoryDb {
     conn: Mutex<Connection>,
-    reader: Mutex<Connection>,
     sync: SyncControl,
     _writer_locks: Vec<File>,
     jsonl: Option<PathBuf>,
@@ -160,8 +159,15 @@ impl HistoryDb {
         sync::prepare_index(db_path, jsonl_dir, tag, spool_dir)?;
         let conn = Connection::open(db_path)
             .map_err(|e| StateError::Corrupt(format!("sqlite open {}: {e}", db_path.display())))?;
+        // W5b: one connection, EXCLUSIVE locking set before the first WAL
+        // access, so SQLite keeps the WAL index in heap memory and never
+        // creates or maps `-shm` — which a network filesystem cannot share
+        // and which crash-looped nzbd with SIGBUS once truncated. Every read
+        // goes through this same connection (a second one would be locked
+        // out); offline inspection runs with the daemon stopped.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            "PRAGMA locking_mode=EXCLUSIVE;
+             PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  job_id INTEGER NOT NULL,
@@ -213,6 +219,14 @@ impl HistoryDb {
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);",
         )
         .map_err(|e| StateError::Corrupt(format!("sqlite meta schema: {e}")))?;
+        // Text-valued node-local facts. `incarnation` names this index: a
+        // wiped or freshly rebuilt index reassigns rowids, so a consumer's
+        // `since_seq` cursor is meaningful only against the incarnation it
+        // was read from (pipeline contract v2 §2.5).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .map_err(|e| StateError::Corrupt(format!("sqlite history_meta schema: {e}")))?;
         // Derived from portable JSONL tombstones. Keeping the set in SQLite
         // makes the delete win even if a refresh races an insert of the old
         // entry; a wiped index reconstructs it from the log.
@@ -230,12 +244,6 @@ impl HistoryDb {
                             ON history(completed_at DESC, id DESC);",
         )
         .map_err(|e| StateError::Corrupt(format!("history ordering index: {e}")))?;
-        let reader =
-            Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|e| StateError::Corrupt(format!("history reader: {e}")))?;
-        reader
-            .busy_timeout(Duration::from_millis(100))
-            .map_err(|e| StateError::Corrupt(format!("history reader timeout: {e}")))?;
         let paused = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'history_sync_paused'",
@@ -255,7 +263,6 @@ impl HistoryDb {
         });
         let db = HistoryDb {
             conn: Mutex::new(conn),
-            reader: Mutex::new(reader),
             sync: SyncControl::new(mode, paused, db_path),
             _writer_locks: writer_locks,
             jsonl,
@@ -310,10 +317,74 @@ impl HistoryDb {
     /// this node's own file is compacted, but another node's is not, and
     /// every poll would re-import what the last prune just dropped —
     /// exactly the resurrect-with-a-new-cursor shape that
-    /// `docs/DEFECT_HISTORY_DELETE.md` documents for `delete`. The floor
+    /// `docs/archive/DEFECT_HISTORY_DELETE.md` documents for `delete`. The floor
     /// only ever rises, so it can't flap.
     fn rebuild_from_jsonl(&self, quiet: bool) -> Result<(), StateError> {
-        self.replay_logs(quiet)
+        let before = self.head_seq()?;
+        self.replay_logs(quiet)?;
+        // An index that held nothing and now holds replayed rows has just
+        // assigned every rowid afresh: a cursor from any earlier index is
+        // meaningless against it. A routine refresh of a populated index
+        // only appends above the head and keeps the incarnation.
+        if before == 0 && self.head_seq()? > 0 {
+            self.mint_incarnation()?;
+        }
+        Ok(())
+    }
+
+    /// The identity of this SQLite index (contract §2.5): read, or minted
+    /// and stored on first call. It changes whenever the index is rebuilt
+    /// from the portable log with fresh rowids.
+    pub fn incarnation(&self) -> Result<String, StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO history_meta (key, value)
+             VALUES ('incarnation', lower(hex(randomblob(16))))",
+            [],
+        )
+        .map_err(|e| StateError::Corrupt(format!("history incarnation mint: {e}")))?;
+        conn.query_row(
+            "SELECT value FROM history_meta WHERE key = 'incarnation'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| StateError::Corrupt(format!("history incarnation read: {e}")))
+    }
+
+    fn mint_incarnation(&self) -> Result<(), StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO history_meta (key, value) VALUES ('incarnation', lower(hex(randomblob(16))))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .map_err(|e| StateError::Corrupt(format!("history incarnation mint: {e}")))?;
+        Ok(())
+    }
+
+    /// The highest sequence the index holds (0 when empty).
+    pub fn head_seq(&self) -> Result<i64, StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM history", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| StateError::Corrupt(format!("history head: {e}")))
+    }
+
+    /// The lowest sequence still retained (0 when empty). A cursor below
+    /// this has lost rows to pruning and must reconcile (contract §2.5).
+    pub fn retained_min_seq(&self) -> Result<i64, StateError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COALESCE(MIN(id), 0) FROM history", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| StateError::Corrupt(format!("history retained minimum: {e}")))
+    }
+
+    /// Test support: replay the portable log into this index as boot does.
+    #[doc(hidden)]
+    pub fn rebuild_for_test(&self) -> Result<(), StateError> {
+        self.rebuild_from_jsonl(false)
     }
 
     /// Merge previously unseen portable tombstones into the derived index,
@@ -402,7 +473,7 @@ impl HistoryDb {
 
     /// Visible row count — what the pager divides into pages.
     pub fn count_filtered(&self, include_hidden: bool) -> Result<u64, StateError> {
-        let conn = self.reader.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
         let sql = format!(
             "SELECT COUNT(*) FROM history {}",
             if include_hidden {
@@ -437,7 +508,7 @@ impl HistoryDb {
     /// 3. **The watermark rises**, so ingest refuses to re-import what just
     ///    went (see `rebuild_from_jsonl`).
     ///
-    /// `docs/DEFECT_HISTORY_DELETE.md` rejects "delete the JSONL line" as a
+    /// `docs/archive/DEFECT_HISTORY_DELETE.md` rejects "delete the JSONL line" as a
     /// fix for `delete`, and rightly: rewriting an append-only log on a
     /// shared volume *under other nodes' concurrent appends* to service a
     /// UI click. Compaction is not that. A node rewrites only the file it
@@ -836,6 +907,20 @@ impl HistoryDb {
         .map(|entries| entries.into_iter().next())
     }
 
+    /// Indexed by job, but matched by the random allocation id as well: job
+    /// numbers and display names alone must never authorize scratch retirement.
+    pub(crate) fn deleted_artifact_completion(
+        &self,
+        job: crate::JobId,
+        artifact: &str,
+    ) -> Result<Option<HistoryEntry>, StateError> {
+        self.query(
+            &format!("SELECT {COLUMNS} FROM history WHERE job_id=?1 AND status='DELETED' AND EXISTS (SELECT 1 FROM json_each(history.params) WHERE json_extract(value,'$[0]')='Artifact:Id' AND json_extract(value,'$[1]')=?2) ORDER BY completed_at DESC,id DESC LIMIT 1"),
+            &[&job.0, &artifact],
+        )
+        .map(|entries| entries.into_iter().next())
+    }
+
     /// One page of the newest-first view: `limit` entries starting at
     /// `offset`.
     ///
@@ -874,7 +959,7 @@ impl HistoryDb {
         offset: usize,
         since: Option<i64>,
     ) -> Result<(Vec<HistoryEntry>, u64), StateError> {
-        let mut conn = self.reader.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| StateError::Corrupt(e.to_string()))?;
@@ -922,7 +1007,7 @@ impl HistoryDb {
         sql: &str,
         params: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<HistoryEntry>, StateError> {
-        let conn = self.reader.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
         Self::query_on(&conn, sql, params)
     }
 
@@ -1444,6 +1529,59 @@ mod tests {
             .max_by_key(|s| s.ms.unwrap_or(0))
             .unwrap();
         assert_eq!(slowest.stage, PostStage::ParRepair);
+    }
+
+    /// Contract §2.5 / plan M1 (j): a rebuilt index is a new incarnation, a
+    /// routine refresh is not, and the cursor bounds follow pruning.
+    #[test]
+    fn rebuild_changes_incarnation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let portable = tmp.path().join("portable");
+        let index = tmp.path().join("history.sqlite");
+        let db = HistoryDb::open(&index, Some(&portable)).unwrap();
+        assert_eq!(db.head_seq().unwrap(), 0);
+        assert_eq!(db.retained_min_seq().unwrap(), 0);
+        let first = db.incarnation().unwrap();
+        assert_eq!(first.len(), 32);
+        assert_eq!(db.incarnation().unwrap(), first, "stable across reads");
+        for (job, at) in [(1, 1_000), (2, 2_000), (3, 3_000)] {
+            db.record_seq_durable(&entry(job, at)).unwrap();
+        }
+        assert_eq!(db.head_seq().unwrap(), 3);
+        assert_eq!(db.retained_min_seq().unwrap(), 1);
+        // A routine refresh of a populated index keeps the identity.
+        db.rebuild_for_test().unwrap();
+        assert_eq!(db.incarnation().unwrap(), first);
+        // Pruning raises the retained minimum; the head stays.
+        db.set_retention(Retention {
+            keep_max: 2,
+            keep_days: 0,
+        })
+        .unwrap();
+        assert_eq!(db.retained_min_seq().unwrap(), 2);
+        assert_eq!(db.head_seq().unwrap(), 3);
+        drop(db);
+        // Reopen against the same index: same incarnation.
+        let reopened = HistoryDb::open(&index, Some(&portable)).unwrap();
+        assert_eq!(reopened.incarnation().unwrap(), first);
+        drop(reopened);
+        // A wiped index rebuilt from the portable log reassigns rowids: a
+        // new incarnation, so a consumer holding (first, 3) must reconcile.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", index.display()));
+        }
+        let rebuilt = HistoryDb::open(&index, Some(&portable)).unwrap();
+        assert!(
+            rebuilt.head_seq().unwrap() > 0,
+            "rows replayed from the log"
+        );
+        let second = rebuilt.incarnation().unwrap();
+        assert_ne!(second, first);
+        let consumer_cursor = (first.clone(), 3_i64);
+        assert!(
+            consumer_cursor.0 != second,
+            "a cursor from the old incarnation is rejected by identity, not by number"
+        );
     }
 
     #[test]

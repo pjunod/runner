@@ -38,6 +38,16 @@ export function urlFetchDetail(job: Pick<JobSummary, 'url_fetch'>, nowMs: number
 }
 
 /**
+ * Whether "Retry now" has a wait to cut short: the fetch was refused or
+ * failed and its next attempt is still in the future. In flight (no next
+ * retry time) or already due, the daemon is retrying on its own.
+ */
+export function canRetryFetchNow(job: Pick<JobSummary, 'url_fetch'>, nowMs: number): boolean {
+  const retry = job.url_fetch;
+  return !!retry?.attempts && retry.nextRetryAtUnix != null && retry.nextRetryAtUnix * 1000 > nowMs;
+}
+
+/**
  * Wall-clock time that advances on its own while `active`.
  *
  * A parked fetch does not change, and the event stream sends nothing for an

@@ -8,12 +8,16 @@
 //! about state. Sends toward writer tasks use `try_send` with a
 //! retry-on-tick fallback so owner ⇄ writer backpressure can never deadlock.
 
+#[path = "owner_disposition.rs"]
+mod disposition;
 #[path = "owner_native_failure.rs"]
 mod native_failure;
 #[path = "owner_lifecycle.rs"]
 mod native_lifecycle;
 #[path = "owner_native_seed.rs"]
 mod native_seed;
+#[path = "owner_terminal.rs"]
+mod terminal_owner;
 #[path = "owner_transitions.rs"]
 mod transitions;
 
@@ -26,7 +30,9 @@ use crate::queue::{
 };
 use crate::rate::{RateLimiter, SpeedMeter};
 use crate::recovery::{DurableFileProof, ProvenRange, WRITER_PROTOCOL};
-use crate::snapshot::{JobSummary, QueueSnapshot, SharedSnapshot, StorageVolumeSnapshot};
+use crate::snapshot::{
+    JobSummary, QueueSnapshot, SharedSnapshot, StorageIoSnapshot, StorageVolumeSnapshot,
+};
 use crate::volumes::DiskGuardReading;
 use crate::writer::{spawn_writer_scoped, WriteCmd, WriterFact, WriterHandle, WriterScope};
 #[path = "owner_recovery.rs"]
@@ -63,6 +69,14 @@ use tokio_util::sync::CancellationToken;
 /// Refuse a new control request once this bound is reached rather than growing
 /// owner memory without limit while no adapter is attached.
 const MAX_PENDING_BACKEND_COMMANDS: usize = 64;
+/// No-wedge task 1: how many times one file may be discarded and
+/// re-downloaded after an identity mismatch before the job fails
+/// `identity`.
+pub(crate) const IDENTITY_RESET_LIMIT: u32 = 3;
+/// Job param: identity resets taken so far for a file (`<prefix><file>`).
+pub(crate) const IDENTITY_RESETS_PREFIX: &str = "*File:identity-resets:";
+/// Job param: the next writer for this file must start from an empty file.
+pub(crate) const IDENTITY_DISCARD_PREFIX: &str = "*File:identity-discard:";
 
 // Only an unenrolled configured root may be initialized. A missing enrolled
 // mount remains unavailable; creating a replacement directory cannot prove it.
@@ -78,6 +92,167 @@ fn prepare_unenrolled_payload_root(
             .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
     }
     Ok(())
+}
+
+/// A checkpoint's distinct members, in order: an identical repeat of a
+/// segment is dropped; `None` when two members name the same segment with
+/// different extents or CRCs.
+fn checkpoint_members(
+    segments: Vec<crate::writer::WrittenSegment>,
+) -> Option<Vec<crate::writer::WrittenSegment>> {
+    let mut seen: HashMap<u32, (u64, u32, u32)> = HashMap::with_capacity(segments.len());
+    let mut members = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let extent = (segment.offset, segment.len, segment.crc);
+        match seen.insert(segment.seg_number, extent) {
+            None => members.push(segment),
+            Some(prior) if prior == extent => {}
+            Some(_) => return None,
+        }
+    }
+    Some(members)
+}
+
+/// True when any range of `batch` shares a segment number with, or overlaps,
+/// a different range — already proven or elsewhere in the batch. Sorting
+/// the (small) batch makes this one pass over the proof instead of a pass
+/// per new range.
+fn proof_overlaps(proven: &[ProvenRange], batch: &[ProvenRange]) -> bool {
+    // Empty or unbounded extents break the ordering argument below; the
+    // writer never sends them, but keep the result exact if one appears.
+    if batch
+        .iter()
+        .any(|range| range.len == 0 || range.end().is_none())
+    {
+        let mut seen = proven.to_vec();
+        for range in batch {
+            if seen
+                .iter()
+                .any(|prior| prior.seg_number == range.seg_number || prior.overlaps(range))
+            {
+                return true;
+            }
+            seen.push(range.clone());
+        }
+        return false;
+    }
+    let mut sorted: Vec<&ProvenRange> = batch.iter().collect();
+    sorted.sort_by_key(|range| range.offset);
+    let numbers: HashSet<u32> = batch.iter().map(|range| range.seg_number).collect();
+    if numbers.len() != batch.len() || sorted.windows(2).any(|pair| pair[0].overlaps(pair[1])) {
+        return true;
+    }
+    proven.iter().any(|prior| {
+        if numbers.contains(&prior.seg_number) {
+            return true;
+        }
+        let Some(prior_end) = prior.end() else {
+            return true;
+        };
+        // Batch extents are non-empty and disjoint, so sorted by offset their
+        // ends ascend too: the first one ending after `prior` starts is the
+        // only one that can overlap it.
+        let first =
+            sorted.partition_point(|range| range.end().is_some_and(|end| end <= prior.offset));
+        sorted
+            .get(first)
+            .is_some_and(|range| range.offset < prior_end && range.overlaps(prior))
+    })
+}
+
+#[cfg(test)]
+mod proof_overlap_tests {
+    use super::{proof_overlaps, ProvenRange};
+
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The per-segment rule the checkpoint replaced: each new range, in
+    /// order, against everything already proven including earlier members.
+    fn sequential(proven: &[ProvenRange], batch: &[ProvenRange]) -> bool {
+        let mut seen = proven.to_vec();
+        for range in batch {
+            if seen
+                .iter()
+                .any(|prior| prior.seg_number == range.seg_number || prior.overlaps(range))
+            {
+                return true;
+            }
+            seen.push(range.clone());
+        }
+        false
+    }
+
+    fn member(seg_number: u32, offset: u64, crc: u32) -> crate::writer::WrittenSegment {
+        crate::writer::WrittenSegment {
+            seg_number,
+            offset,
+            len: 2,
+            crc,
+            file_size: 8,
+            server: nzbd_types::ServerId(1),
+        }
+    }
+
+    #[test]
+    fn checkpoint_repeats_are_idempotent_unless_they_contradict() {
+        let members =
+            super::checkpoint_members(vec![member(1, 0, 7), member(1, 0, 7), member(2, 2, 9)])
+                .expect("an identical re-ack inside one checkpoint is not a conflict");
+        assert_eq!(
+            members.iter().map(|m| m.seg_number).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let batch: Vec<_> = members
+            .iter()
+            .map(|m| ProvenRange {
+                seg_number: m.seg_number,
+                offset: m.offset,
+                len: m.len,
+                crc: m.crc,
+            })
+            .collect();
+        assert!(!proof_overlaps(&[], &batch));
+        assert!(super::checkpoint_members(vec![member(1, 0, 7), member(1, 0, 8)]).is_none());
+        assert!(super::checkpoint_members(vec![member(1, 0, 7), member(1, 2, 7)]).is_none());
+    }
+
+    #[test]
+    fn batch_check_matches_the_per_segment_rule() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..2000 {
+            let mut proven = Vec::new();
+            let mut cursor = 0;
+            for seg_number in 0..(next(&mut state) % 12) as u32 {
+                cursor += next(&mut state) % 5;
+                let len = 1 + (next(&mut state) % 6) as u32;
+                proven.push(ProvenRange {
+                    seg_number,
+                    offset: cursor,
+                    len,
+                    crc: 0,
+                });
+                cursor += u64::from(len);
+            }
+            let batch: Vec<_> = (0..1 + next(&mut state) % 5)
+                .map(|_| ProvenRange {
+                    seg_number: (next(&mut state) % 20) as u32,
+                    offset: next(&mut state) % (cursor + 10),
+                    len: (next(&mut state) % 6) as u32,
+                    crc: 0,
+                })
+                .collect();
+            assert_eq!(
+                proof_overlaps(&proven, &batch),
+                sequential(&proven, &batch),
+                "{proven:?} + {batch:?}"
+            );
+        }
+    }
 }
 
 fn set_owner_param(params: &mut Vec<(String, String)>, key: &str, value: Option<String>) {
@@ -150,6 +325,20 @@ pub(crate) struct GenerationMaterialization {
     pub emit_finished: bool,
 }
 
+#[derive(Debug)]
+pub(crate) enum WorkerRetirement {
+    Revoked(nzbd_state::artifacts::WorkerControlContext),
+    Accepted(nzbd_state::artifacts::WorkerControlContext),
+}
+
+impl WorkerRetirement {
+    fn context(&self) -> &nzbd_state::artifacts::WorkerControlContext {
+        match self {
+            Self::Revoked(context) | Self::Accepted(context) => context,
+        }
+    }
+}
+
 /// External commands (wrapped by `EngineHandle` methods).
 #[derive(Debug)]
 pub(crate) enum QueueCommand {
@@ -170,6 +359,14 @@ pub(crate) enum QueueCommand {
     BeginPostAdmission {
         job: JobId,
         reply: oneshot::Sender<Option<crate::PostAdmission>>,
+    },
+    BeginFailedCleanupAdmission {
+        job: JobId,
+        reply: oneshot::Sender<Option<crate::FailedCleanupAdmission>>,
+    },
+    FailedCleanupMetadata {
+        admission: crate::PostAdmission,
+        reply: oneshot::Sender<Option<Job>>,
     },
     EndPostAdmission {
         admission: crate::PostAdmission,
@@ -223,6 +420,8 @@ pub(crate) enum QueueCommand {
     FailNativeTorrent {
         job: JobId,
         donor: Option<JobId>,
+        reason: nzbd_types::FailureReason,
+        fetch_cause: Option<nzbd_types::FetchCause>,
         stage: String,
         message: String,
         cleanup_complete: bool,
@@ -347,6 +546,13 @@ pub(crate) enum QueueCommand {
         context: nzbd_state::artifacts::WorkerControlContext,
         reply: oneshot::Sender<bool>,
     },
+    AdvanceJobDisposition {
+        job: JobId,
+        native_joined: bool,
+        url_joined: bool,
+        request: nzbd_state::artifacts::JobDispositionRequest,
+        reply: oneshot::Sender<Result<nzbd_state::artifacts::JobDisposition, crate::EngineError>>,
+    },
     QuiescePayload {
         job: JobId,
         reply: oneshot::Sender<Result<Vec<WriterHandle>, String>>,
@@ -389,7 +595,20 @@ pub(crate) enum QueueCommand {
         source: String,
         reply: oneshot::Sender<()>,
     },
+    RetryStorage {
+        reply: oneshot::Sender<()>,
+    },
     ResumeAll {
+        source: String,
+        reply: oneshot::Sender<()>,
+    },
+    /// Post-processing lane, independent of the download pause above:
+    /// no new post stage starts while set (the running stage finishes).
+    PausePost {
+        source: String,
+        reply: oneshot::Sender<()>,
+    },
+    ResumePost {
         source: String,
         reply: oneshot::Sender<()>,
     },
@@ -453,7 +672,7 @@ pub(crate) enum QueueCommand {
     /// history or events — the executor-side handoff cleanup.
     RemoveJobSilent {
         job: JobId,
-        accepted_context: Option<nzbd_state::artifacts::WorkerControlContext>,
+        retirement: Option<WorkerRetirement>,
         reply: oneshot::Sender<bool>,
     },
     /// Mark a job as executing on another node: the local scheduler skips
@@ -554,15 +773,6 @@ pub(crate) enum QueueCommand {
         generation: String,
         reply: oneshot::Sender<Result<nzbd_state::artifacts::Artifact, String>>,
     },
-    SchedulePostRetry {
-        job: JobId,
-        revision: String,
-        retry_attempt: u8,
-        next_retry: i64,
-        blocked_since: i64,
-        message: String,
-        reply: oneshot::Sender<bool>,
-    },
     BeginResourceProbe {
         job: JobId,
         revision: String,
@@ -601,6 +811,39 @@ pub(crate) enum QueueCommand {
         reason: String,
         guard: crate::hold_release::HoldReleaseGuard,
         reply: oneshot::Sender<bool>,
+    },
+    PrepareWorkerHoldExpiry {
+        job: JobId,
+        revision: String,
+        notice: String,
+        guard: crate::hold_release::HoldReleaseGuard,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Contract §2.3: end an expired hold as `failed/hold_expired`.
+    ExpireHold {
+        job: JobId,
+        revision: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Contract §2.2: end a job as `failed/<reason>`.
+    FailJob {
+        job: JobId,
+        reason: nzbd_types::FailureReason,
+        fetch_cause: Option<nzbd_types::FetchCause>,
+        stage: String,
+        message: String,
+        reply: oneshot::Sender<Option<nzbd_state::artifacts::JobTerminal>>,
+    },
+    /// Contract §2.1: run the terminal chain for a producer-built row.
+    RecordTerminal {
+        terminal: Box<nzbd_state::artifacts::JobTerminal>,
+        /// The producer's history store when it has its own (post-processing
+        /// is handed one); otherwise the engine's.
+        history: Option<crate::TerminalHistory>,
+        reply: oneshot::Sender<Option<nzbd_state::artifacts::JobTerminal>>,
+    },
+    ReplayTerminals {
+        reply: oneshot::Sender<()>,
     },
     HoldJob {
         job: JobId,
@@ -744,6 +987,7 @@ pub(crate) struct Lease {
     pub message_id: String,
     pub writer: mpsc::Sender<WriteCmd>,
     pub generation: u64,
+    pub cancel: CancellationToken,
 }
 
 /// Everything that reaches the owner task.
@@ -754,6 +998,11 @@ type IoContinuation = Box<dyn FnOnce(&mut Owner, IoResult) + Send>;
 pub(crate) enum EngineMsg {
     PayloadFinished {
         root: PathBuf,
+        revision: u64,
+        result: IoResult,
+    },
+    /// A background (off-lane) blocking job finished; see `background_then`.
+    BackgroundFinished {
         revision: u64,
         result: IoResult,
     },
@@ -842,18 +1091,48 @@ pub(crate) enum EngineMsg {
         job: JobId,
         file: FileId,
         error: String,
+        /// The hold the writer's `io::Error` named by errno
+        /// ([`crate::io_error_hold_cause`]); `None` is a terminal `failed/io`.
+        cause: Option<nzbd_types::HoldCause>,
+    },
+    /// The writer found the file on disk is not the object its proof names
+    /// (no-wedge task 1). Nothing was written.
+    WriterIdentityMismatch {
+        job: JobId,
+        file: FileId,
+        error: String,
     },
     /// A real write ran out of space (ENOSPC/EDQUOT). Reported from
     /// wherever it happened — writer, finalize, post-processing — and
     /// latches the disk guard immediately.
     OutOfSpace {
         whence: String,
+        /// The directory whose write failed, when the reporter knows it.
+        dir: Option<PathBuf>,
+        /// The job whose post-processing write failed: that job's own retry
+        /// is the evidence that clears it (W5a).
+        job: Option<JobId>,
+    },
+    /// W5a: a probe round finished: per failure, the ENOSPC count it was
+    /// planned under (a newer report of the same failure voids a success),
+    /// what it found, and the guarded roots it found remounted.
+    SpaceProbed {
+        results: Vec<crate::space_probe::Probed>,
     },
 }
 
 // ---------------------------------------------------------------------------
 // Owner
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PostRollback {
+    generation: u64,
+    control_revision: Option<u64>,
+    in_flight: bool,
+}
+
+type JobTerminalRow = nzbd_state::artifacts::JobTerminal;
 
 pub(crate) struct Owner {
     state: QueueState,
@@ -869,15 +1148,30 @@ pub(crate) struct Owner {
     writer_epochs: HashMap<FileId, u64>,
     job_epochs: HashMap<JobId, u64>,
     control_epochs: HashMap<JobId, u64>,
+    disposition_in_flight: HashSet<JobId>,
+    disposition_fences: HashMap<JobId, (String, String)>,
     post_admissions: HashMap<JobId, u64>,
     post_cancellations: HashMap<JobId, CancellationToken>,
+    failed_cleanup_admissions: HashMap<JobId, nzbd_state::artifacts::FailedCleanupProof>,
     record_transitions: HashSet<JobId>,
+    post_rollbacks: HashMap<JobId, PostRollback>,
     projection_transition: bool,
     startup_reconciliation: HashMap<PathBuf, transitions::StartupRoot>,
     startup_snapshot: Arc<nzbd_state::artifacts::StartupReconciliation>,
     startup_roots_loading: bool,
     startup_roots_ready: bool,
     startup_roots_retry_at: Instant,
+    /// Jobs this installation's own snapshot carried at boot. A legacy
+    /// `Done` range of one of these (no writer proof at all) is stamped at
+    /// first open without being read; imported and adopted rows are not.
+    boot_jobs: HashSet<JobId>,
+    /// Jobs with an open lifecycle intent (relocation, transform custody,
+    /// a non-active allocation). Only these wait for their root's startup
+    /// reconciliation; live active allocations lease immediately.
+    startup_intent_jobs: HashSet<JobId>,
+    startup_phases: crate::startup_phases::StartupPhases,
+    /// While set, `publish_now` is deferred to the end of a batch.
+    publish_batched: bool,
     verification: HashMap<JobId, VerificationState>,
     verification_roots: HashSet<PathBuf>,
     allocation_cache: HashMap<JobId, nzbd_state::artifacts::Artifact>,
@@ -887,9 +1181,29 @@ pub(crate) struct Owner {
     retirement_epochs: HashMap<JobId, u64>,
     deferred_replacements: VecDeque<QueueCommand>,
     pending_writer_birth: HashMap<FileId, u64>,
+    #[cfg(test)]
+    work_selection_attempts: usize,
+    /// Test hook handed to every writer this owner spawns.
+    #[cfg(test)]
+    writer_sync_hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>,
     allocating_jobs: HashSet<JobId>,
     pending_journal_loads: HashMap<JobId, (u64, usize)>,
     pending_control_commits: HashSet<JobId>,
+    /// Jobs whose terminal (contract §2.1) is being recorded: the row,
+    /// history, markers and emit run as one chain and nothing else may
+    /// transition the job meanwhile.
+    terminals_in_flight: HashSet<JobId>,
+    /// Contract §2.1 (review #280-4): a terminal whose row never landed (the
+    /// `job_terminals` insert failed, or a transient fence refused it) is
+    /// kept here and retried on the replay tick. Nothing may complete,
+    /// admit to post-processing or re-terminate the job meanwhile, so a
+    /// released storage hold cannot turn a recorded `io` into a `completed`.
+    deferred_terminals:
+        HashMap<JobId, (JobTerminalRow, Option<Arc<nzbd_state::history::HistoryDb>>)>,
+    last_terminal_replay: Option<Instant>,
+    /// The last projected status/stage published per job, so every
+    /// observable transition emits one `job_status_changed` (§2.4).
+    last_status: HashMap<JobId, (&'static str, Option<&'static str>)>,
     /// Exact queue control revision currently awaiting its durable snapshot.
     /// Unlike the unrelated set of commit barriers, this protects overlapping
     /// Pause/Resume intents from releasing one another's operational fence.
@@ -966,13 +1280,23 @@ pub(crate) struct Owner {
     /// queue record; rates and peers live here so snapshot traffic does not
     /// rewrite the queue once per second.
     torrent_progress: HashMap<JobId, crate::backend::TransferProgress>,
+    /// An operator rate edit fences asynchronous authority-load rollback.
+    speed_limit_revision: u64,
     applied_usenet_limit: Option<Option<u64>>,
     applied_torrent_limit: Option<Option<u64>>,
     history: Option<Arc<nzbd_state::history::HistoryDb>>,
 
     state_dir: PathBuf,
+    /// Where the terminal store (`artifacts.sqlite`, the artifact inventory)
+    /// lives: the path an out-of-space terminal write is reported against.
+    terminal_store_dir: PathBuf,
     persistence: Persistence,
     persistence_callbacks: HashMap<u64, Continuation>,
+    // Saturated journal admission is covered by one coalesced owner snapshot.
+    // Stop leasing until that snapshot durably covers the latest accepted fact.
+    journal_checkpoint: Option<u64>,
+    journal_checkpoint_inflight: bool,
+    journal_checkpoint_retry_at: Instant,
     journal_suffix: String,
     payload_waiting: VecDeque<PayloadWork>,
     payload_active: HashSet<PathBuf>,
@@ -993,6 +1317,9 @@ pub(crate) struct Owner {
     /// 2026-07-26). An initially unknown reading never trips the guard; an
     /// incomplete later cycle cannot clear a hold that already exists.
     disk_guard: Arc<ArcSwap<DiskGuardReading>>,
+    /// Latest per-filesystem throughput from the storage I/O sampler.
+    /// Read-only here: the sampler thread owns the writes.
+    disk_io: Arc<ArcSwap<crate::disk_io::DiskIoReading>>,
     /// The exact reading used for the most recent admission decision.
     /// Snapshot publication must not reload `disk_guard`: the prober may
     /// publish a newer value between decision and status publication, which
@@ -1032,6 +1359,10 @@ pub(crate) struct Owner {
     dest_dir: PathBuf,
     pub(crate) artifacts: Arc<nzbd_state::artifacts::Inventory>,
     torrent_payload_roots: Vec<PathBuf>,
+    /// Configured payload roots (completed, failed, category destinations)
+    /// that startup reconciles alongside the recorded ones, so every
+    /// configured root is a reconciled root even before a row names it.
+    pub(crate) configured_payload_roots: Vec<PathBuf>,
 
     engine_tx: mpsc::Sender<EngineMsg>,
     tracker: TaskTracker,
@@ -1051,27 +1382,54 @@ pub(crate) struct Owner {
     enospc_latched: bool,
     enospc_observed: u64,
     enospc_where: Option<String>,
+    /// Finding 7: jobs whose proven files passed the post-processing
+    /// admission stat, by job epoch.
+    pp_stat_passed: HashMap<JobId, u64>,
+    /// W5a: every write that reported ENOSPC, by the operation that failed.
+    /// The latch clears when each has evidence from its own operation
+    /// (`space_probe`), never from a write somewhere else.
+    enospc_failures:
+        std::collections::BTreeMap<crate::space_probe::SpaceOp, crate::space_probe::SpaceFailure>,
+    /// Probe filesystem (a fake in tests).
+    space_probe_fs: Arc<dyn crate::space_probe::ProbeFs>,
+    space_probe_inflight: bool,
+    space_probe_after: Instant,
+    space_probe_failures: u32,
     guard_tick: u32,
     /// Round-robin cursor over the active set, advanced per granted
     /// lease. See `SelectionCtx::rotate`.
     rotate: usize,
 }
 
+/// The filesystem a torrent's payload lives on, from the capacity probe's
+/// last reading (memory only; the owner never stats a volume). A category
+/// with its own torrent directory uses that; anything else uses the
+/// torrent payload root.
+pub(crate) fn torrent_payload_device(
+    volumes: &[crate::volumes::StorageVolumeReading],
+    category: Option<&str>,
+) -> Option<u64> {
+    let holding = |role: &str| {
+        volumes
+            .iter()
+            .find(|volume| volume.has_role(role))
+            .and_then(|volume| volume.device_id)
+    };
+    category
+        .and_then(|category| holding(&format!("torrent category: {category}")))
+        .or_else(|| holding("torrent payloads"))
+}
+
+/// statvfs is a forecast that can hold intake; it is never evidence that a
+/// write-observed ENOSPC recovered (W5a: Gluster DHT sums its bricks). The
+/// latch is cleared only by a successful probe write or the operator.
 fn disk_guard_decision(
     was_held: bool,
-    mut write_latched: bool,
+    write_latched: bool,
     reading: &DiskGuardReading,
     floor: u64,
 ) -> (bool, bool) {
     let free = reading.available_bytes;
-    let clear_at = floor.saturating_mul(2);
-    if write_latched
-        && clear_at > 0
-        && reading.all_roots_known
-        && free.is_some_and(|available| available >= clear_at)
-    {
-        write_latched = false;
-    }
     let below_floor = floor > 0 && free.is_some_and(|available| available < floor);
     // Once held, an incomplete cycle is not recovery evidence. Retain the
     // hold until every configured root was measured and the minimum is above
@@ -1106,7 +1464,7 @@ fn open_post_stage(job: &Job) -> Option<PostStage> {
 fn recovered_post_fetch_files(job: &Job) -> Option<HashSet<FileId>> {
     if !matches!(
         job.status,
-        JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+        JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused | JobStatus::Held
     ) || open_post_stage(job).is_none()
     {
         return None;
@@ -1139,6 +1497,7 @@ impl Owner {
     pub(crate) fn recover(
         state_dir: &Path,
         artifact_dir: Option<&Path>,
+        workspace_dir: Option<&Path>,
         expected_installation_id: Option<&str>,
         dest_dir: PathBuf,
         torrent_payload_roots: Vec<PathBuf>,
@@ -1170,6 +1529,18 @@ impl Owner {
             )
             .map_err(|e| nzbd_state::StateError::Corrupt(e.to_string()))?,
         );
+        // `paths.workspace_dir`, and the migration of rows recorded under the
+        // default root, before anything reads a workspace path.
+        // Unset, the default root is configured too: workspaces recorded
+        // under a previous state directory (a wholesale move) are resolved.
+        let dir = workspace_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| artifacts.workspace_dir());
+        if workspace_dir.is_some() || dir.is_absolute() {
+            artifacts
+                .configure_workspace_dir(&dir)
+                .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+        }
         // Capture the metadata boundary before runtime Inventory handles can
         // admit allocations or journals while payload workers are delayed.
         let startup_snapshot = Arc::new(
@@ -1186,6 +1557,24 @@ impl Owner {
                 .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
         );
         let journal = JobJournals::open(state_dir, journal_suffix)?;
+        // Contract §2.1: every terminal has a durable history row. The daemon
+        // always passes its store; an engine built without one (tests, tools)
+        // keeps a private one beside its queue, so no event carries a
+        // made-up `history_seq`.
+        let history = match history {
+            Some(history) => history,
+            // Per node (W5b): cluster nodes share `state_dir`, and an
+            // EXCLUSIVE SQLite store has exactly one owner.
+            None => Arc::new(nzbd_state::history::HistoryDb::open(
+                &state_dir.join(if journal_suffix.is_empty() {
+                    "engine-history.sqlite".to_owned()
+                } else {
+                    format!("engine-history.{journal_suffix}.sqlite")
+                }),
+                None,
+            )?),
+        };
+        let history = Some(history);
 
         let mut state = QueueState::default();
         let mut file_sizes = HashMap::new();
@@ -1208,8 +1597,17 @@ impl Owner {
                 }
             }
             state.jobs.retain(|job| !retired.contains(&job.id));
+            state
+                .pending_admissions
+                .retain(|pending| !retired.contains(&pending.job_id));
             for receipt in &mut state.url_admission_receipts {
-                if retired.contains(&JobId(receipt.job_id)) && receipt.custody_state != "curator" {
+                if retired.contains(&JobId(receipt.job_id))
+                    && receipt.custody_state != "curator"
+                    && receipt
+                        .terminal_outcome
+                        .as_deref()
+                        .is_none_or(|terminal| terminal == "DELETED")
+                {
                     receipt.outcome = "deleted".into();
                 }
             }
@@ -1249,7 +1647,9 @@ impl Owner {
                     seg_number: rec.segment_number,
                 };
                 if rec.file_size > 0 {
-                    file_sizes.insert(rec.file, rec.file_size);
+                    if let Some(size) = merge_replayed_size(&mut state, &rec) {
+                        file_sizes.insert(rec.file, size);
+                    }
                 }
                 if let Some(seg) = state.segment_mut(r) {
                     if !matches!(seg.state, SegmentState::Done { .. }) {
@@ -1273,9 +1673,9 @@ impl Owner {
                         file_sizes.insert(f.id, size);
                     }
                 }
-                if j.held() {
-                    j.status = JobStatus::Paused;
-                }
+                // A 0.5.0 snapshot stores a hold as `paused` + a held control.
+                crate::normalize_stored_hold_status(j, "queue snapshot");
+                drop_retired_params(j);
             }
             state.recompute_all_totals();
             // Holds re-derive their recovery from their cause on every load
@@ -1337,8 +1737,27 @@ impl Owner {
                 .reserved_file_id()
                 .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?,
         );
+        let boot_jobs = state
+            .jobs
+            .iter()
+            .filter(|job| job.torrent.is_none())
+            .map(|job| job.id)
+            .collect::<HashSet<_>>();
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         let initial_quota_hold = tuning.daily_quota_bytes > 0 || tuning.monthly_quota_bytes > 0;
+        let disposition_fences = artifacts
+            .job_disposition_fences()
+            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+            .into_iter()
+            .filter(|(job, transfer, generation)| {
+                state.url_admission_receipts.iter().any(|receipt| {
+                    receipt.job_id == *job
+                        && receipt.request_token == *transfer
+                        && receipt.generation == *generation
+                })
+            })
+            .map(|(job, transfer, generation)| (JobId(job), (transfer, generation)))
+            .collect();
         let mut owner = Owner {
             state,
             admission_adoption: None,
@@ -1352,15 +1771,23 @@ impl Owner {
             writer_epochs: HashMap::new(),
             job_epochs: HashMap::new(),
             control_epochs: HashMap::new(),
+            disposition_in_flight: HashSet::new(),
+            disposition_fences,
             post_admissions: HashMap::new(),
             post_cancellations: HashMap::new(),
+            failed_cleanup_admissions: HashMap::new(),
             record_transitions: HashSet::new(),
+            post_rollbacks: HashMap::new(),
             projection_transition: false,
             startup_reconciliation: HashMap::new(),
             startup_snapshot,
             startup_roots_loading: false,
             startup_roots_ready: false,
             startup_roots_retry_at: Instant::now(),
+            boot_jobs,
+            startup_intent_jobs: HashSet::new(),
+            startup_phases: crate::startup_phases::StartupPhases::default(),
+            publish_batched: false,
             verification: HashMap::new(),
             verification_roots: HashSet::new(),
             allocation_cache,
@@ -1370,9 +1797,17 @@ impl Owner {
             retirement_epochs: HashMap::new(),
             deferred_replacements: VecDeque::new(),
             pending_writer_birth: HashMap::new(),
+            #[cfg(test)]
+            work_selection_attempts: 0,
+            #[cfg(test)]
+            writer_sync_hook: None,
             allocating_jobs: HashSet::new(),
             pending_journal_loads: HashMap::new(),
             pending_control_commits: HashSet::new(),
+            terminals_in_flight: HashSet::new(),
+            deferred_terminals: HashMap::new(),
+            last_terminal_replay: None,
+            last_status: HashMap::new(),
             pending_control_revisions: HashMap::new(),
             cluster_writer_stops: Default::default(),
             allocated_jobs,
@@ -1397,10 +1832,12 @@ impl Owner {
             seed_clock_unix: HashMap::new(),
             backend_started: HashSet::new(),
             torrent_progress: HashMap::new(),
+            speed_limit_revision: fresh_epoch(),
             applied_usenet_limit: None,
             applied_torrent_limit: None,
             history,
             state_dir: state_dir.to_path_buf(),
+            terminal_store_dir: artifact_dir.unwrap_or(state_dir).to_path_buf(),
             persistence: Persistence::start(
                 journal,
                 SnapshotStore::open(state_dir)?,
@@ -1421,6 +1858,9 @@ impl Owner {
                 engine_tx.clone(),
             ),
             persistence_callbacks: HashMap::new(),
+            journal_checkpoint: None,
+            journal_checkpoint_inflight: false,
+            journal_checkpoint_retry_at: Instant::now(),
             io_callbacks: HashMap::new(),
             payload_waiting: VecDeque::new(),
             payload_active: HashSet::new(),
@@ -1444,6 +1884,7 @@ impl Owner {
             tuning,
             download_enabled,
             dest_dir,
+            configured_payload_roots: Vec::new(),
             artifacts,
             torrent_payload_roots,
             engine_tx,
@@ -1456,6 +1897,9 @@ impl Owner {
             last_save_ms: 0,
             background_save_pending: false,
             disk_guard: Arc::new(ArcSwap::from_pointee(DiskGuardReading::default())),
+            disk_io: Arc::new(ArcSwap::from_pointee(
+                crate::disk_io::DiskIoReading::default(),
+            )),
             evaluated_disk_guard: Arc::new(DiskGuardReading::default()),
             volumes: crate::volumes::VolumeBook::load(state_dir, journal_suffix),
             quota_probe_pending: false,
@@ -1467,9 +1911,16 @@ impl Owner {
             enospc_latched: false,
             enospc_observed: 0,
             enospc_where: None,
+            pp_stat_passed: HashMap::new(),
+            enospc_failures: std::collections::BTreeMap::new(),
+            space_probe_fs: Arc::new(crate::space_probe::RealFs),
+            space_probe_inflight: false,
+            space_probe_after: Instant::now(),
+            space_probe_failures: 0,
             rotate: 0,
             guard_tick: 0,
         };
+        owner.startup_phases.owner_ready_ms = Some(crate::startup_phases::since_boot_ms());
         owner.schedule_startup_reconciliation();
         Ok(owner)
     }
@@ -1478,6 +1929,12 @@ impl Owner {
         // Fold replayed journal into a fresh snapshot, then finish anything
         // that completed just before the crash.
         self.save_snapshot();
+        // Contract §2.1/§2.3: finish interrupted terminal chains, give every
+        // stored hold its deadline and convert legacy terminal holds before
+        // hold recovery's first pass or the post manager can act on them.
+        self.arm_hold_deadlines();
+        self.convert_legacy_holds();
+        self.replay_terminals();
         self.startup_pass();
         self.drain_replacements();
         self.start_verifications();
@@ -1671,6 +2128,7 @@ impl Owner {
         let mut to_check = Vec::new();
         for job in &self.state.jobs {
             if self.pending_control_commits.contains(&job.id)
+                || self.job_disposing(job.id)
                 || self.verification.contains_key(&job.id)
                 || self.retiring_writers.contains_key(&job.id)
             {
@@ -1705,6 +2163,12 @@ impl Owner {
                 revision,
                 result,
             } => self.payload_finished(root, revision, result),
+            EngineMsg::BackgroundFinished { revision, result } => {
+                self.io_finished(revision, result);
+                self.retry_payload_recoveries();
+                self.start_verifications();
+                self.bump_epoch();
+            }
             EngineMsg::ScopedNameInspected {
                 job,
                 generation,
@@ -1750,6 +2214,26 @@ impl Owner {
             } => self.on_verification_result(job, generation, *result),
             EngineMsg::ScopedCommand { admission, command } => {
                 if self.post_scope_current(&admission) {
+                    if self.failed_cleanup_admissions.contains_key(&admission.job)
+                        && matches!(command.as_ref(), QueueCommand::ExportJob { .. })
+                    {
+                        if let QueueCommand::ExportJob { reply, .. } = *command {
+                            let _ = reply.send(None);
+                        }
+                        return;
+                    }
+                    if self.failed_cleanup_admissions.contains_key(&admission.job)
+                        && !matches!(
+                            command.as_ref(),
+                            QueueCommand::ImportJobIfPresent { .. }
+                                | QueueCommand::ApplyPostRecord { .. }
+                                | QueueCommand::FailedCleanupMetadata { .. }
+                                | QueueCommand::ExportJob { .. }
+                                | QueueCommand::EndPostAdmission { .. }
+                        )
+                    {
+                        return;
+                    }
                     match *command {
                         QueueCommand::ImportJobIfPresent {
                             job,
@@ -1795,7 +2279,17 @@ impl Owner {
                 }
             }
             EngineMsg::ScopedEvent { admission, event } => {
-                if self.post_scope_current(&admission) {
+                let cleanup_event = !self.failed_cleanup_admissions.contains_key(&admission.job)
+                    || (matches!(&event, Event::JobPpFinished { job, outcome, reason, .. }
+                            if *job == admission.job
+                                && *outcome == nzbd_types::TerminalOutcome::Failed
+                                && reason.is_some_and(|reason| reason.history_status().starts_with("FAILURE/")))
+                        && self.state.job(admission.job).is_some_and(|job| {
+                            job.params
+                                .iter()
+                                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                        }));
+                if self.post_scope_current(&admission) && cleanup_event {
                     self.emit(event);
                 }
             }
@@ -1872,27 +2366,98 @@ impl Owner {
                 final_path,
                 combined_crc,
             } => self.on_writer_finalized(job, file, ok, final_path, combined_crc),
-            EngineMsg::OutOfSpace { whence } => self.observe_out_of_space(&whence),
-            EngineMsg::WriterError { job, file, error } => {
+            EngineMsg::OutOfSpace { whence, dir, job } => match job {
+                Some(job) => self.observe_space_failure(
+                    &whence,
+                    crate::space_probe::SpaceOp::Post { job },
+                    dir,
+                ),
+                None => self.observe_out_of_space_in(&whence, dir),
+            },
+            EngineMsg::SpaceProbed { results } => self.on_space_probed(results),
+            EngineMsg::WriterIdentityMismatch { job, file, error } => {
+                self.on_writer_identity_mismatch(job, file, &error)
+            }
+            EngineMsg::WriterError {
+                job,
+                file,
+                error,
+                cause,
+            } => {
                 tracing::warn!(job = job.0, file = file.0, %error, "writer error; failing file");
                 // The errno decides whether retrying can help: a full disk
                 // waits for space, a dropped mount retries on its own, and
-                // anything else (a digest or size mismatch) waits for a
-                // person rather than re-checking a whole file forever.
-                if crate::is_out_of_space(&error) {
-                    self.observe_out_of_space(&error);
-                }
+                // anything else (a digest or size mismatch) is the job's
+                // terminal failure rather than a re-check forever.
                 let stage = if error.starts_with("finalize") {
                     "finalize"
                 } else {
                     "download_write"
                 };
-                self.hold_job(job, crate::io_hold_cause(&error), stage, &error);
+                if crate::out_of_space(cause.as_ref()) {
+                    // W5a: the evidence that clears this is the same file's
+                    // write (an allocation on its partial) or, for a file
+                    // whose bytes are all written, its own finalize retry.
+                    let part = self
+                        .artifacts
+                        .for_job(job.0)
+                        .ok()
+                        .flatten()
+                        .map(|artifact| {
+                            artifact.path.join(format!(".runner-file-{}.part", file.0))
+                        });
+                    let written = self.state.job(job).is_some_and(|record| {
+                        record
+                            .files
+                            .iter()
+                            .any(|entry| entry.id == file && entry.is_terminal())
+                    });
+                    let op = if stage == "finalize" || written {
+                        crate::space_probe::SpaceOp::Finalize { job, file }
+                    } else {
+                        crate::space_probe::SpaceOp::Write { job, file }
+                    };
+                    self.observe_space_failure(&error, op, part);
+                }
+                match cause {
+                    Some(cause) => {
+                        self.hold_job(job, cause, stage, &error);
+                    }
+                    // Contract §2.2: a write failure retrying cannot fix is
+                    // the job's terminal `failed/io`, parked, never blamed.
+                    None => {
+                        self.fail_job_terminal(
+                            job,
+                            nzbd_types::FailureReason::Io,
+                            None,
+                            stage,
+                            &error,
+                        );
+                    }
+                }
             }
         }
     }
 
     fn on_command(&mut self, cmd: QueueCommand) {
+        // Rejection must precede every busy-path cancellation, writer stop or
+        // deferral: an old grant cannot revoke custody belonging to its successor.
+        if self.stale_worker_retirement(&cmd) {
+            if let QueueCommand::RemoveJobSilent { reply, .. } = cmd {
+                let _ = reply.send(false);
+            }
+            return;
+        }
+        let cmd = match cmd {
+            QueueCommand::RemoveJobSilent { job, reply, .. }
+            | QueueCommand::Delete { job, reply, .. }
+                if self.job_disposing(job) =>
+            {
+                let _ = reply.send(false);
+                return;
+            }
+            command => command,
+        };
         let pending_job = match &cmd {
             QueueCommand::Pause { job, .. }
             | QueueCommand::Resume { job, .. }
@@ -1900,6 +2465,9 @@ impl Owner {
             | QueueCommand::SetCategory { job, .. }
             | QueueCommand::SetKeepOnFailure { job, .. }
             | QueueCommand::HoldJob { job, .. }
+            | QueueCommand::ExpireHold { job, .. }
+            | QueueCommand::PrepareWorkerHoldExpiry { job, .. }
+            | QueueCommand::FailJob { job, .. }
             | QueueCommand::RetryHold { job, .. }
             | QueueCommand::RescheduleHold { job, .. }
             | QueueCommand::BeginResourceProbe { job, .. }
@@ -1945,6 +2513,7 @@ impl Owner {
             QueueCommand::ImportJob { job, .. } | QueueCommand::ImportJobIfPresent { job, .. } => {
                 Some(job.id)
             }
+            QueueCommand::RemoveJobSilent { job, .. } if self.state.job(*job).is_none() => None,
             QueueCommand::RemoveJobSilent { job, .. } | QueueCommand::Delete { job, .. } => {
                 Some(*job)
             }
@@ -2012,7 +2581,8 @@ impl Owner {
                     let busy = self.retiring_writers.contains_key(&id)
                         || self.post_admissions.contains_key(&id)
                         || self.allocating_jobs.contains(&id)
-                        || self.record_transitions.contains(&id)
+                        || (self.record_transitions.contains(&id)
+                            && !self.settled_post_rollback(id))
                         || self.pending_control_revisions.contains_key(&id)
                         || self
                             .verification
@@ -2328,71 +2898,6 @@ impl Owner {
                     let _ = reply.send(ok);
                 });
             }
-            QueueCommand::SchedulePostRetry {
-                job,
-                revision,
-                retry_attempt,
-                next_retry,
-                blocked_since,
-                message,
-                reply,
-            } => {
-                let before = self.state.job(job).cloned();
-                let mut changed = false;
-                if !self.persistence_fenced {
-                    if let Some(row) = self.state.job_mut(job) {
-                        if row.lifecycle_eligible() {
-                            if let Some(mut control) = row.control().filter(|control| {
-                                control.revision == revision
-                                    && control.lifecycle == "held"
-                                    && !control.manual_pause
-                                    && control.hold_cause().policy().automatic()
-                                    && retry_attempt == control.retry_attempt.saturating_add(1)
-                                    && next_retry >= control.next_retry_at_unix.unwrap_or(0)
-                            }) {
-                                if let Some(next_revision) = control
-                                    .revision
-                                    .parse::<u64>()
-                                    .ok()
-                                    .and_then(|value| value.checked_add(1))
-                                {
-                                    control.revision = next_revision.to_string();
-                                    control.retry_attempt = retry_attempt;
-                                    control.next_retry_at_unix = Some(next_retry);
-                                    control.blocked_since_unix = Some(
-                                        control
-                                            .blocked_since_unix
-                                            .unwrap_or(blocked_since)
-                                            .min(blocked_since),
-                                    );
-                                    control.retry_policy = "scheduled_retry".into();
-                                    control.message = message.chars().take(2048).collect();
-                                    row.set_control(&control);
-                                    changed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !changed {
-                    let _ = reply.send(false);
-                    return;
-                }
-                self.pending_control_commits.insert(job);
-                self.commit_control_change_then(job, before.clone(), move |owner, ok| {
-                    owner.pending_control_commits.remove(&job);
-                    if ok {
-                        owner.publish_now();
-                        owner.bump_epoch();
-                    } else if let Some(before) = before {
-                        if let Some(current) = owner.state.job_mut(job) {
-                            *current = before;
-                        }
-                    }
-                    let _ = reply.send(ok);
-                });
-            }
             QueueCommand::MaterializeGeneration { request, reply } => {
                 self.materialize_generation_then(*request, move |_, result| {
                     let _ = reply.send(result);
@@ -2414,7 +2919,9 @@ impl Owner {
             QueueCommand::BeginPostAdmission { job, reply } => {
                 let allowed = !self.cancel.is_cancelled()
                     && self.state.job(job).is_some_and(|j| {
-                        !j.held()
+                        (!self.job_disposing(job) || Self::disposition_allows_failed_followup(j))
+                            && !j.held()
+                            && !transitions::failed_cleanup_only(j)
                             && matches!(
                                 j.status,
                                 JobStatus::Completed
@@ -2424,11 +2931,76 @@ impl Owner {
                             )
                     })
                     && !self.post_admissions.contains_key(&job)
+                    && !self.record_transitions.contains(&job)
+                    && !self.projection_transition
                     && !self.pending_control_commits.contains(&job)
+                    && !self.deferred_terminals.contains_key(&job)
                     && !self.verification.contains_key(&job)
                     && !self.retiring_writers.contains_key(&job);
                 if !allowed {
                     let _ = reply.send(None);
+                    return;
+                }
+                // No-wedge item 4: a job startup released untouched is checked
+                // here, from metadata, before post-processing reads it. A range
+                // no writer proof covers gets this job's ticket (a legacy one
+                // is stamped without a read); PAR verification is the backstop.
+                // A job admitted before (its download retired into PP custody)
+                // was checked then; transforms own its shape since.
+                if self.state.job(job).is_some_and(|record| {
+                    !record
+                        .params
+                        .iter()
+                        .any(|(key, _)| key == "*Recovery:download-retired")
+                        && !self.payload_evidence_sufficient(record)
+                }) {
+                    self.queue_verification(job);
+                    if self.verification.contains_key(&job) {
+                        let _ = reply.send(None);
+                        return;
+                    }
+                }
+                // Finding 7: a proof says which object holds the ranges, not
+                // that the object still holds them. One stat per proven file
+                // (off this loop) before post-processing reads it: a replaced,
+                // missing or truncated file goes to verification, which
+                // reopens its missing ranges for download.
+                if let Some((epoch, dir, files)) = self.pp_admission_stat_needed(job) {
+                    self.background_then(
+                        format!("pp-stat-{}", job.0),
+                        move || Ok(recovery_worker::stat_proven_files(&dir, &files)),
+                        move |owner, result| {
+                            match result {
+                                Ok(recovery_worker::AdmissionStat::Fits) => {
+                                    owner.pp_stat_passed.insert(job, epoch);
+                                    // The admission re-runs every check
+                                    // against the queue as it is now.
+                                    owner.on_command(QueueCommand::BeginPostAdmission {
+                                        job,
+                                        reply,
+                                    });
+                                }
+                                Ok(recovery_worker::AdmissionStat::Short(why)) => {
+                                    tracing::warn!(job = job.0, %why,
+                                        "proven payload no longer fits its proof; verifying before post-processing");
+                                    owner.queue_verification(job);
+                                    let _ = reply.send(None);
+                                    owner.publish_now();
+                                    owner.bump_epoch();
+                                }
+                                Ok(recovery_worker::AdmissionStat::Unavailable(why)) => {
+                                    tracing::warn!(job = job.0, %why,
+                                        "payload stat unavailable; post-processing admission retries");
+                                    let _ = reply.send(None);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(job = job.0, %error,
+                                        "payload stat failed; post-processing admission retries");
+                                    let _ = reply.send(None);
+                                }
+                            }
+                        },
+                    );
                     return;
                 }
                 if self.state.job(job).is_some_and(|job| {
@@ -2457,6 +3029,7 @@ impl Owner {
                     self.writers.remove(&file);
                 }
                 self.post_admissions.insert(job, generation);
+                self.pp_stat_passed.remove(&job);
                 let cancellation = self.cancel.child_token();
                 self.post_cancellations.insert(job, cancellation.clone());
                 if let Some(record) = self.state.job_mut(job) {
@@ -2513,8 +3086,29 @@ impl Owner {
                     }
                 });
             }
+            QueueCommand::BeginFailedCleanupAdmission { job, reply } => {
+                self.begin_failed_cleanup_admission_then(job, move |owner, admission| {
+                    if let Err(Some(scope)) = reply.send(admission) {
+                        owner.failed_cleanup_admissions.remove(&scope.admission.job);
+                        owner.post_admissions.remove(&scope.admission.job);
+                        if let Some(cancel) = owner.post_cancellations.remove(&scope.admission.job)
+                        {
+                            cancel.cancel();
+                        }
+                        owner.drain_replacements();
+                    }
+                });
+            }
+            QueueCommand::FailedCleanupMetadata { admission, reply } => {
+                let record = (self.post_scope_current(&admission)
+                    && self.failed_cleanup_admissions.contains_key(&admission.job))
+                .then(|| self.state.job(admission.job).cloned())
+                .flatten();
+                let _ = reply.send(record);
+            }
             QueueCommand::EndPostAdmission { admission, reply } => {
                 if self.post_admissions.get(&admission.job) == Some(&admission.generation) {
+                    self.failed_cleanup_admissions.remove(&admission.job);
                     self.post_admissions.remove(&admission.job);
                     if let Some(cancel) = self.post_cancellations.remove(&admission.job) {
                         cancel.cancel();
@@ -2922,14 +3516,22 @@ impl Owner {
                             request_token: token.clone(),
                             submission_sha256: submission_sha256.clone().unwrap_or_default(),
                             job_id: id.0,
-                            generation: url_admission_generation(
-                                id,
-                                token,
-                                &self.consumer_instance_id,
-                            ),
+                            generation: existing_job
+                                .params
+                                .iter()
+                                .find(|(key, _)| key == "*URL:AdmissionGeneration")
+                                .map(|(_, generation)| generation.clone())
+                                .unwrap_or_else(|| {
+                                    url_admission_generation(
+                                        id,
+                                        token,
+                                        &self.consumer_instance_id,
+                                        &crate::admissions::generation_nonce(),
+                                    )
+                                }),
                             runner_instance_id: self.consumer_instance_id.clone(),
                             terminal_outcome: None,
-                            outcome: job_status_name(existing_job.status).into(),
+                            outcome: existing_job.status.as_str().into(),
                             failure_stage: None,
                             failure_cause: None,
                             custody_state: "runner_owned".into(),
@@ -2938,9 +3540,15 @@ impl Owner {
                             publication_path: None,
                             source_artifact_id: None,
                             source_generation: None,
+                            failure_reason: None,
+                            fetch_cause: None,
+                            blames_release: None,
+                            salvage: None,
                         };
                         self.state.url_admission_receipts.push(receipt.clone());
-                        self.unaccepted_admissions.insert(token.clone(), receipt);
+                        if self.persist_guard.is_some() {
+                            self.unaccepted_admissions.insert(token.clone(), receipt);
+                        }
                         let token = token.clone();
                         let generation = fresh_epoch();
                         self.job_epochs.insert(id, generation);
@@ -3020,6 +3628,9 @@ impl Owner {
                     return;
                 }
                 let id = self.state.admit_url(name.clone(), &url, category, priority);
+                let admission_nonce = request_token
+                    .as_ref()
+                    .map(|_| crate::admissions::generation_nonce());
                 if let Some(j) = self.state.job_mut(id) {
                     mark_new_lifecycle_cohort(j);
                     if let Some(dupe) = dupe {
@@ -3030,17 +3641,39 @@ impl Owner {
                     }
                     j.params.extend(params);
                     j.delivery_lifecycle = nzbd_types::has_delivery_intent(&j.params);
+                    if let (Some(token), Some(nonce)) = (request_token.as_deref(), &admission_nonce)
+                    {
+                        // Public consumer identity can change across authority
+                        // adoption; the fetch origin remains bound to this
+                        // storage installation for its complete lifetime.
+                        j.params.push((
+                            "*URL:AdmissionGeneration".into(),
+                            url_admission_generation(
+                                id,
+                                token,
+                                &self.artifacts.installation,
+                                nonce,
+                            ),
+                        ));
+                    }
                 }
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
-                if let (Some(token), Some(fingerprint)) =
-                    (request_token.as_ref(), submission_sha256.as_ref())
-                {
+                if let (Some(token), Some(fingerprint), Some(nonce)) = (
+                    request_token.as_ref(),
+                    submission_sha256.as_ref(),
+                    &admission_nonce,
+                ) {
                     let receipt = UrlAdmissionReceipt {
                         protocol_version: 1,
                         request_token: token.clone(),
                         submission_sha256: fingerprint.clone(),
                         job_id: id.0,
-                        generation: url_admission_generation(id, token, &self.consumer_instance_id),
+                        generation: url_admission_generation(
+                            id,
+                            token,
+                            &self.consumer_instance_id,
+                            nonce,
+                        ),
                         runner_instance_id: self.consumer_instance_id.clone(),
                         terminal_outcome: None,
                         outcome: "fetching".into(),
@@ -3052,15 +3685,27 @@ impl Owner {
                         publication_path: None,
                         source_artifact_id: None,
                         source_generation: None,
+                        failure_reason: None,
+                        fetch_cause: None,
+                        blames_release: None,
+                        salvage: None,
                     };
                     self.state.url_admission_receipts.push(receipt.clone());
-                    self.unaccepted_admissions.insert(token.clone(), receipt);
+                    if self.persist_guard.is_some() {
+                        self.unaccepted_admissions.insert(token.clone(), receipt);
+                    }
                 }
                 let generation = fresh_epoch();
                 self.job_epochs.insert(id, generation);
+                // Snapshot publication can race the admission save. Reuse the
+                // export barrier until the durable acceptance callback runs.
+                self.pending_control_revisions.insert(id, generation);
                 let persistent = self.persist;
                 self.persist_then(move |owner, committed| {
                     let current = owner.job_epochs.get(&id) == Some(&generation);
+                    if owner.pending_control_revisions.get(&id) == Some(&generation) {
+                        owner.pending_control_revisions.remove(&id);
+                    }
                     if (!persistent || committed) && current {
                         tracing::info!(job = id.0, %name, %url, "url job added (fetching)");
                         owner.publish_now();
@@ -3078,6 +3723,8 @@ impl Owner {
                                 .unaccepted_admissions
                                 .retain(|_, receipt| receipt.job_id != id.0);
                         }
+                        owner.publish_now();
+                        owner.bump_epoch();
                         let _ = reply.send(Err(crate::EngineError::AdmissionNotDurable));
                     }
                 });
@@ -3452,6 +4099,10 @@ impl Owner {
                 });
             }
             QueueCommand::Resume { job, reply } => {
+                if self.job_disposing(job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if self
                     .state
@@ -3595,6 +4246,7 @@ impl Owner {
                                     let prior = record.control();
                                     let revision = prior.as_ref().and_then(|control| control.revision.parse::<u64>().ok()).unwrap_or(0).saturating_add(1);
                                     record.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
                                         version: 1,
                                         revision: revision.to_string(),
                                         lifecycle: "held".into(),
@@ -3609,8 +4261,10 @@ impl Owner {
                                         next_retry_at_unix: None,
                                         blocked_since_unix: Some(unix_now()),
                                         released_at_unix: None,
+                                        deadline_in_s: None,
+                                        deadline_unix: None,
                                     });
-                                    record.status = JobStatus::Paused;
+                                    record.status = JobStatus::Held;
                                 }
                                 owner.publish_now();
                             }
@@ -3664,11 +4318,13 @@ impl Owner {
                         self.attempts.retain(|reference, _| reference.job != job);
                         self.pending_finalize.retain(|(id, _)| *id != job);
                         if let Some(record) = self.state.job_mut(job) {
+                            // A held job stays held: the writers stop, the hold
+                            // is not this stop's to clear.
                             if !matches!(
                                 record.status,
                                 JobStatus::Completed | JobStatus::Failed | JobStatus::Deleted
                             ) {
-                                record.status = JobStatus::Paused;
+                                record.stop();
                             }
                         }
                         self.bump_epoch();
@@ -3687,6 +4343,15 @@ impl Owner {
             }
             QueueCommand::ForgetClusterWriterStops { context, reply } => {
                 let _ = reply.send(self.cluster_writer_stops.forget_joined(&context));
+            }
+            QueueCommand::AdvanceJobDisposition {
+                job,
+                request,
+                native_joined,
+                url_joined,
+                reply,
+            } => {
+                self.advance_job_disposition(job, request, native_joined, url_joined, reply);
             }
             QueueCommand::QuiescePayload { job, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
@@ -3734,7 +4399,8 @@ impl Owner {
                             return;
                         }
                         let record = owner.state.job_mut(job).unwrap();
-                        record.status = JobStatus::Paused;
+                        // Fenced for deletion; a hold stays a hold.
+                        record.stop();
                         let file_ids = record.files.iter().map(|file| file.id).collect::<Vec<_>>();
                         owner.allocated_jobs.remove(&job);
                         let writers = owner.retiring_writers.entry(job).or_default();
@@ -3755,6 +4421,16 @@ impl Owner {
                             let current = owner.control_epochs.get(&job) == Some(&generation)
                                 && owner.job_epochs.get(&job) == Some(&scope_generation);
                             if (!persistent || committed) && current {
+                                // The empty fence has no writer acknowledgement
+                                // task to clear it. Its durable quiesce commit
+                                // is the complete retirement boundary.
+                                if writers.is_empty()
+                                    && !owner.retirement_epochs.contains_key(&job)
+                                    && owner.retiring_writers.get(&job).is_some_and(Vec::is_empty)
+                                {
+                                    owner.retiring_writers.remove(&job);
+                                    owner.drain_replacements();
+                                }
                                 owner.publish_now();
                                 let _ = reply.send(Ok(writers));
                             } else {
@@ -3958,7 +4634,10 @@ impl Owner {
                 let early_queue_job = before.as_ref().is_some_and(|record| {
                     matches!(
                         record.status,
-                        JobStatus::Fetching | JobStatus::Queued | JobStatus::Paused
+                        JobStatus::Fetching
+                            | JobStatus::Queued
+                            | JobStatus::Paused
+                            | JobStatus::Held
                     )
                 });
                 self.io_then(
@@ -3969,7 +4648,7 @@ impl Owner {
                                 let updated = artifacts.set_keep_on_failure(job.0, keep)
                                     .map_err(|e| nzbd_state::StateError::Corrupt(format!("artifact inventory: {e}")))?;
                                 if updated {
-                                    for receipt in &mut refreshed_receipts { refresh_url_admission_custody(receipt, &artifacts); }
+                                    refresh_url_admission_custodies(&mut refreshed_receipts, &artifacts);
                                 }
                                 Ok((updated, updated, refreshed_receipts))
                             },
@@ -4188,6 +4867,14 @@ impl Owner {
                 self.publish_now();
                 let _ = reply.send(());
             }
+            QueueCommand::RetryStorage { reply } => {
+                // Retry probes, not pause flags or the evidence-based safety latch.
+                self.space_probe_after = Instant::now();
+                self.space_probe_failures = 0;
+                self.maybe_probe_space();
+                self.publish_now();
+                let _ = reply.send(());
+            }
             QueueCommand::ResumeAll { source, reply } => {
                 tracing::info!(
                     %source,
@@ -4207,10 +4894,19 @@ impl Owner {
                 self.publish_now();
                 let _ = reply.send(());
             }
+            QueueCommand::PausePost { source, reply } => {
+                self.set_post_paused(true, source);
+                let _ = reply.send(());
+            }
+            QueueCommand::ResumePost { source, reply } => {
+                self.set_post_paused(false, source);
+                let _ = reply.send(());
+            }
             QueueCommand::SetSpeedLimit {
                 bytes_per_sec,
                 reply,
             } => {
+                self.speed_limit_revision = fresh_epoch();
                 self.state.speed_limit_bps = bytes_per_sec;
                 self.applied_usenet_limit = None;
                 self.applied_torrent_limit = None;
@@ -4322,8 +5018,15 @@ impl Owner {
                             _ => false,
                         });
                 let exportable = !self.verification.contains_key(&job)
+                    && !self
+                        .state
+                        .job(job)
+                        .is_some_and(transitions::failed_cleanup_only)
                     && !self.retiring_writers.contains_key(&job)
                     && !self.pending_control_revisions.contains_key(&job)
+                    && !self.post_rollbacks.contains_key(&job)
+                    && !self.failed_cleanup_admissions.contains_key(&job)
+                    && !self.projection_transition
                     && !replacement_pending;
                 let result = if exportable {
                     self.state.job(job).cloned().map(Box::new)
@@ -4334,21 +5037,25 @@ impl Owner {
             }
             QueueCommand::RemoveJobSilent {
                 job,
-                accepted_context,
+                retirement,
                 reply,
             } => {
-                let accepted = accepted_context.as_ref().is_some_and(|expected| {
+                let current = retirement.as_ref().is_some_and(|expected| {
                     self.state.job(job).is_some_and(|record| {
                         nzbd_state::artifacts::WorkerControlContext::for_job(record).as_ref()
-                            == Some(expected)
+                            == Some(expected.context())
                     })
                 });
-                if accepted_context.is_some() && !accepted {
+                if retirement.is_some() && !current {
                     // A delayed completion must not retire another grant's journal.
                     let _ = reply.send(false);
                 } else {
-                    let _ = reply
-                        .send(self.remove_job_silent_with_journal(job, self.persist || accepted));
+                    let compact = match retirement {
+                        Some(WorkerRetirement::Accepted(_)) => true,
+                        Some(WorkerRetirement::Revoked(_)) => false,
+                        None => self.persist,
+                    };
+                    let _ = reply.send(self.remove_job_silent_with_journal(job, compact));
                 }
             }
             QueueCommand::SetDelegated { job, node, reply } => {
@@ -4454,7 +5161,7 @@ impl Owner {
                 });
             }
             QueueCommand::AdoptReplicatedAuthority { jobs, reply } => {
-                self.replace_projection_then(jobs, move |_, result| {
+                self.replace_projection_then(jobs, None, move |_, result| {
                     let _ = reply.send(result);
                 });
             }
@@ -4625,6 +5332,7 @@ impl Owner {
                         && self.delegated.contains_key(&job))
                     || !self.state.job(job).is_some_and(|current| {
                         guard.matches(&self.artifacts, current, self.persist)
+                            && !current.control().is_some_and(|c| c.expiry_pending)
                     })
                 {
                     let _ = reply.send(false);
@@ -4643,36 +5351,19 @@ impl Owner {
                 if quiescent {
                     if let Some(j) = self.state.job_mut(job) {
                         let current = j.control();
-                        let after = j
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == "*Control:probe_after")
-                            .and_then(|(_, v)| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        let count = j
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == "*Control:attempts")
-                            .and_then(|(_, v)| v.parse::<u32>().ok())
-                            .unwrap_or(0);
                         if current.is_some_and(|c| {
                             c.revision == revision
                                 && c.lifecycle == "held"
                                 && matches!(c.cause.as_str(), "capacity" | "quota")
-                        }) && (after <= now || by == RetryBy::Operator)
-                        {
-                            // The spacing paces the recovery task; a person
-                            // asking is the health probe's to answer, not
-                            // the backoff's.
+                                && (by == RetryBy::Operator
+                                    || (!c.manual_pause
+                                        && c.next_retry_at_unix.is_none_or(|after| after <= now)))
+                        }) {
+                            // JobControl owns the retry clock. Legacy probe
+                            // parameters must not delay a migrated hold.
                             j.params.retain(|(k, _)| {
                                 k != "*Control:probe_after" && k != "*Control:attempts"
                             });
-                            j.params.push((
-                                "*Control:probe_after".into(),
-                                (now + 30 * (1i64 << count.min(6))).to_string(),
-                            ));
-                            j.params
-                                .push(("*Control:attempts".into(), (count + 1).to_string()));
                             self.dirty = true;
                             accepted = true;
                         }
@@ -4719,6 +5410,7 @@ impl Owner {
                         && self.delegated.contains_key(&job))
                     || !self.state.job(job).is_some_and(|current| {
                         guard.matches(&self.artifacts, current, self.persist)
+                            && !current.control().is_some_and(|c| c.expiry_pending)
                     })
                 {
                     let _ = reply.send(false);
@@ -4833,6 +5525,130 @@ impl Owner {
                     }
                     let _ = reply.send(ok);
                 });
+            }
+            QueueCommand::PrepareWorkerHoldExpiry {
+                job,
+                revision,
+                notice,
+                guard,
+                reply,
+            } => {
+                let before = self.state.job(job).cloned();
+                let valid = !self.persist
+                    && !self.persistence_fenced
+                    && !self.pending_control_commits.contains(&job)
+                    && before.as_ref().is_some_and(|row| {
+                        guard.worker_checked() && guard.matches(&self.artifacts, row, false)
+                    });
+                let control = before.as_ref().and_then(Job::control).filter(|c| {
+                    c.lifecycle == "held"
+                        && c.revision == revision
+                        && c.deadline_unix
+                            .is_some_and(|deadline| deadline <= unix_now())
+                        && nzbd_types::HoldCause::legacy_terminal(&c.cause).is_none()
+                });
+                let Some(mut control) = control.filter(|_| valid) else {
+                    let _ = reply.send(false);
+                    return;
+                };
+                // A regrant preserves the original frozen episode. Re-enqueue
+                // it under the exact current grant, without advancing the hold
+                // revision or restarting its deadline.
+                if !control.expiry_pending {
+                    let Some(next) = control
+                        .revision
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|value| value.checked_add(1))
+                    else {
+                        let _ = reply.send(false);
+                        return;
+                    };
+                    control.revision = next.to_string();
+                }
+                // Owner-relative, canonical due proof. Absolute timestamps
+                // are display data on a different host's clock.
+                control.deadline_in_s = Some(0);
+                control.expiry_pending = true;
+                self.state.job_mut(job).unwrap().set_control(&control);
+                self.pending_control_commits.insert(job);
+                let record = self.state.job(job).unwrap().clone();
+                let inventory = self.artifacts.clone();
+                let previous = revision.clone();
+                self.io_then(
+                    move || {
+                        inventory
+                            .checkpoint_worker_hold_expiry(&record, &previous, &notice)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))
+                    },
+                    move |owner, result| {
+                        let ok = result.is_ok();
+                        owner.pending_control_commits.remove(&job);
+                        if !ok {
+                            if let Some(before) = before {
+                                if let Some(row) = owner.state.job_mut(job) {
+                                    *row = before;
+                                }
+                            }
+                        }
+                        owner.dirty = true;
+                        let _ = reply.send(ok && guard.live());
+                    },
+                );
+            }
+            QueueCommand::ExpireHold {
+                job,
+                revision,
+                reply,
+            } => {
+                let started = self.expire_hold(job, &revision);
+                let _ = reply.send(started);
+            }
+            QueueCommand::FailJob {
+                job,
+                reason,
+                fetch_cause,
+                stage,
+                message,
+                reply,
+            } => {
+                self.fail_job_terminal_then(
+                    job,
+                    reason,
+                    fetch_cause,
+                    &stage,
+                    &message,
+                    Box::new(move |_, row| {
+                        let _ = reply.send(row);
+                    }),
+                );
+            }
+            QueueCommand::RecordTerminal {
+                terminal,
+                history,
+                reply,
+            } => {
+                let job = JobId(terminal.job);
+                if self.terminals_in_flight.contains(&job) {
+                    self.deferred_replacements
+                        .push_back(QueueCommand::RecordTerminal {
+                            terminal,
+                            history,
+                            reply,
+                        });
+                    return;
+                }
+                self.record_terminal_with_then(
+                    *terminal,
+                    history.map(|history| history.0),
+                    Box::new(move |_, row| {
+                        let _ = reply.send(row);
+                    }),
+                );
+            }
+            QueueCommand::ReplayTerminals { reply } => {
+                self.replay_terminals();
+                let _ = reply.send(());
             }
             QueueCommand::HoldJob {
                 job,
@@ -5015,7 +5831,7 @@ impl Owner {
                     let (reply, _) = oneshot::channel();
                     self.on_command(QueueCommand::RemoveJobSilent {
                         job: id,
-                        accepted_context: None,
+                        retirement: None,
                         reply,
                     });
                 }
@@ -5040,6 +5856,10 @@ impl Owner {
     ) {
         if self.persistence_fenced || !self.persist {
             callback(self, Err(crate::EngineError::OwnershipLost));
+            return;
+        }
+        if self.job_disposing(job) {
+            callback(self, Ok(false));
             return;
         }
         let Some(before) = self
@@ -5096,12 +5916,12 @@ impl Owner {
             JobStatus::Queued
         };
         row.params.retain(|(key, _)| key != "*AddPaused");
-        for (key, value) in prepared
-            .resolved
-            .params
-            .into_iter()
-            .filter(|(key, _)| matches!(key.as_str(), "Failure:Stage" | "Failure:Reason"))
-        {
+        for (key, value) in prepared.resolved.params.into_iter().filter(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "Failure:Stage" | "Failure:Reason" | crate::FETCH_CAUSE_PARAM
+            )
+        }) {
             set_owner_param(&mut row.params, &key, Some(value));
         }
         let maximum_file_id = row.files.iter().map(|file| file.id.0).max().unwrap_or(0);
@@ -5149,16 +5969,49 @@ impl Owner {
                 owner.publish_now();
                 owner.emit(Event::UrlFetchResolved { job });
                 if failed {
-                    owner.emit(Event::JobFinished {
+                    // Contract §2.1: the fetcher's terminal, typed at its
+                    // own site. Without a fetch cause the source failed
+                    // locally (a storage refusal), which is `io`.
+                    let row = owner.state.job(job);
+                    let param = |key: &str| {
+                        row.and_then(|row| {
+                            row.params
+                                .iter()
+                                .find(|(name, _)| name == key)
+                                .map(|(_, value)| value.clone())
+                        })
+                    };
+                    let cause = param(crate::FETCH_CAUSE_PARAM)
+                        .as_deref()
+                        .and_then(nzbd_types::FetchCause::parse);
+                    let message =
+                        param("Failure:Reason").unwrap_or_else(|| "URL fetch failed".into());
+                    let reason = if cause.is_some() {
+                        nzbd_types::FailureReason::Fetch
+                    } else {
+                        nzbd_types::FailureReason::Io
+                    };
+                    let name = owner
+                        .state
+                        .job(job)
+                        .map(|row| row.name.clone())
+                        .unwrap_or_default();
+                    // The advisory `job_finished` follows the terminal.
+                    owner.fail_job_terminal_then(
                         job,
-                        name: owner
-                            .state
-                            .job(job)
-                            .map(|row| row.name.clone())
-                            .unwrap_or_default(),
-                        status: JobStatus::Failed,
-                        health: 0,
-                    });
+                        reason,
+                        cause,
+                        "fetch",
+                        &message,
+                        Box::new(move |owner, _| {
+                            owner.emit(Event::JobFinished {
+                                job,
+                                name,
+                                status: JobStatus::Failed,
+                                health: 0,
+                            });
+                        }),
+                    );
                 }
                 owner.bump_epoch();
                 callback(owner, Ok(true));
@@ -5171,7 +6024,7 @@ impl Owner {
                 if let Err(error) = result {
                     owner.hold_job(
                         job,
-                        allocation_hold_cause(&error.to_string()),
+                        allocation_hold_cause(&error),
                         "download_write",
                         &format!("payload allocation: {error}"),
                     );
@@ -5410,6 +6263,11 @@ impl Owner {
             return false;
         };
         let record = self.state.jobs.remove(index);
+        self.artifacts.invalidate_writer_naming(job.0);
+        if self.post_rollbacks.remove(&job).is_some() {
+            self.record_transitions.remove(&job);
+            self.pending_control_commits.remove(&job);
+        }
         self.job_epochs.insert(job, fresh_epoch());
         if let Some(state) = self.verification.remove(&job) {
             state.cancel.cancel();
@@ -5563,7 +6421,9 @@ impl Owner {
                         continue;
                     }
                     if record.file_size > 0 {
-                        owner.file_sizes.insert(record.file, record.file_size);
+                        if let Some(size) = merge_replayed_size(&mut owner.state, &record) {
+                            owner.file_sizes.insert(record.file, size);
+                        }
                     }
                     let reference = SegRef {
                         job,
@@ -5619,6 +6479,7 @@ impl Owner {
         callback: impl FnOnce(&mut Owner, Result<(), nzbd_state::StateError>) + Send + 'static,
     ) {
         let state_dir = self.state_dir.clone();
+        let speed_revision = self.speed_limit_revision;
         self.io_then(
             move || SnapshotStore::open(&state_dir)?.load(),
             move |owner, result| {
@@ -5633,6 +6494,7 @@ impl Owner {
                     }
                 };
                 let mut jobs = owner.state.jobs.clone();
+                let mut adopted_speed = None;
                 if let Some(state) = recovered {
                     // The first cluster authority may boot without loading the
                     // shared queue. Preserve retired admissions for the one-time
@@ -5667,6 +6529,8 @@ impl Owner {
                     owner.state.next_job_id = owner.state.next_job_id.max(state.next_job_id);
                     owner.state.next_file_id = owner.state.next_file_id.max(state.next_file_id);
                     owner.state.download_paused = state.download_paused;
+                    owner.state.post_paused = state.post_paused;
+                    adopted_speed = Some(state.speed_limit_bps);
                     for job in state.jobs {
                         if !jobs.iter().any(|current| current.id == job.id) {
                             jobs.push(job);
@@ -5687,7 +6551,7 @@ impl Owner {
                 }
                 owner.persistence_fenced = false;
                 owner.persist = true;
-                owner.replace_projection_then(jobs, move |owner, result| {
+                owner.replace_projection_then(jobs, adopted_speed.map(|speed| (speed_revision, speed)), move |owner, result| {
                     if was_fenced && result.is_err() {
                         owner.persistence_fenced = true;
                         owner.persist = false;
@@ -5701,7 +6565,11 @@ impl Owner {
     // -- scheduling ----------------------------------------------------------
 
     fn grant_work(&mut self, server_id: ServerId, max: usize) -> Vec<Lease> {
-        if self.cancel.is_cancelled() || self.disk_low || self.is_blocked(server_id) {
+        if self.cancel.is_cancelled()
+            || self.disk_low
+            || self.is_blocked(server_id)
+            || self.journal_checkpoint.is_some()
+        {
             return Vec::new();
         }
         let servers = self.servers.clone();
@@ -5719,12 +6587,24 @@ impl Owner {
 
         let mut excluded = self.delegated.clone();
         for job in self
+            .state
+            .jobs
+            .iter()
+            .filter(|job| transitions::failed_cleanup_only(job) || self.job_disposing(job.id))
+        {
+            excluded.insert(
+                job.id,
+                "job is fenced for disposition or failed cleanup".into(),
+            );
+        }
+        for job in self
             .verification
             .keys()
             .chain(self.retiring_writers.keys())
             .chain(self.pending_control_commits.iter())
             .chain(self.pending_control_revisions.keys())
             .chain(self.allocating_jobs.iter())
+            .chain(self.deferred_terminals.keys())
         {
             excluded.insert(*job, "verification/replacement".into());
         }
@@ -5766,6 +6646,10 @@ impl Owner {
                 soft_hold: self.quota_reached,
                 rotate: self.rotate,
             };
+            #[cfg(test)]
+            {
+                self.work_selection_attempts += 1;
+            }
             let result = next_for_server(&self.state, server, &mut ctx);
             let exhausted = result.exhausted;
             let lease = result.lease;
@@ -5775,8 +6659,15 @@ impl Owner {
             let Some(r) = lease else { break };
 
             if let Err(e) = self.ensure_allocation(r.job, false) {
+                if matches!(e, nzbd_state::artifacts::Error::Busy(_)) {
+                    // No allocation was admitted and no callback owns this
+                    // row. Retain it in the queue and yield this bounded batch
+                    // until the payload-capacity wakeup; preserve prior leases.
+                    break;
+                }
                 if self.retiring_writers.contains_key(&r.job)
                     || self.allocating_jobs.contains(&r.job)
+                    || self.verification.contains_key(&r.job)
                 {
                     // Writer retirement owns its own completion/wake-up. It is
                     // transient, not an allocation needing operator review.
@@ -5785,17 +6676,16 @@ impl Owner {
                     continue;
                 }
                 let message = format!("payload allocation: {e}");
-                self.hold_job(
-                    r.job,
-                    allocation_hold_cause(&message),
-                    "download_write",
-                    &message,
-                );
+                self.hold_job(r.job, allocation_hold_cause(&e), "download_write", &message);
                 continue;
             }
             let writer = self.writer_for(r.job, r.file);
             let Some(generation) = self.writers.get(&r.file).map(|writer| writer.generation) else {
-                continue;
+                // Only an owner-handled persistence completion can publish the
+                // writer. Yield this batch instead of re-selecting its unchanged
+                // Pending segment once per queued job. Keep any leases already
+                // granted and preserve the active-download cap.
+                break;
             };
             let Some(seg) = self.state.segment_mut(r) else {
                 break;
@@ -5833,155 +6723,225 @@ impl Owner {
                 message_id,
                 writer,
                 generation,
+                cancel: self.writers[&r.file].stop.clone(),
             });
+        }
+        if !leases.is_empty() && self.startup_phases.first_lease_ms.is_none() {
+            let ms = crate::startup_phases::since_boot_ms();
+            self.startup_phases.first_lease_ms = Some(ms);
+            tracing::info!(ms, "first article lease since boot");
         }
         leases
     }
 
     // -- outcomes ------------------------------------------------------------
 
-    fn on_scoped_writer(&mut self, job: JobId, file: FileId, generation: u64, fact: WriterFact) {
-        if self.writer_epochs.get(&file) != Some(&generation)
-            || self.state.job(job).is_none()
-            || self.verification.contains_key(&job)
-        {
+    /// One writer durability checkpoint: every segment was written before
+    /// the shared `fdatasync`, and all name the same post-sync identity. The
+    /// file's proof is parsed, checked and re-serialized once per checkpoint,
+    /// not once per segment — the proof holds every range of the file, so a
+    /// per-segment round trip is quadratic in the file's article count and
+    /// saturated the owner on large files.
+    fn on_written_checkpoint(
+        &mut self,
+        job: JobId,
+        file: FileId,
+        generation: u64,
+        segments: Vec<crate::writer::WrittenSegment>,
+        identity: nzbd_state::artifacts::Identity,
+    ) {
+        // W5a: the same file's write landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
+        // Segments this checkpoint still has to record. A repeat — of a Done
+        // segment or of one earlier in this checkpoint (the writer re-acks a
+        // duplicate delivery) — is idempotent when identical and an identity
+        // failure when it contradicts.
+        let Some(segments) = checkpoint_members(segments) else {
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Identity,
+                None,
+                "download_write",
+                "writer acknowledgement contradicts completed logical segment",
+            );
             return;
-        }
-        match fact {
-            WriterFact::Written {
-                seg_number,
-                offset,
-                len,
-                crc,
-                file_size,
-                server,
-                identity,
-            } => {
-                let reference = SegRef {
-                    job,
-                    file,
-                    seg_number,
-                };
-                let Some(segment) = self.state.segment_mut(reference) else {
-                    return;
-                };
-                if let SegmentState::Done {
-                    offset: old,
-                    len: old_len,
-                    crc: old_crc,
-                } = segment.state
-                {
-                    if (old, old_len, old_crc) != (offset, len, crc) {
-                        self.hold_job(
-                            job,
-                            nzbd_types::HoldCause::IdentityConflict,
-                            "download_write",
-                            "writer acknowledgement contradicts completed logical segment",
-                        );
-                    }
-                    return;
-                }
-                let Some(allocation) = self.allocation_cache.get(&job) else {
-                    return;
-                };
-                let record = self.state.job(job).unwrap();
-                let key = format!("*File:proof:{}", file.0);
-                let file_generation = record
-                    .params
-                    .iter()
-                    .find(|(key, _)| key == &format!("*File:generation:{}", file.0))
-                    .map(|(_, value)| value.clone())
-                    .unwrap_or_default();
-                if file_generation != generation.to_string() {
-                    return;
-                }
-                let mut proof = record
-                    .params
-                    .iter()
-                    .find(|(candidate, _)| candidate == &key)
-                    .and_then(|(_, value)| serde_json::from_str::<DurableFileProof>(value).ok())
-                    .filter(|proof| {
-                        proof.protocol == WRITER_PROTOCOL
-                            && proof.generation == file_generation
-                            && proof.allocation_generation == allocation.generation
-                            && proof.installation == self.artifacts.installation
-                            && proof.identity.same_object(&identity)
-                    })
-                    .unwrap_or_else(|| DurableFileProof {
-                        protocol: WRITER_PROTOCOL,
-                        generation: file_generation.clone(),
-                        allocation_generation: allocation.generation.clone(),
-                        installation: self.artifacts.installation.clone(),
-                        identity: identity.clone(),
-                        ranges: vec![],
-                        publication_name: None,
-                    });
-                let range = ProvenRange {
-                    seg_number,
-                    offset,
-                    len,
-                    crc,
-                };
-                if proof
-                    .ranges
-                    .iter()
-                    .any(|prior| prior.seg_number == seg_number || prior.overlaps(&range))
-                {
-                    self.hold_job(
+        };
+        let mut fresh = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let reference = SegRef {
+                job,
+                file,
+                seg_number: segment.seg_number,
+            };
+            let Some(state) = self.state.segment_mut(reference) else {
+                continue;
+            };
+            if let SegmentState::Done {
+                offset: old,
+                len: old_len,
+                crc: old_crc,
+            } = state.state
+            {
+                if (old, old_len, old_crc) != (segment.offset, segment.len, segment.crc) {
+                    self.fail_job_terminal(
                         job,
-                        nzbd_types::HoldCause::IdentityConflict,
+                        nzbd_types::FailureReason::Identity,
+                        None,
                         "download_write",
-                        "writer acknowledgement overlaps durable evidence",
+                        "writer acknowledgement contradicts completed logical segment",
                     );
                     return;
                 }
-                proof.identity = identity;
-                proof.ranges.push(range.clone());
-                let mut journal_proof = proof.clone();
-                journal_proof.ranges = vec![range];
-                self.append_journal(
-                    JournalRecord {
-                        job,
-                        file,
-                        segment_number: seg_number,
-                        offset,
-                        len,
-                        crc32: crc,
-                        file_size,
-                    },
-                    serde_json::to_value(&journal_proof).ok(),
-                );
-                if let Some(segment) = self.state.segment_mut(reference) {
-                    segment.state = SegmentState::Done { offset, len, crc };
-                }
-                if let Some(record) = self.state.job_mut(job) {
-                    set_owner_param(&mut record.params, &key, serde_json::to_string(&proof).ok());
-                    recompute_job_totals(record);
-                }
-                if file_size > 0 {
-                    self.file_sizes.insert(file, file_size);
-                }
-                self.volumes.add(
-                    server,
-                    u64::from(len),
-                    unix_now(),
-                    self.tuning.quota_start_day,
-                );
-                self.attempts.remove(&reference);
-                self.dirty = true;
-                self.after_file_change(job, file);
+                continue;
+            }
+            fresh.push(segment);
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let Some(allocation) = self.allocation_cache.get(&job) else {
+            return;
+        };
+        let record = self.state.job(job).unwrap();
+        let key = format!("*File:proof:{}", file.0);
+        let file_generation = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &format!("*File:generation:{}", file.0))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        if file_generation != generation.to_string() {
+            return;
+        }
+        let mut proof = record
+            .params
+            .iter()
+            .find(|(candidate, _)| candidate == &key)
+            .and_then(|(_, value)| serde_json::from_str::<DurableFileProof>(value).ok())
+            .filter(|proof| {
+                proof.protocol == WRITER_PROTOCOL
+                    && proof.generation == file_generation
+                    && proof.allocation_generation == allocation.generation
+                    && proof.installation == self.artifacts.installation
+                    && proof.identity.same_object(&identity)
+            })
+            .unwrap_or_else(|| DurableFileProof {
+                protocol: WRITER_PROTOCOL,
+                generation: file_generation.clone(),
+                allocation_generation: allocation.generation.clone(),
+                installation: self.artifacts.installation.clone(),
+                identity: identity.clone(),
+                ranges: vec![],
+                publication_name: None,
+            });
+        let batch: Vec<ProvenRange> = fresh
+            .iter()
+            .map(|segment| ProvenRange {
+                seg_number: segment.seg_number,
+                offset: segment.offset,
+                len: segment.len,
+                crc: segment.crc,
+            })
+            .collect();
+        if proof_overlaps(&proof.ranges, &batch) {
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Identity,
+                None,
+                "download_write",
+                "writer acknowledgement overlaps durable evidence",
+            );
+            return;
+        }
+        proof.identity = identity;
+        let mut journal_proof = DurableFileProof {
+            ranges: vec![],
+            ..proof.clone()
+        };
+        proof.ranges.extend(batch.iter().cloned());
+        for (segment, range) in fresh.iter().zip(batch) {
+            journal_proof.ranges = vec![range];
+            self.append_journal(
+                JournalRecord {
+                    job,
+                    file,
+                    segment_number: segment.seg_number,
+                    offset: segment.offset,
+                    len: segment.len,
+                    crc32: segment.crc,
+                    file_size: segment.file_size,
+                },
+                serde_json::to_value(&journal_proof).ok(),
+            );
+            let reference = SegRef {
+                job,
+                file,
+                seg_number: segment.seg_number,
+            };
+            if let Some(state) = self.state.segment_mut(reference) {
+                state.state = SegmentState::Done {
+                    offset: segment.offset,
+                    len: segment.len,
+                    crc: segment.crc,
+                };
+            }
+            if segment.file_size > 0 {
+                self.file_sizes.insert(file, segment.file_size);
+            }
+            self.volumes.add(
+                segment.server,
+                u64::from(segment.len),
+                unix_now(),
+                self.tuning.quota_start_day,
+            );
+            self.attempts.remove(&reference);
+        }
+        if let Some(record) = self.state.job_mut(job) {
+            set_owner_param(&mut record.params, &key, serde_json::to_string(&proof).ok());
+            recompute_job_totals(record);
+        }
+        self.dirty = true;
+        self.after_file_change(job, file);
+    }
+
+    fn on_scoped_writer(&mut self, job: JobId, file: FileId, generation: u64, fact: WriterFact) {
+        if self.writer_epochs.get(&file) != Some(&generation)
+            || self.state.job(job).is_none()
+            || self
+                .state
+                .job(job)
+                .is_some_and(transitions::failed_cleanup_only)
+            || self.verification.contains_key(&job)
+        {
+            if let WriterFact::Finalized {
+                naming: Some(naming),
+                ..
+            } = fact
+            {
+                self.artifacts.discard_writer_naming(*naming);
+            }
+            return;
+        }
+        match fact {
+            WriterFact::Written { segments, identity } => {
+                self.on_written_checkpoint(job, file, generation, segments, identity)
             }
             WriterFact::Finalized {
                 ok,
                 final_path,
                 combined_crc,
                 identity,
+                naming,
             } => {
                 if !ok {
+                    if let Some(naming) = naming {
+                        self.artifacts.discard_writer_naming(*naming);
+                    }
                     self.on_writer_finalized(job, file, false, final_path, combined_crc);
                     return;
                 }
                 let proof_key = format!("*File:proof:{}", file.0);
+                let naming_allocation = self.allocation_cache.get(&job).cloned();
                 if let Some(record) = self.state.job_mut(job) {
                     if let Some(identity) = identity {
                         if let Some((_, raw)) =
@@ -6009,11 +6969,30 @@ impl Owner {
                     if owner.writer_epochs.get(&file) != Some(&generation)
                         || owner.state.job(job).is_none()
                     {
+                        if let Some(naming) = naming {
+                            owner.artifacts.discard_writer_naming(*naming);
+                        }
                         return;
                     }
                     if committed {
+                        if let Some(naming) = naming {
+                            if let Some(allocation) = naming_allocation {
+                                owner.artifacts.remember_writer_naming(
+                                    job.0,
+                                    file.0,
+                                    generation,
+                                    &allocation,
+                                    *naming,
+                                );
+                            } else {
+                                owner.artifacts.discard_writer_naming(*naming);
+                            }
+                        }
                         owner.on_writer_finalized(job, file, true, final_path, combined_crc);
                     } else {
+                        if let Some(naming) = naming {
+                            owner.artifacts.discard_writer_naming(*naming);
+                        }
                         if let Some(entry) = owner.state.file_mut(job, file) {
                             entry.finalized = false;
                         }
@@ -6026,12 +7005,24 @@ impl Owner {
                     }
                 });
             }
-            WriterFact::Error { error } => {
+            WriterFact::Error { error, cause } => {
                 if let Some(writer) = self.writers.remove(&file) {
                     self.retire_writer_handle(job, writer);
                 }
                 self.writer_epochs.remove(&file);
-                self.on_msg(EngineMsg::WriterError { job, file, error });
+                self.on_msg(EngineMsg::WriterError {
+                    job,
+                    file,
+                    error,
+                    cause,
+                });
+            }
+            WriterFact::IdentityMismatch { error } => {
+                if let Some(writer) = self.writers.remove(&file) {
+                    self.retire_writer_handle(job, writer);
+                }
+                self.writer_epochs.remove(&file);
+                self.on_msg(EngineMsg::WriterIdentityMismatch { job, file, error });
             }
             WriterFact::Rejected {
                 seg_number,
@@ -6052,6 +7043,80 @@ impl Owner {
         }
     }
 
+    /// No-wedge task 1. The writer found that the file on disk is not the
+    /// object its proof names. The recorded ranges are therefore not on
+    /// disk: discard this one file's Done ranges and proof and re-download
+    /// it from an empty file (the next writer removes whatever sits at its
+    /// names; the job directory is Runner's closed scope). Other files and
+    /// other jobs are untouched. After [`IDENTITY_RESET_LIMIT`] resets of the
+    /// same file the job ends `failed/io` (the storage's fault, never the
+    /// release's; salvage allowed) and follows its terminal policy, so a
+    /// filesystem that keeps swapping the object cannot loop.
+    fn on_writer_identity_mismatch(&mut self, job: JobId, file: FileId, error: &str) {
+        let resets_key = format!("{IDENTITY_RESETS_PREFIX}{}", file.0);
+        let Some(record) = self.state.job_mut(job) else {
+            return;
+        };
+        if record
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
+            return;
+        }
+        let resets = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &resets_key)
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        if resets >= IDENTITY_RESET_LIMIT {
+            tracing::warn!(job = job.0, file = file.0, %error, resets, "writer identity mismatch recurred; failing job");
+            // A filesystem that keeps replacing the object is the storage's
+            // fault, not the release's: `failed/io` (blameless, parked,
+            // salvage allowed), with the cause named in the message.
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Io,
+                None,
+                "download_write",
+                &format!("identity: {error}; recurred after {resets} re-downloads of the file"),
+            );
+            return;
+        }
+        tracing::warn!(job = job.0, file = file.0, %error, attempt = resets + 1, "writer identity mismatch; re-downloading the file");
+        set_owner_param(
+            &mut record.params,
+            &resets_key,
+            Some((resets + 1).to_string()),
+        );
+        set_owner_param(
+            &mut record.params,
+            &format!("{IDENTITY_DISCARD_PREFIX}{}", file.0),
+            Some("1".into()),
+        );
+        set_owner_param(&mut record.params, &format!("*File:proof:{}", file.0), None);
+        if let Some(entry) = record.files.iter_mut().find(|entry| entry.id == file) {
+            for segment in &mut entry.segments {
+                if matches!(
+                    segment.state,
+                    SegmentState::Done { .. } | SegmentState::Leased { .. }
+                ) {
+                    segment.state = SegmentState::Pending;
+                }
+            }
+            entry.finalized = false;
+            entry.crc32 = None;
+        }
+        recompute_job_totals(record);
+        self.file_sizes.remove(&file);
+        self.finalize_sent.remove(&file);
+        self.attempts.retain(|reference, _| reference.file != file);
+        self.dirty = true;
+        self.publish_now();
+        self.bump_epoch();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn on_segment_written(
         &mut self,
@@ -6064,6 +7129,8 @@ impl Owner {
         file_size: u64,
         server: ServerId,
     ) {
+        // W5a: the same file's write landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
         self.volumes
             .add(server, len as u64, unix_now(), self.tuning.quota_start_day);
         let r = SegRef {
@@ -6081,6 +7148,15 @@ impl Owner {
             return; // duplicate (e.g. recovery overlap)
         }
         seg.state = SegmentState::Done { offset, len, crc };
+        if let Some(record) = self.state.job_mut(job) {
+            // The writer that took this write started from an empty file:
+            // the discard it was asked for is done.
+            set_owner_param(
+                &mut record.params,
+                &format!("{IDENTITY_DISCARD_PREFIX}{}", file.0),
+                None,
+            );
+        }
         self.append_journal(
             JournalRecord {
                 job,
@@ -6173,14 +7249,13 @@ impl Owner {
         self.maybe_abort_unhealthy(r.job);
     }
 
-    /// NZBGet-style critical-health abort: once enough articles have
-    /// failed that the job can't be repaired even with every par2 block
-    /// (`health < critical_health`), stop wasting bandwidth. Pending
-    /// segments are failed outright; leased ones finish their in-flight
-    /// attempt honestly. The job then completes as Failed through the
-    /// normal path, and the PP health gate parks/deletes per policy.
+    /// End an unviable download through the durable failure path immediately.
+    /// Pending-only exhaustion leaves leased retries and paused PAR files alive.
     fn maybe_abort_unhealthy(&mut self, job_id: JobId) {
-        if !self.tuning.health_abort {
+        if !self.tuning.health_abort
+            || self.terminals_in_flight.contains(&job_id)
+            || self.deferred_terminals.contains_key(&job_id)
+        {
             return;
         }
         let Some(job) = self.state.job(job_id) else {
@@ -6188,8 +7263,14 @@ impl Owner {
         };
         if !matches!(
             job.status,
-            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
-        ) {
+            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused | JobStatus::Held
+        ) || open_post_stage(job).is_some()
+            || job.control().is_some_and(|control| control.post_side())
+            || job
+                .params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
             return;
         }
         let health = Health::calc(&job.totals);
@@ -6198,46 +7279,31 @@ impl Owner {
             return;
         }
         let name = job.name.clone();
-        let pending: Vec<(FileId, Vec<u32>)> = job
-            .files
-            .iter()
-            .filter(|f| !f.is_terminal())
-            .map(|f| {
-                (
-                    f.id,
-                    f.segments
-                        .iter()
-                        .filter(|s| matches!(s.state, SegmentState::Pending))
-                        .map(|s| s.number)
-                        .collect(),
-                )
-            })
-            .collect();
-        tracing::warn!(
-            job = job_id.0,
-            %name,
-            health = health.0,
-            critical = critical.0,
-            "aborting download: health below critical (unrepairable even with all par2)"
-        );
-        for (file, segs) in pending {
-            for seg_number in segs {
-                let r = SegRef {
-                    job: job_id,
-                    file,
-                    seg_number,
-                };
-                if let Some(seg) = self.state.segment_mut(r) {
-                    seg.state = SegmentState::Failed;
+        // Stop producers and fence their late acknowledgements before disposal.
+        self.retire_job_writers(job_id);
+        self.attempts.retain(|r, _| r.job != job_id);
+        self.fail_job_terminal_then(
+            job_id,
+            nzbd_types::FailureReason::Health,
+            None,
+            "health",
+            &format!(
+                "download health {} below critical health {}",
+                health.0, critical.0
+            ),
+            Box::new(move |owner, row| {
+                if row.is_some() {
+                    owner.emit(Event::JobFinished {
+                        job: job_id,
+                        name,
+                        status: JobStatus::Failed,
+                        health: health.0,
+                    });
                 }
-                self.attempts.remove(&r);
-            }
-            if let Some(j) = self.state.job_mut(job_id) {
-                recompute_job_totals(j);
-            }
-            self.after_file_change(job_id, file);
-        }
+            }),
+        );
         self.bump_epoch();
+        self.publish_now();
     }
 
     fn accept_file_metadata(&mut self, job: JobId, file: FileId, name: &str, size: u64) {
@@ -6248,9 +7314,10 @@ impl Owner {
             || name == ".."
             || size == 0
         {
-            self.hold_job(
+            self.fail_job_terminal(
                 job,
-                nzbd_types::HoldCause::IdentityConflict,
+                nzbd_types::FailureReason::Identity,
+                None,
                 "download_write",
                 "unsafe or incomplete yEnc metadata",
             );
@@ -6273,9 +7340,10 @@ impl Owner {
         // every article. The NZB file/segment mapping identifies the file;
         // keep the first safe name stable and require a consistent size.
         if previous_size.is_some_and(|s| s != size) {
-            self.hold_job(
+            self.fail_job_terminal(
                 job,
-                nzbd_types::HoldCause::IdentityConflict,
+                nzbd_types::FailureReason::Identity,
+                None,
                 "download_write",
                 "conflicting yEnc declared size",
             );
@@ -6342,6 +7410,14 @@ impl Owner {
         if self.persistence_fenced || self.automatic_control_pending(job) {
             return false;
         }
+        if self
+            .state
+            .job(job)
+            .and_then(Job::control)
+            .is_some_and(|c| c.expiry_pending)
+        {
+            return false;
+        }
         let before = self.state.job(job).cloned();
         let cause_str = cause.as_str().to_string();
         let Some(j) = self.state.job_mut(job) else {
@@ -6351,11 +7427,9 @@ impl Owner {
             return false;
         }
         let prior = j.control();
-        if prior.as_ref().is_some_and(|c| {
-            c.lifecycle == "held" && !matches!(c.cause.as_str(), "capacity" | "quota")
-        }) {
-            return true;
-        }
+        // A newer hold replaces the control (revision + 1): the first cause
+        // does not win (contract §2.3). Only the same cause at the same stage
+        // is already recorded.
         if prior
             .as_ref()
             .is_some_and(|c| c.lifecycle == "held" && c.cause == cause_str && c.stage == stage)
@@ -6390,6 +7464,7 @@ impl Owner {
         let attempts_made = episode.map_or(0, |c| c.retry_attempt);
         let timed = policy.timed();
         let control = nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: revision.to_string(),
             lifecycle: "held".into(),
@@ -6428,13 +7503,34 @@ impl Owner {
                 attempts_made
             },
             next_retry_at_unix: timed.then(|| {
-                now.saturating_add(hold_retry_delay_with_jitter(job, attempts_made, now))
-                    .max(not_before.unwrap_or(0))
+                now.saturating_add(
+                    if cause.is_storage() || cause == nzbd_types::HoldCause::StorageUnavailable {
+                        hold_retry_delay_with_jitter(job, attempts_made, now).min(60)
+                    } else {
+                        hold_retry_delay_with_jitter(job, attempts_made, now)
+                    },
+                )
+                .max(not_before.unwrap_or(0))
             }),
             blocked_since_unix: episode.and_then(|c| c.blocked_since_unix).or(Some(now)),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         };
+        let deadline_secs = self.tuning.hold_deadline_secs(&cause);
+        // The deadline runs from when this episode began, so a hold that
+        // changes cause mid-outage does not restart the clock.
+        let deadline_unix = control
+            .blocked_since_unix
+            .unwrap_or(now)
+            .saturating_add(deadline_secs);
         let mut control = control;
+        // Seed retirement runs after the job's terminal and never ends it,
+        // so its holds carry no deadline.
+        if !crate::terminal::seed_retirement_stage(stage) {
+            control.deadline_unix = Some(deadline_unix);
+            control.deadline_in_s = Some(deadline_unix.saturating_sub(now));
+        }
         if control
             .blocked_since_unix
             .is_some_and(|since| now.saturating_sub(since) >= 1800)
@@ -6460,7 +7556,7 @@ impl Owner {
                 );
             }
         }
-        j.status = JobStatus::Paused;
+        j.status = JobStatus::Held;
         for f in &mut j.files {
             for s in &mut f.segments {
                 if matches!(s.state, SegmentState::Leased { .. }) {
@@ -6519,18 +7615,7 @@ impl Owner {
     /// `PostQueued`, which the post scan claims through its own guards and
     /// runs from the beginning. Storage causes release through
     /// `ReleaseResourceHold` after their capacity probe instead.
-    #[cfg(test)]
-    pub(crate) fn retry_hold(
-        &mut self,
-        job: JobId,
-        revision: &str,
-        by: RetryBy,
-        custody_checked: bool,
-    ) -> Result<(), String> {
-        self.retry_hold_proven(job, revision, by, custody_checked, &Default::default())
-    }
-
-    fn retry_hold_proven(
+    pub(crate) fn retry_hold_proven(
         &mut self,
         job: JobId,
         revision: &str,
@@ -6539,6 +7624,7 @@ impl Owner {
         guard: &crate::hold_release::HoldReleaseGuard,
     ) -> Result<(), String> {
         if self.persistence_fenced
+            || self.job_disposing(job)
             || (by == RetryBy::Recovery && self.automatic_control_pending(job))
         {
             return Err("durable queue ownership is fenced".into());
@@ -6564,14 +7650,16 @@ impl Owner {
         if control.revision != revision {
             return Err("the hold changed since it was read; reload and retry".into());
         }
+        if control.expiry_pending {
+            return Err("the expired worker hold awaits its authoritative terminal".into());
+        }
         let native_preparation = crate::torrent_acquisitions::preparation_hold(&before, &control);
         if control.hold_cause().is_storage() && !control.post_side() && !native_preparation {
             return Err("storage holds are released by the capacity check".into());
         }
         if by == RetryBy::Recovery
-            && (!control.hold_cause().policy().automatic()
-                || (control.hold_cause().policy().timed()
-                    && control.next_retry_at_unix.is_none_or(|at| at > unix_now())))
+            && control.hold_cause().policy().timed()
+            && control.next_retry_at_unix.is_none_or(|at| at > unix_now())
         {
             return Err("the hold is not due for automatic recovery".into());
         }
@@ -6660,11 +7748,6 @@ impl Owner {
     /// Push an automatic hold's next attempt out on the same backoff, keeping
     /// the original reason and recording the refusal beside it. The new time
     /// lives in memory even if this save fails; the next snapshot carries it.
-    #[cfg(test)]
-    fn reschedule_hold(&mut self, job: JobId, revision: &str, reason: &str) -> bool {
-        self.reschedule_hold_proven(job, revision, reason, &Default::default())
-    }
-
     fn reschedule_hold_proven(
         &mut self,
         job: JobId,
@@ -6675,10 +7758,10 @@ impl Owner {
         if self.persistence_fenced
             || self.automatic_control_pending(job)
             || (!guard.worker_checked() && self.delegated.contains_key(&job))
-            || !self
-                .state
-                .job(job)
-                .is_some_and(|current| guard.matches(&self.artifacts, current, self.persist))
+            || !self.state.job(job).is_some_and(|current| {
+                guard.matches(&self.artifacts, current, self.persist)
+                    && !current.control().is_some_and(|c| c.expiry_pending)
+            })
         {
             return false;
         }
@@ -6686,9 +7769,10 @@ impl Owner {
         let Some(j) = self.state.job_mut(job) else {
             return false;
         };
-        let Some(mut control) = j.control().filter(|c| {
-            c.lifecycle == "held" && c.revision == revision && c.hold_cause().policy().automatic()
-        }) else {
+        let Some(mut control) = j
+            .control()
+            .filter(|c| c.lifecycle == "held" && c.revision == revision && !c.expiry_pending)
+        else {
             return false;
         };
         // A timed hold moves its next attempt out; a re-observed one keeps
@@ -6696,6 +7780,13 @@ impl Owner {
         let timed = control.hold_cause().policy().timed();
         if timed {
             let delay = hold_retry_delay_with_jitter(job, control.retry_attempt, unix_now());
+            let delay = if control.hold_cause().is_storage()
+                || control.hold_cause() == nzbd_types::HoldCause::StorageUnavailable
+            {
+                delay.min(60)
+            } else {
+                delay
+            };
             control.retry_attempt = control.retry_attempt.saturating_add(1);
             control.next_retry_at_unix = Some(unix_now().saturating_add(delay));
         }
@@ -6887,11 +7978,16 @@ impl Owner {
                 valid && end <= file_size
             });
         if !range_checkpoint && !valid_ranges {
+            // The partial's recorded coverage cannot be proven against an
+            // expected size. That is not contradictory evidence (contract
+            // §2.2 `identity`): verification re-checks the retained partial
+            // and reopens its invalid ranges for download, releasing this
+            // hold (`accepted_hold_rewrite`). Bounded by the hold deadline.
             self.hold_job(
                 job,
-                nzbd_types::HoldCause::IdentityConflict,
+                nzbd_types::HoldCause::StorageUnavailable,
                 "finalize",
-                "file coverage or expected size is unverified; partial retained",
+                crate::owner::COVERAGE_UNVERIFIED,
             );
             return;
         }
@@ -7012,35 +8108,49 @@ impl Owner {
         let Some(f) = self.state.file_mut(job, file) else {
             return;
         };
-        f.finalized = true;
-        if ok {
-            f.crc32 = combined_crc;
-        }
         let filename = f.filename.clone();
         if !ok {
-            // The bytes did not land. Record it against the job so that
-            // check_job_complete cannot call this a success — see the field's
-            // comment for why health is incapable of catching it.
+            // The bytes did not land. The file is NOT finalized: its partial
+            // may be the only copy of the payload, and the startup sweep
+            // removes partials of finalized files. The failure is recorded
+            // durably as the job's `failed/io` terminal (parked, blameless,
+            // salvage keeps the partial) — the same path as a writer error
+            // that retrying cannot fix — so it survives a restart instead of
+            // living only in memory.
             tracing::error!(job = job.0, file = file.0, %filename,
                 "finalize failed; the job cannot be reported as successful");
-            self.write_failures
-                .entry(job)
-                .or_insert_with(|| format!("could not write {filename} to disk"));
+            self.emit(Event::FileFinished {
+                job,
+                file,
+                filename: filename.clone(),
+                ok: false,
+            });
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Io,
+                None,
+                "finalize",
+                &format!("could not write {filename} to disk"),
+            );
+            return;
         }
+        f.finalized = true;
+        f.crc32 = combined_crc;
+        // W5a: this file's own write and publication landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Finalize { job, file });
         tracing::info!(job = job.0, file = file.0, %filename, ok, path = ?final_path, "file finished");
         // A completed file may be the recovery index that knows what this
         // whole job actually is. Only worth asking when the job still has
         // no real name.
-        if ok {
-            if let Some(path) = final_path.clone() {
-                self.maybe_learn_name_from(job, path);
-            }
+        if let Some(path) = final_path.clone() {
+            self.maybe_learn_name_from(job, path);
         }
         self.emit(Event::FileFinished {
             job,
             file,
             filename,
-            ok,
+            ok: true,
         });
         self.dirty = true;
         self.check_job_complete(job);
@@ -7169,6 +8279,7 @@ impl Owner {
 
     fn check_job_complete(&mut self, job_id: JobId) {
         if self.pending_control_commits.contains(&job_id)
+            || self.journal_checkpoint.is_some()
             || self.cancel.is_cancelled()
             || self.verification.contains_key(&job_id)
             || self.retiring_writers.contains_key(&job_id)
@@ -7177,6 +8288,11 @@ impl Owner {
         }
         if self.state.job(job_id).is_some_and(|j| j.held()) {
             return;
+        }
+        if self.terminals_in_flight.contains(&job_id)
+            || self.deferred_terminals.contains_key(&job_id)
+        {
+            return; // the job's terminal is being (or waits to be) recorded
         }
         if self.delegated.contains_key(&job_id) {
             return; // completes via the executor's report, not locally
@@ -7219,6 +8335,11 @@ impl Owner {
         // strength of the first while the second failed is how a consumer
         // ends up importing 500 MiB of a 48 GiB file.
         let mut recovery_write_failed = false;
+        // Contract §2.2: the owner types its own terminal. A write that did
+        // not land is `io` (parked, never the release's fault); articles
+        // below critical are `health` (blamed, salvageable). Neither passes
+        // through post-processing admission.
+        let mut terminal: Option<(nzbd_types::FailureReason, &'static str, String)> = None;
         if let Some(reason) = self.write_failures.remove(&job_id) {
             if let Some(stage) = resume_post_stage {
                 // The active PP task will re-verify the filesystem and either
@@ -7233,13 +8354,23 @@ impl Owner {
                     "post-processing recovery download did not reach disk; resuming verification");
             } else {
                 status = JobStatus::Failed;
-                job.status = status;
                 tracing::error!(job = job_id.0, %reason,
                     "job failed: the download completed but the files did not");
+                terminal = Some((nzbd_types::FailureReason::Io, "download", reason));
             }
         } else if let Some(stage) = resume_post_stage {
             status = JobStatus::Post { stage };
             job.status = status;
+        } else if status == JobStatus::Failed {
+            let critical = Health::calc_critical(&job.totals, true);
+            terminal = Some((
+                nzbd_types::FailureReason::Health,
+                "health",
+                format!(
+                    "download health {} below critical health {}",
+                    health.0, critical.0
+                ),
+            ));
         } else {
             job.status = status;
         }
@@ -7269,6 +8400,29 @@ impl Owner {
         for fid in &file_ids {
             self.writers.remove(fid);
             self.file_sizes.remove(fid);
+        }
+        if let Some((reason, stage, message)) = terminal {
+            // The terminal record, history and markers come first; the
+            // advisory `job_finished` follows the stamp.
+            self.fail_job_terminal_then(
+                job_id,
+                reason,
+                None,
+                stage,
+                &message,
+                Box::new(move |owner, row| {
+                    if row.is_some() {
+                        owner.emit(Event::JobFinished {
+                            job: job_id,
+                            name,
+                            status: JobStatus::Failed,
+                            health: health.0,
+                        });
+                    }
+                }),
+            );
+            self.publish_now();
+            return;
         }
         // Persist and publish BEFORE emitting: an event subscriber that
         // immediately reads the snapshot must see the resulting state.
@@ -7353,6 +8507,7 @@ impl Owner {
             return;
         };
         let inventory = self.artifacts.clone();
+        let consumer_admission = self.job_admission_binding(&record);
         let root = self.dest_dir.clone();
         let occupied = self
             .state
@@ -7407,6 +8562,11 @@ impl Owner {
                         keep,
                     )
                     .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                if let Some(binding) = consumer_admission.as_ref().filter(|_| allocation.owned) {
+                    inventory
+                        .bind_job_disposition_source(binding, &allocation)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
                 Ok((name, allocation))
             },
             move |owner, result| {
@@ -7470,12 +8630,27 @@ impl Owner {
                 "writer retirement in progress".into(),
             ));
         }
+        // Completion evidence with no allocation is recovery's, never a
+        // fresh allocation's: a job startup released untouched
+        // (paused, then resumed) takes its recovery pass here, lazily.
+        let needs_recovery = !self.allocated_jobs.contains(&job)
+            && !self.allocating_jobs.contains(&job)
+            && self
+                .state
+                .job(job)
+                .is_some_and(|record| record.files.iter().any(|file| file.has_any_done()))
+            && !self.allocation_cache.contains_key(&job);
+        if needs_recovery {
+            self.queue_verification(job);
+            return Err(nzbd_state::artifacts::Error::Conflict(
+                "payload recovery pending".into(),
+            ));
+        }
         let record = self
             .state
             .job(job)
-            .cloned()
             .ok_or(nzbd_state::artifacts::Error::NotFound)?;
-        let plan = transitions::imported_payload_plan(&record, &self.dest_dir)
+        let plan = transitions::imported_payload_plan(record, &self.dest_dir)
             .map_err(|error| nzbd_state::artifacts::Error::Conflict(error.to_string()))?;
         if self.allocated_jobs.contains(&job)
             && self.allocation_cache.get(&job).is_some_and(|allocation| {
@@ -7490,7 +8665,16 @@ impl Owner {
                 "payload allocation pending".into(),
             ));
         }
+        if !self.payload_capacity_available() {
+            return Err(nzbd_state::artifacts::Error::Busy(
+                "payload allocation awaits lane capacity",
+            ));
+        }
+        // Cache hits need only the plan above, not a clone of every file and
+        // segment. Own the descriptor only when scheduling an actual allocation.
+        let record = record.clone();
         let inventory = self.artifacts.clone();
+        let consumer_admission = self.job_admission_binding(&record);
         let root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         self.allocating_jobs.insert(job);
@@ -7514,7 +8698,7 @@ impl Owner {
                         .params
                         .iter()
                         .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
-                    inventory
+                    let created = inventory
                         .allocate_for_delivery_with_keep(
                             record.id.0,
                             &plan.root,
@@ -7523,7 +8707,13 @@ impl Owner {
                             record.delivery_lifecycle,
                             keep,
                         )
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    if let Some(binding) = consumer_admission.as_ref().filter(|_| created.owned) {
+                        inventory
+                            .bind_job_disposition_source(binding, &created)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                    created
                 } else {
                     transitions::allocate_imported_payload(
                         &inventory, &record, &root, &plan, allocation,
@@ -7547,10 +8737,14 @@ impl Owner {
                         owner.allocated_jobs.insert(job);
                         owner.bump_epoch();
                     }
+                    Err(nzbd_state::StateError::Busy(_)) => {
+                        // The action never started. The scheduler retains the
+                        // row and will retry on the payload capacity wakeup.
+                    }
                     Err(error) => {
                         owner.hold_job(
                             job,
-                            allocation_hold_cause(&error.to_string()),
+                            allocation_hold_cause(&error),
                             "download_write",
                             &error.to_string(),
                         );
@@ -7592,6 +8786,7 @@ impl Owner {
         }
         self.writers.remove(&file);
         self.writer_epochs.remove(&file);
+        self.artifacts.invalidate_writer_naming_file(job.0, file.0);
         if let Err(error) = self.ensure_allocation(job, false) {
             tracing::warn!(job=job.0,%error,"writer allocation unavailable");
             return closed();
@@ -7605,6 +8800,7 @@ impl Owner {
         let Some(entry) = record.files.iter().find(|entry| entry.id == file) else {
             return closed();
         };
+        let collect_naming = !entry.is_par2 && record.files.iter().any(|file| file.is_par2);
         let proven = entry
             .segments
             .iter()
@@ -7646,6 +8842,8 @@ impl Owner {
             return closed();
         }
         let expected_identity = proof.as_ref().map(|proof| proof.identity.clone());
+        let discard_key = format!("{IDENTITY_DISCARD_PREFIX}{}", file.0);
+        let discard_existing = record.params.iter().any(|(key, _)| key == &discard_key);
         let filename = record
             .params
             .iter()
@@ -7694,6 +8892,13 @@ impl Owner {
                 generation,
                 proven,
                 expected_identity,
+                collect_naming,
+                discard_existing,
+                naming_inventory: collect_naming.then(|| owner.artifacts.clone()),
+                #[cfg(test)]
+                naming_test_hook: None,
+                #[cfg(test)]
+                sync_test_hook: owner.writer_sync_hook.clone(),
             };
             let writer = spawn_writer_scoped(
                 &owner.tracker,
@@ -7779,6 +8984,20 @@ impl Owner {
         });
     }
 
+    fn stale_worker_retirement(&self, command: &QueueCommand) -> bool {
+        match command {
+            QueueCommand::RemoveJobSilent {
+                job,
+                retirement: Some(retirement),
+                ..
+            } => self.state.job(*job).is_none_or(|record| {
+                nzbd_state::artifacts::WorkerControlContext::for_job(record).as_ref()
+                    != Some(retirement.context())
+            }),
+            _ => false,
+        }
+    }
+
     fn drain_replacements(&mut self) {
         if self.cancel.is_cancelled() || self.projection_transition {
             return;
@@ -7788,6 +9007,10 @@ impl Owner {
             let Some(command) = self.deferred_replacements.pop_front() else {
                 break;
             };
+            if self.stale_worker_retirement(&command) {
+                self.on_command(command);
+                continue;
+            }
             if matches!(
                 &command,
                 QueueCommand::AdoptReplicatedAuthority { .. } | QueueCommand::AdoptAuthority { .. }
@@ -7799,7 +9022,8 @@ impl Owner {
                         || self.retiring_writers.contains_key(&job.id)
                         || self.post_admissions.contains_key(&job.id)
                         || self.allocating_jobs.contains(&job.id)
-                        || self.record_transitions.contains(&job.id)
+                        || (self.record_transitions.contains(&job.id)
+                            && !self.settled_post_rollback(job.id))
                         || self.pending_control_revisions.contains_key(&job.id)
                         || self
                             .verification
@@ -7968,6 +9192,16 @@ impl Owner {
         delete_files: bool,
         callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
+        self.delete_job_with_source_then(job, delete_files, None, callback);
+    }
+
+    fn delete_job_with_source_then(
+        &mut self,
+        job: JobId,
+        delete_files: bool,
+        disposition: Option<nzbd_state::artifacts::JobDispositionRecord>,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
         if delete_files
             || self.state.job(job).is_none()
             || self.post_admissions.contains_key(&job)
@@ -7992,6 +9226,26 @@ impl Owner {
         let inventory = self.artifacts.clone();
         let retirement_record = self.state.job(job).cloned().unwrap();
         let retirements = self.url_resolutions.clone();
+        let native_disposition = disposition.is_some()
+            && crate::torrent_acquisitions::is_acquisition(&retirement_record);
+        let url_disposition = disposition.is_some()
+            && retirement_record
+                .params
+                .iter()
+                .any(|(key, _)| key == "*URL");
+        let descriptor_references = if native_disposition {
+            self.state
+                .jobs
+                .iter()
+                .filter_map(|row| {
+                    crate::torrent_acquisitions::descriptor_reference(row)
+                        .and_then(|reference| reference.source_identity(row).ok())
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let pending_sources = self.pending_sources.clone();
 
         self.pending_control_commits.insert(job);
         let lane_root = self
@@ -8002,13 +9256,49 @@ impl Owner {
         self.payload_then(
             lane_root,
             move || {
-                let retiring = inventory
+                if let Some(disposition) = &disposition {
+                    if let Some(source) = &disposition.source {
+                        let files = disposition::disposition_writer_files(
+                            &retirement_record,
+                            source,
+                            &inventory.installation,
+                        );
+                        inventory
+                            .finish_job_disposition_source(source, &retirement_record, &files)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                } else if let Some(artifact) = inventory
                     .prepare_forget(job.0)
-                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                if let Some(artifact) = retiring {
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                {
                     inventory
                         .finish(job.0, &artifact.path, &artifact.root, "retained")
                         .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
+                if native_disposition {
+                    for metadata in [false, true] {
+                        let origin =
+                            crate::torrent_acquisitions::blob_origin(&retirement_record, metadata)
+                                .map_err(|error| {
+                                    nzbd_state::StateError::Corrupt(error.to_string())
+                                })?;
+                        retirements
+                            .dispose_disposition_input(&origin, &descriptor_references)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                    pending_sources.remove(job)?;
+                }
+                if url_disposition {
+                    retirements
+                        .dispose_disposition_input(&retirement_record, &descriptor_references)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
+                if let Some(disposition) = &disposition {
+                    if disposition.source.is_none() {
+                        inventory
+                            .record_unallocated_job_retirement(disposition, &retirement_record)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
                 }
                 retirements
                     .retire_job(&retirement_record)
@@ -8024,6 +9314,12 @@ impl Owner {
                 if !owner.remove_job_silent(job) {
                     callback(owner, false);
                     return;
+                }
+                if native_disposition {
+                    owner
+                        .state
+                        .pending_admissions
+                        .retain(|pending| pending.job_id != job);
                 }
                 owner.persist_then(move |owner, _snapshot_ok| {
                     // The exact cancellation tombstone is already fsync'd.
@@ -8068,6 +9364,10 @@ impl Owner {
 
     /// The prober task's write side, handed out at spawn (lib.rs) so the
     /// statvfs syscall lives on a blocking thread, never in this loop.
+    pub(crate) fn disk_io_handle(&self) -> Arc<ArcSwap<crate::disk_io::DiskIoReading>> {
+        self.disk_io.clone()
+    }
+
     pub(crate) fn disk_guard_handle(&self) -> Arc<ArcSwap<DiskGuardReading>> {
         self.disk_guard.clone()
     }
@@ -8079,18 +9379,49 @@ impl Owner {
     /// downloading at wire speed while writers, finalize and PP were all
     /// being told there was no space — 725 GB burned in a day. A failed
     /// write is not a forecast, so it does not go through the threshold:
-    /// it latches the guard directly and only a statvfs reading of twice
-    /// the floor (or an operator resume) clears it.
-    pub(crate) fn observe_out_of_space(&mut self, whence: &str) {
+    /// it latches the guard directly and only evidence from the operation
+    /// that failed (`space_probe`) or an operator resume clears it.
+    /// An unattributed report (torrent backend, a bare report): only a
+    /// directory probe can answer it.
+    pub(crate) fn observe_out_of_space_in(&mut self, whence: &str, dir: Option<PathBuf>) {
+        let dir = dir.unwrap_or_default();
+        self.observe_space_failure(
+            whence,
+            crate::space_probe::SpaceOp::Directory(dir.clone()),
+            (!dir.as_os_str().is_empty()).then_some(dir),
+        );
+    }
+
+    /// Record what failed; the latch holds until each recorded failure has
+    /// evidence from its own operation.
+    pub(crate) fn observe_space_failure(
+        &mut self,
+        whence: &str,
+        op: crate::space_probe::SpaceOp,
+        path: Option<PathBuf>,
+    ) {
         self.enospc_observed += 1;
+        let volumes = self.guarded_volumes();
+        self.enospc_failures.insert(
+            op,
+            crate::space_probe::SpaceFailure {
+                path,
+                whence: whence.to_string(),
+                observed: self.enospc_observed,
+                volumes,
+            },
+        );
+        if !self.enospc_latched {
+            self.space_probe_after = Instant::now() + Duration::from_secs(30);
+        }
         self.enospc_where = Some(whence.to_string());
         if !self.enospc_latched {
             self.enospc_latched = true;
             tracing::error!(
                 whence,
                 observed = self.enospc_observed,
-                "out of space on a configured write volume — holding all downloads (observed from a \
-                 write, not from the free-space probe)"
+                "out of space — holding all downloads (reported by a write or a write's capacity \
+                 reservation, not by the free-space probe)"
             );
         }
         if !self.disk_low {
@@ -8100,12 +9431,49 @@ impl Owner {
         }
     }
 
+    /// The latched failures as the operator reads them: what failed, where,
+    /// and which configured volume that is — resolved against the same
+    /// readings the storage panel shows, so the banner and the panel name
+    /// the volume the same way.
+    fn space_failure_snapshots(
+        &self,
+        reading: &DiskGuardReading,
+    ) -> Vec<crate::snapshot::SpaceFailureSnapshot> {
+        use crate::space_probe::SpaceOp;
+        self.enospc_failures
+            .iter()
+            .map(|(op, failure)| {
+                let path = failure.path.clone();
+                let volume = path
+                    .as_deref()
+                    .and_then(|path| crate::volumes::volume_containing(&reading.volumes, path));
+                crate::snapshot::SpaceFailureSnapshot {
+                    operation: match op {
+                        SpaceOp::Write { .. } => "download write",
+                        SpaceOp::Finalize { .. } => "publish",
+                        SpaceOp::Post { .. } => "post-processing",
+                        SpaceOp::Terminal => "terminal store",
+                        SpaceOp::Directory(_) => "write",
+                    }
+                    .to_owned(),
+                    detail: failure.whence.clone(),
+                    path: path.map(|path| path.to_string_lossy().into_owned()),
+                    volume: volume.map(|(volume, _)| volume.name()),
+                    volume_label: volume.map(|(volume, _)| volume.label.clone()),
+                    volume_path: volume.map(|(_, root)| root.to_string_lossy().into_owned()),
+                }
+            })
+            .collect()
+    }
+
     /// Operator resume clears the latch: they have been told what
     /// happened, and only they can know the volume is usable again when
     /// statvfs is the thing that is lying.
     pub(crate) fn clear_enospc_latch(&mut self) {
         if self.enospc_latched {
             self.enospc_latched = false;
+            self.enospc_failures.clear();
+            self.space_probe_failures = 0;
             // Drop only the previous latch-derived hold before reevaluating.
             // A current below-floor reading immediately restores disk_low;
             // an unknown reading does not defeat the explicit override.
@@ -8135,14 +9503,11 @@ impl Owner {
             self.tuning.min_free_disk_bytes,
         );
         self.evaluated_disk_guard = reading.clone();
-        if was_latched && !self.enospc_latched {
-            tracing::info!(
-                free = free.unwrap_or_default(),
-                clear_at = self.tuning.min_free_disk_bytes.saturating_mul(2),
-                limiting_path = ?reading.limiting_path,
-                "out-of-space latch cleared — every volume reports twice the floor free"
-            );
-        }
+        debug_assert!(
+            !was_latched || self.enospc_latched,
+            "statvfs never clears the latch"
+        );
+        self.maybe_probe_space();
         if self.disk_low != was {
             if self.disk_low {
                 self.pause_incomplete_torrents_for_storage();
@@ -8164,6 +9529,349 @@ impl Owner {
             }
             self.publish_guard_change(was, self.disk_low);
         }
+    }
+
+    /// W5a: while latched, gather evidence for each recorded failure on a
+    /// backoff (30–60 s), off the owner thread. Failures
+    /// whose operation no longer exists are dropped here; see
+    /// [`Self::space_probe_plan`] for what each remaining one waits on.
+    fn maybe_probe_space(&mut self) {
+        use crate::space_probe::SpaceOp;
+        if !self.enospc_latched
+            || self.space_probe_inflight
+            || Instant::now() < self.space_probe_after
+        {
+            return;
+        }
+        let gone = self
+            .enospc_failures
+            .keys()
+            .filter(|op| match op {
+                SpaceOp::Write { job, .. }
+                | SpaceOp::Finalize { job, .. }
+                | SpaceOp::Post { job } => !self.state.job(*job).is_some_and(|record| {
+                    !matches!(
+                        record.status,
+                        JobStatus::Failed | JobStatus::Completed | JobStatus::Deleted
+                    )
+                }),
+                SpaceOp::Terminal | SpaceOp::Directory(_) => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for op in gone {
+            tracing::info!(
+                ?op,
+                "out-of-space failure dropped: its operation no longer exists"
+            );
+            self.enospc_failures.remove(&op);
+        }
+        if self.settle_space_latch() {
+            return;
+        }
+        let plan = self.space_probe_plan();
+        if plan.is_empty() {
+            return;
+        }
+        self.space_probe_inflight = true;
+        let tx = self.engine_tx.clone();
+        let fs = self.space_probe_fs.clone();
+        self.tracker.spawn_blocking(move || {
+            let results = crate::space_probe::run(&plan, fs.as_ref());
+            let _ = tx.blocking_send(EngineMsg::SpaceProbed { results });
+        });
+    }
+
+    /// The guarded volumes as the disk guard last measured them — each
+    /// configured member root with its filesystem's device and its parent's
+    /// (never a group's common path, which for two bind mounts of one
+    /// filesystem is another filesystem) — plus the completed directory;
+    /// recorded with each failure.
+    fn guarded_volumes(&self) -> Vec<crate::space_probe::GuardedVolume> {
+        use crate::space_probe::GuardedVolume;
+        let mut volumes: Vec<GuardedVolume> = self
+            .evaluated_disk_guard
+            .volumes
+            .iter()
+            .flat_map(|volume| {
+                let members: Vec<GuardedVolume> = if volume.members.is_empty() {
+                    vec![GuardedVolume {
+                        root: volume.path.clone(),
+                        device: volume.device_id,
+                        parent_device: None,
+                    }]
+                } else {
+                    volume
+                        .members
+                        .iter()
+                        .map(|member| GuardedVolume {
+                            root: member.path.clone(),
+                            device: volume.device_id,
+                            parent_device: member.parent_device_id,
+                        })
+                        .collect()
+                };
+                members
+            })
+            .collect();
+        if !volumes
+            .iter()
+            .any(|volume| self.dest_dir.starts_with(&volume.root))
+        {
+            volumes.push(GuardedVolume {
+                root: self.dest_dir.clone(),
+                device: None,
+                parent_device: None,
+            });
+        }
+        volumes.sort();
+        volumes.dedup();
+        volumes
+    }
+
+    /// A writer for `file` (or a retiring one of `job`) has not stopped: its
+    /// own next write is the evidence, and an allocation probe racing it
+    /// could cut bytes it appends. Writers exist only while data for the
+    /// file is in flight, so that write comes.
+    fn space_writer_live(&self, job: JobId, file: FileId) -> bool {
+        self.writers
+            .get(&file)
+            .is_some_and(|writer| !*writer.stopped.borrow())
+            || self
+                .retiring_writers
+                .get(&job)
+                .is_some_and(|writers| writers.iter().any(|writer| !*writer.stopped.borrow()))
+    }
+
+    /// The job's own retry will run: it is not stopped by a person, not
+    /// held for review, and (for post-processing) the lane is not paused.
+    fn space_retry_runnable(&self, op: &crate::space_probe::SpaceOp) -> bool {
+        use crate::space_probe::SpaceOp;
+        let (SpaceOp::Finalize { job, .. } | SpaceOp::Post { job }) = op else {
+            return false;
+        };
+        let Some(record) = self.state.job(*job) else {
+            return false;
+        };
+        if matches!(op, SpaceOp::Post { .. }) && self.state.post_paused {
+            return false;
+        }
+        match record.status {
+            JobStatus::Paused | JobStatus::Failed | JobStatus::Completed | JobStatus::Deleted => {
+                false
+            }
+            JobStatus::Held => record
+                .control()
+                .is_some_and(|control| !control.manual_pause && control.retry_policy != "review"),
+            _ => true,
+        }
+    }
+
+    /// What each recorded failure is probed with:
+    ///
+    /// * Write — an allocation on the partial that failed, unless its writer
+    ///   is live (its next write decides); with no recorded partial, a
+    ///   directory probe in the job's directory.
+    /// * Finalize / Post — the job's own retry while it can run (hold
+    ///   recovery releases it under the latch). When it cannot (paused,
+    ///   operator-held, post-processing paused), the partial itself
+    ///   (finalize) or the job's directory, so intake never waits on a
+    ///   person who has not been asked.
+    /// * Terminal — its own replay.
+    /// * Directory — probe files there (every guarded root when empty).
+    ///
+    /// No guarded root containing a target: the target only. Every probe
+    /// is bounded by the root and device recorded with the failure.
+    pub(crate) fn space_probe_plan(&self) -> Vec<crate::space_probe::Planned> {
+        use crate::space_probe::{Planned, SpaceOp, Target};
+        let job_dir = |job: JobId, failure: &crate::space_probe::SpaceFailure| -> Target {
+            let dir = failure
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .or_else(|| self.allocation_cache.get(&job).map(|a| a.path.clone()));
+            match dir {
+                Some(dir) => Target::Dirs(vec![(dir.clone(), failure.bound(&dir))]),
+                None => Target::Dirs(failure.probe_roots()),
+            }
+        };
+        self.enospc_failures
+            .iter()
+            .filter_map(|(op, failure)| {
+                let target = match op {
+                    SpaceOp::Write { job, file } => {
+                        if self.space_writer_live(*job, *file) {
+                            return None;
+                        }
+                        match &failure.path {
+                            Some(path) => Target::File(path.clone(), failure.bound(path)),
+                            None => job_dir(*job, failure),
+                        }
+                    }
+                    SpaceOp::Finalize { job, file } => {
+                        if self.space_retry_runnable(op) || self.space_writer_live(*job, *file) {
+                            return None;
+                        }
+                        match &failure.path {
+                            Some(path) => Target::File(path.clone(), failure.bound(path)),
+                            None => job_dir(*job, failure),
+                        }
+                    }
+                    SpaceOp::Post { job } => {
+                        if self.post_admissions.contains_key(job) {
+                            return None;
+                        }
+                        // A post report's path is already the directory the
+                        // write went into (`report_out_of_space_for`), not a
+                        // file whose parent is the job's directory.
+                        match &failure.path {
+                            Some(dir) => Target::Dirs(vec![(dir.clone(), failure.bound(dir))]),
+                            None => job_dir(*job, failure),
+                        }
+                    }
+                    SpaceOp::Directory(dir) if dir.as_os_str().is_empty() => {
+                        Target::Dirs(failure.probe_roots())
+                    }
+                    SpaceOp::Directory(dir) => {
+                        Target::Dirs(vec![(dir.clone(), failure.bound(dir))])
+                    }
+                    SpaceOp::Terminal => return None,
+                };
+                Some(Planned {
+                    op: op.clone(),
+                    observed: failure.observed,
+                    target,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn on_space_probed(&mut self, results: Vec<crate::space_probe::Probed>) {
+        use crate::space_probe::ProbeResult;
+        self.space_probe_inflight = false;
+        let mut held = false;
+        for (op, observed, result, rebound) in results {
+            if let Some(failure) = self.enospc_failures.get_mut(&op) {
+                if !rebound.is_empty() {
+                    tracing::info!(
+                        ?op,
+                        ?rebound,
+                        "guarded volume mounted again on a new device; rebound"
+                    );
+                    failure.rebind(&rebound);
+                }
+            }
+            let current = self
+                .enospc_failures
+                .get(&op)
+                .is_some_and(|failure| failure.observed == observed);
+            match result {
+                ProbeResult::Cleared if current => {
+                    tracing::info!(?op, "out-of-space failure cleared by an allocation on the operation that failed");
+                    self.enospc_failures.remove(&op);
+                    self.space_probe_failures = 0;
+                }
+                ProbeResult::Gone if current => {
+                    tracing::info!(
+                        ?op,
+                        "out-of-space failure dropped: the object that failed is gone"
+                    );
+                    self.enospc_failures.remove(&op);
+                }
+                ProbeResult::Holds(error) => {
+                    held = true;
+                    tracing::debug!(?op, %error, "out-of-space latch holds; probe allocation failed");
+                }
+                // A newer report of the same failure voids this answer.
+                ProbeResult::Cleared | ProbeResult::Gone => {}
+            }
+        }
+        if held {
+            self.space_probe_failures = self.space_probe_failures.saturating_add(1);
+            let backoff = 30u64
+                .saturating_mul(1 << self.space_probe_failures.min(5))
+                .min(60);
+            self.space_probe_after = Instant::now() + Duration::from_secs(backoff);
+        }
+        self.settle_space_latch();
+    }
+
+    /// The operation behind `op` succeeded (its own write, finalize, terminal
+    /// replay or post retry): that failure has its evidence.
+    pub(crate) fn space_op_succeeded(&mut self, op: &crate::space_probe::SpaceOp) {
+        if self.enospc_failures.remove(op).is_some() {
+            tracing::info!(
+                ?op,
+                "out-of-space failure cleared: the operation that failed succeeded"
+            );
+            self.settle_space_latch();
+        }
+    }
+
+    /// Clear the latch once no recorded failure remains. True when cleared.
+    fn settle_space_latch(&mut self) -> bool {
+        if !self.enospc_latched || !self.enospc_failures.is_empty() {
+            return false;
+        }
+        tracing::info!(
+            observed = self.enospc_observed,
+            "out-of-space latch cleared — every failed write has evidence from its own operation"
+        );
+        self.enospc_latched = false;
+        self.update_disk_guard();
+        self.publish_now();
+        true
+    }
+
+    /// Finding 7: the stat post-processing admission still owes this job
+    /// for its current epoch — `(epoch, directory, proven files)` — or None
+    /// when it passed, has nothing to check, or was checked at an earlier
+    /// admission (its download retired into post-processing custody).
+    #[allow(clippy::type_complexity)]
+    fn pp_admission_stat_needed(
+        &mut self,
+        job: JobId,
+    ) -> Option<(
+        u64,
+        PathBuf,
+        Vec<(FileId, String, nzbd_state::artifacts::Identity, u64)>,
+    )> {
+        let record = self.state.job(job)?;
+        // A short stat queues a verification and refuses this admission; a
+        // job verification cannot act on (terminal: PP done, cleanup-only,
+        // torrent) would get no ticket and be refused again on every retry.
+        // Its payload is what it is; post-processing works from that.
+        if recovery_worker::verification_inert(record)
+            || record
+                .params
+                .iter()
+                .any(|(key, _)| key == "*Recovery:download-retired")
+        {
+            return None;
+        }
+        let files = recovery_worker::proven_files(record);
+        if files.is_empty() {
+            return None;
+        }
+        let dir = self.allocation_cache.get(&job).map(|a| a.path.clone())?;
+        let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
+        (self.pp_stat_passed.get(&job) != Some(&epoch)).then_some((epoch, dir, files))
+    }
+
+    /// Jobs whose own retry is the evidence a finalize failure needs: hold
+    /// recovery may release their download-side storage hold while the
+    /// latch holds (a finalize fetches nothing). Post-processing failures
+    /// are not listed: a post-side hold is released through the custody
+    /// check, which `disk_low` never gates, so its retry already runs.
+    pub(crate) fn space_retry_jobs(&self) -> HashSet<JobId> {
+        self.enospc_failures
+            .keys()
+            .filter_map(|op| match op {
+                crate::space_probe::SpaceOp::Finalize { job, .. } => Some(*job),
+                _ => None,
+            })
+            .collect()
     }
 
     fn pause_incomplete_torrents_for_storage(&mut self) {
@@ -8272,6 +9980,21 @@ impl Owner {
         self.owner_heartbeat
             .store(unix_now() as u64, std::sync::atomic::Ordering::Relaxed);
         self.drain_replacements();
+        if self
+            .last_terminal_replay
+            .is_none_or(|at| at.elapsed() >= terminal_owner::TERMINAL_REPLAY_EVERY)
+        {
+            self.last_terminal_replay = Some(Instant::now());
+            self.replay_terminals();
+        }
+        self.convert_legacy_holds();
+        if self.tuning.health_abort {
+            let jobs = self.state.jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+            for job in jobs {
+                self.maybe_abort_unhealthy(job);
+            }
+        }
+        self.persist_post_rollbacks_then(|_| {});
         self.retry_payload_recoveries();
         self.start_verifications();
         let tick_started = Instant::now();
@@ -8342,6 +10065,7 @@ impl Owner {
         let publish_ms = t.elapsed().as_millis() as u64;
 
         let sync_started = Instant::now();
+        self.retry_journal_checkpoint();
         self.sync_journal();
         let sync_ms = sync_started.elapsed().as_millis() as u64;
 
@@ -8407,20 +10131,32 @@ impl Owner {
         let latest = self.backend.latest_progress();
         let mut changed = false;
         for (job_id, progress) in latest {
-            let verified_delta = {
+            let (verified_delta, uploaded_delta, category) = {
                 let Some(job) = self.state.job_mut(job_id) else {
                     continue;
                 };
-                let before = job
-                    .torrent
-                    .as_ref()
-                    .map_or(0, |torrent| torrent.downloaded_bytes);
+                let (before, uploaded_before) = job.torrent.as_ref().map_or((0, 0), |torrent| {
+                    (torrent.downloaded_bytes, torrent.uploaded_bytes)
+                });
                 changed |=
                     crate::torrent_runtime::reconcile_progress(job, &progress).durable_changed;
-                job.torrent
-                    .as_ref()
-                    .map_or(0, |torrent| torrent.downloaded_bytes.saturating_sub(before))
+                let (after, uploaded_after) = job.torrent.as_ref().map_or((0, 0), |torrent| {
+                    (torrent.downloaded_bytes, torrent.uploaded_bytes)
+                });
+                (
+                    after.saturating_sub(before),
+                    uploaded_after.saturating_sub(uploaded_before),
+                    job.category.clone(),
+                )
             };
+            // Payload transfer is disk traffic on the torrent's filesystem:
+            // verified pieces were written, uploaded pieces were read.
+            if verified_delta > 0 || uploaded_delta > 0 {
+                let device =
+                    torrent_payload_device(&self.evaluated_disk_guard.volumes, category.as_deref());
+                nzbd_state::io_meter::write(device, verified_delta);
+                nzbd_state::io_meter::read(device, uploaded_delta);
+            }
             if verified_delta > 0 {
                 self.volumes.add(
                     crate::volumes::TORRENT_SOURCE_ID,
@@ -8468,7 +10204,7 @@ impl Owner {
                 job.kind == JobKind::Torrent
                     && !self.pending_control_revisions.contains_key(&job_id)
                     && !self.pending_control_commits.contains(&job_id)
-                    && job.status != JobStatus::Paused
+                    && !matches!(job.status, JobStatus::Paused | JobStatus::Held)
                     && job.torrent.as_ref().is_some_and(|torrent| {
                         torrent.control_intent == TorrentControlIntent::Running
                             && torrent.removal_intent.is_none()
@@ -8598,7 +10334,8 @@ impl Owner {
             let Some(job) = self.state.job_mut(job_id) else {
                 continue;
             };
-            job.status = JobStatus::Paused;
+            // Seed policy stops the backend; a hold on the seed stays a hold.
+            job.stop();
             job.torrent.as_mut().unwrap().control_intent = TorrentControlIntent::Paused;
             job.torrent.as_mut().unwrap().stop_reason = Some(reason);
             self.dirty = true;
@@ -8700,6 +10437,9 @@ impl Owner {
                                             control.lifecycle = "running".into();
                                             control.next_retry_at_unix = None;
                                             row.set_control(&control);
+                                            // The detached seed stays stopped,
+                                            // no longer held.
+                                            row.normalize_hold_status();
                                         }
                                     }
                                     set_owner_param(
@@ -8760,7 +10500,8 @@ impl Owner {
                         .first()
                         .map(|root| format!("torrent payload write under {}", root.display()))
                         .unwrap_or_else(|| "torrent payload write".to_owned());
-                    self.observe_out_of_space(&whence);
+                    let dir = self.torrent_payload_roots.first().cloned();
+                    self.observe_out_of_space_in(&whence, dir);
                 }
             }
         }
@@ -8986,7 +10727,32 @@ impl Owner {
         }
     }
 
+    /// The post-processing lane switch. Like the download pause it is only
+    /// ever flipped by a client command, so the source is logged and carried
+    /// on the event. The epoch bump wakes the post manager, which parks at
+    /// stage boundaries on `queue_changes` while the flag is set.
+    fn set_post_paused(&mut self, paused: bool, source: String) {
+        tracing::info!(
+            %source,
+            was_paused = self.state.post_paused,
+            paused,
+            "post-processing pause change requested"
+        );
+        self.state.post_paused = paused;
+        self.dirty = true;
+        self.emit(Event::PostPauseChanged { paused, source });
+        // Snapshot first, then the wake: a parked stage re-reads the
+        // snapshot when the epoch moves, so the reverse order could wake it
+        // onto the stale flag with nothing left to wake it again.
+        self.publish_now();
+        self.bump_epoch();
+    }
+
     fn publish_now(&mut self) {
+        if self.publish_batched {
+            // A batch (startup ticketing) publishes once when it ends.
+            return;
+        }
         self.repair_progress.retain(|id, _| {
             self.state.job(*id).is_some_and(|job| {
                 !job.held()
@@ -9095,7 +10861,16 @@ impl Owner {
                     } else {
                         None
                     },
-                    control: j.control(),
+                    control: j.control().map(|mut control| {
+                        // Relative on the wire: hosts share no clock.
+                        control.deadline_in_s = control
+                            .deadline_unix
+                            .filter(|_| control.lifecycle == "held")
+                            .map(|deadline| deadline.saturating_sub(unix_now()));
+                        control
+                    }),
+                    status_projected: nzbd_types::projected_status(j).into(),
+                    transfer: nzbd_types::transfer_of(&j.params),
                     lifecycle_eligible: j.lifecycle_eligible(),
                     url_fetch: crate::snapshot::url_fetch_progress(j),
                     failed_cleanup: crate::snapshot::failed_cleanup_progress(j),
@@ -9198,7 +10973,10 @@ impl Owner {
                         Some(exact) => exact,
                         None if matches!(
                             summary.status,
-                            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused
+                            JobStatus::Queued
+                                | JobStatus::Downloading
+                                | JobStatus::Paused
+                                | JobStatus::Held
                         ) =>
                         {
                             summary
@@ -9225,11 +11003,16 @@ impl Owner {
                     }
                 }
                 if self.verification.contains_key(&j.id)
+                    || self.job_disposing(j.id)
                     || self.retiring_writers.contains_key(&j.id)
                     || self.pending_control_commits.contains(&j.id)
                 {
                     summary.ready = false;
-                    if j.status != JobStatus::Paused && !j.held() {
+                    if !matches!(j.status, JobStatus::Paused | JobStatus::Held)
+                        && !j.held()
+                        && !summary.pp_done
+                        && !transitions::failed_cleanup_only(j)
+                    {
                         summary.status = JobStatus::Queued;
                     }
                 }
@@ -9297,9 +11080,17 @@ impl Owner {
             .collect();
         blocked_servers.sort_unstable();
         let disk_guard = &self.evaluated_disk_guard;
+        let disk_io = self.disk_io.load();
+        let disk_io_stale = disk_io.is_stale(std::time::Instant::now());
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             queue_authority: self.persist,
+            job_disposition_fences: self
+                .disposition_fences
+                .iter()
+                .filter(|(job, _)| self.job_disposing(**job))
+                .map(|(job, (transfer, _))| (*job, transfer.clone()))
+                .collect(),
             pending_automatic_controls: self
                 .state
                 .jobs
@@ -9331,8 +11122,10 @@ impl Owner {
                 })
                 .collect(),
             download_paused: self.state.download_paused,
+            post_paused: self.state.post_paused,
             quota_reached: self.quota_reached,
             disk_low: self.disk_low,
+            space_retry_jobs: self.space_retry_jobs(),
             disk_guard_free_bytes: disk_guard.available_bytes,
             disk_guard_label: disk_guard.limiting_label.clone(),
             disk_guard_path: disk_guard
@@ -9345,15 +11138,29 @@ impl Owner {
                 .volumes
                 .iter()
                 .map(|volume| StorageVolumeSnapshot {
+                    name: volume.name(),
                     label: volume.label.clone(),
                     path: volume.path.to_string_lossy().into_owned(),
                     available_bytes: volume.available_bytes,
                     total_bytes: volume.total_bytes,
                     current: volume.current,
+                    io: disk_io
+                        .for_device(volume.device_id)
+                        .map(|io| StorageIoSnapshot {
+                            source: if disk_io_stale {
+                                "stale"
+                            } else {
+                                io.source.kind()
+                            },
+                            detail: io.source.detail().to_owned(),
+                            read_bps: io.read_bps.filter(|_| !disk_io_stale),
+                            write_bps: io.write_bps.filter(|_| !disk_io_stale),
+                        }),
                 })
                 .collect(),
             enospc_observed: self.enospc_observed,
             enospc_where: self.enospc_where.clone(),
+            enospc_failures: self.space_failure_snapshots(disk_guard),
             blocked_servers,
             health_abort: self.tuning.health_abort,
             server_volumes: {
@@ -9411,13 +11218,49 @@ impl Owner {
             download_rate_bps: rate.saturating_add(torrent_rate),
             session_downloaded_bytes: self.meter.total(),
             remaining_bytes,
+            startup: crate::startup_phases::StartupPhases {
+                listener_ms: crate::startup_phases::listener_ms(),
+                ..self.startup_phases.clone()
+            },
             jobs,
         };
+        // The status mirrors the hold record (M6b): every path that writes
+        // a held control writes `Held`, every release leaves it.
+        // (A control of an unknown version on a running job is fenced like a
+        // hold but keeps its status; only `Paused`/`Held` must agree.)
+        #[cfg(debug_assertions)]
+        {
+            let agrees = |j: &Job| {
+                (j.status != JobStatus::Held || j.held())
+                    && !(j.status == JobStatus::Paused && j.held())
+            };
+            debug_assert!(
+                self.state.jobs.iter().all(agrees),
+                "status disagrees with hold record: {:?}",
+                self.state
+                    .jobs
+                    .iter()
+                    .filter(|j| !agrees(j))
+                    .map(|j| (j.id, j.status, j.control().map(|c| c.lifecycle)))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let projected = snap
+            .jobs
+            .iter()
+            .map(|summary| (summary.id, summary.status))
+            .collect::<Vec<_>>();
         self.shared.store(Arc::new(snap));
+        // Review #283-1: status changes are announced from the projection
+        // just published, after it is readable. A consumer that wakes on the
+        // event and reads the snapshot sees the status the event names — in
+        // particular a job boot verification returns from `queued` to
+        // `post_processing` (the owner's own status never left `Post`).
+        self.emit_status_changes(&projected);
     }
 
     fn save_snapshot(&mut self) {
-        if self.background_save_pending {
+        if self.background_save_pending || self.journal_checkpoint.is_some() {
             return;
         }
         self.background_save_pending = true;
@@ -9445,6 +11288,30 @@ impl Owner {
     fn bump_epoch(&self) {
         self.epoch_tx.send_modify(|v| *v += 1);
     }
+}
+
+/// Accepted journal replay carries the expected publication length into the
+/// durable row used by payload verification, without replacing prior evidence.
+fn merge_replayed_size(state: &mut QueueState, record: &JournalRecord) -> Option<u64> {
+    let job = state.job_mut(record.job)?;
+    if !job.files.iter().any(|file| {
+        file.id == record.file
+            && file
+                .segments
+                .iter()
+                .any(|segment| segment.number == record.segment_number)
+    }) {
+        return None;
+    }
+    let key = format!("*File:size:{}", record.file.0);
+    if let Some((_, size)) = job.params.iter().find(|(name, _)| name == &key) {
+        return size.parse().ok().filter(|size| *size > 0);
+    }
+    if record.file_size > 0 {
+        job.params.push((key, record.file_size.to_string()));
+        return Some(record.file_size);
+    }
+    None
 }
 
 /// Replay retains unknown evidence; only matching incarnation provenance can
@@ -9537,16 +11404,117 @@ fn refresh_url_admission_custody(
     receipt: &mut UrlAdmissionReceipt,
     inventory: &nzbd_state::artifacts::Inventory,
 ) -> bool {
-    // Consumer custody is terminal for this receipt. Retention of a separate
-    // processing source cannot reclaim the accepted publication.
-    let Some((artifact_id, source_generation)) = receipt
-        .source_artifact_id
-        .as_deref()
-        .zip(receipt.source_generation.as_deref())
-    else {
+    let exact = if receipt.source_artifact_id.is_none()
+        && receipt.source_generation.is_none()
+        && receipt.runner_instance_id == inventory.installation
+    {
+        let binding = nzbd_state::artifacts::JobAdmissionBinding {
+            job_id: receipt.job_id,
+            transfer: receipt.request_token.clone(),
+            instance: receipt.runner_instance_id.clone(),
+            generation: receipt.generation.clone(),
+        };
+        if let Ok(Some(source)) = inventory.job_disposition_source(&binding) {
+            receipt.source_artifact_id = Some(source.artifact);
+            receipt.source_generation = Some(source.generation);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let pinned = exact || pin_unpinned_failed_source(receipt, inventory);
+    refresh_pinned_url_admission_custody(receipt, inventory) || pinned
+}
+
+/// Failures retained before Runner pinned their source generation into the
+/// receipt reported `runner_owned` with no artifact to refresh from, so no
+/// later delete or Keep could ever reach Curator, which holds replacement
+/// while Runner owns failed bytes. Adopt the allocation this installation
+/// recorded for the exact job. This pins identity only; custody still comes
+/// from that artifact's own state below.
+fn pin_unpinned_failed_source(
+    receipt: &mut UrlAdmissionReceipt,
+    inventory: &nzbd_state::artifacts::Inventory,
+) -> bool {
+    if receipt.source_artifact_id.is_some()
+        || receipt.source_generation.is_some()
+        || receipt.custody_state != "runner_owned"
+        || receipt.outcome != "failed"
+        || receipt.runner_instance_id != inventory.installation
+    {
+        return false;
+    }
+    let Ok(Some(artifact)) = inventory.for_job(receipt.job_id) else {
         return false;
     };
-    let Ok(artifact) = inventory.get(artifact_id) else {
+    if artifact.job != Some(receipt.job_id) || (!artifact.owned && !artifact.terminal()) {
+        return false;
+    }
+    receipt.source_artifact_id = Some(artifact.id);
+    receipt.source_generation = Some(artifact.generation);
+    true
+}
+
+fn refresh_pinned_url_admission_custody(
+    receipt: &mut UrlAdmissionReceipt,
+    inventory: &nzbd_state::artifacts::Inventory,
+) -> bool {
+    let Some(artifact_id) = receipt.source_artifact_id.as_deref() else {
+        return false;
+    };
+    if receipt.source_generation.is_none() {
+        return false;
+    }
+    let Ok(artifact) = inventory.receipt_custody(artifact_id) else {
+        return false;
+    };
+    apply_receipt_custody(receipt, &artifact)
+}
+
+/// Refresh a checkpoint's pinned receipts in one current inventory read.
+/// A single statement keeps one SQLite read transaction across all headers,
+/// avoiding a Gluster file-lock round trip for every individual receipt.
+fn refresh_url_admission_custodies(
+    receipts: &mut [UrlAdmissionReceipt],
+    inventory: &nzbd_state::artifacts::Inventory,
+) -> bool {
+    let mut changed = false;
+    for receipt in receipts.iter_mut() {
+        changed |= pin_unpinned_failed_source(receipt, inventory);
+    }
+    let keys = receipts
+        .iter()
+        .filter(|receipt| receipt.source_generation.is_some())
+        .filter_map(|receipt| receipt.source_artifact_id.clone())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return changed;
+    }
+    let Ok(custodies) = inventory.receipt_custodies(&keys) else {
+        return changed;
+    };
+    for receipt in receipts {
+        let Some(Ok(custody)) = receipt
+            .source_artifact_id
+            .as_ref()
+            .and_then(|id| custodies.get(id))
+        else {
+            continue;
+        };
+        changed |= apply_receipt_custody(receipt, custody);
+    }
+    changed
+}
+
+fn apply_receipt_custody(
+    receipt: &mut UrlAdmissionReceipt,
+    artifact: &nzbd_state::artifacts::ArtifactCustody,
+) -> bool {
+    // Consumer custody is terminal for this receipt. Retention of a separate
+    // processing source cannot reclaim the accepted publication.
+    let Some(source_generation) = receipt.source_generation.as_deref() else {
         return false;
     };
     if artifact.generation != source_generation {
@@ -9569,12 +11537,24 @@ fn refresh_url_admission_custody(
         }
         return keep_changed || changed;
     }
-    if artifact.state == "deleted" {
+    // `source_gone` is reconcile_missing's positive finding: the storage root
+    // verified and the exact source directory is absent. Nothing remains in
+    // Runner custody, so it settles the receipt exactly like a Runner delete;
+    // reporting runner_owned for it held Curator's replacement forever.
+    if artifact.state == "deleted" || (artifact.state == "source_gone" && artifact.owned) {
+        // Custody ended either way. A row settled gone on weaker evidence
+        // (`gone_reason`, e.g. a legacy root rebind) was not removed by
+        // Runner: its cleanup reads `gone`, not `removed`.
+        let cleanup = if artifact.state == "source_gone" && artifact.gone_reason.is_some() {
+            "gone"
+        } else {
+            "removed"
+        };
         let changed = receipt.custody_state != "deleted_by_runner"
-            || receipt.source_cleanup_status.as_deref() != Some("removed")
+            || receipt.source_cleanup_status.as_deref() != Some(cleanup)
             || keep_changed;
         receipt.custody_state = "deleted_by_runner".into();
-        receipt.source_cleanup_status = Some("removed".into());
+        receipt.source_cleanup_status = Some(cleanup.into());
         changed
     } else if artifact.keep || artifact.keep_on_failure {
         let changed = receipt.custody_state != "kept_by_user"
@@ -9641,6 +11621,18 @@ pub(crate) fn unix_now() -> i64 {
 /// 2. The policy is re-derived; an automatic timed hold with no time is due
 ///    `now`.
 ///
+/// The hold message for a partial whose coverage cannot be proven; startup
+/// verification owns its exit.
+///
+/// One-release bridge (remove in M6): pre-v2 builds persisted this partial
+/// as `identity_conflict` and told it apart only by this exact message, so
+/// `rearmed_hold` and `legacy_coverage_hold` match the constant to keep
+/// those rows on the verification path. Once no `identity_conflict` control
+/// can remain on disk (M6 drops the legacy cause strings), match the cause
+/// alone and delete the message comparison.
+pub(crate) const COVERAGE_UNVERIFIED: &str =
+    "file coverage or expected size is unverified; partial retained";
+
 /// The revision moves so a client holding the old one re-reads.
 fn hold_retry_delay_with_jitter(job: JobId, attempt: u8, now: i64) -> i64 {
     let base = nzbd_types::hold_retry_delay_seconds(attempt);
@@ -9655,12 +11647,64 @@ pub(crate) fn rearmed_hold(
     now: i64,
 ) -> Option<nzbd_types::JobControl> {
     let mut cause = control.hold_cause();
-    if cause == nzbd_types::HoldCause::Io && crate::is_storage_unavailable(&control.message) {
+    // A pre-v2 `io` hold whose message names an unavailable volume was
+    // environmental all along; keep it a hold. Every other legacy terminal
+    // cause is left for the boot conversion (`convert_legacy_holds`).
+    // The pre-v2 message is rendered text with no errno attached; the
+    // stderr rule reads its `(os error N)` suffix (removed with the legacy
+    // causes in M6b).
+    if control.cause == "io"
+        && crate::stderr_hold_cause(&control.message)
+            == Some(nzbd_types::HoldCause::StorageUnavailable)
+    {
         cause = nzbd_types::HoldCause::StorageUnavailable;
+    }
+    // A pre-v2 unverified-coverage hold is a re-verification, not a
+    // contradiction: it keeps its verification exit (`COVERAGE_UNVERIFIED`).
+    if control.cause == "identity_conflict"
+        && control.stage == "finalize"
+        && control.message == COVERAGE_UNVERIFIED
+    {
+        cause = nzbd_types::HoldCause::StorageUnavailable;
+    }
+    // Older builds called a control-request timeout a shutdown and turned
+    // this exact failed-repair cleanup error into a permanent review hold.
+    // Do not infer retryability from arbitrary subprocess output or titles.
+    if control.cause == "post_failure"
+        && control.message.split("; retry ").next()
+            == Some("subprocess failed: read live Keep setting: engine is shutting down")
+    {
+        cause = nzbd_types::HoldCause::EngineUnavailable;
+        control.message = "read live Keep setting: engine request was unavailable; retrying failed-job finalization".into();
+    }
+    if nzbd_types::HoldCause::legacy_terminal(&control.cause).is_some()
+        && cause.as_str() == control.cause
+    {
+        return None;
     }
     let policy = cause.policy();
     let unscheduled = policy.timed() && control.next_retry_at_unix.is_none();
-    if control.cause == cause.as_str() && control.retry_policy == policy.as_str() && !unscheduled {
+    // No-wedge task 1: a writer identity mismatch used to hold the job on
+    // storage until the deadline. It now discards the file and re-downloads,
+    // so the existing hold retries at once and takes that exit.
+    let identity_wedge =
+        writer_identity_hold(&control) && control.next_retry_at_unix.is_some_and(|at| at > now);
+    if identity_wedge {
+        control.next_retry_at_unix = Some(now);
+    }
+    let storage_delay = (cause.is_storage() || cause == nzbd_types::HoldCause::StorageUnavailable)
+        && control
+            .next_retry_at_unix
+            .is_some_and(|at| at > now.saturating_add(60));
+    if storage_delay {
+        control.next_retry_at_unix = Some(now.saturating_add(60));
+    }
+    if control.cause == cause.as_str()
+        && control.retry_policy == policy.as_str()
+        && !unscheduled
+        && !identity_wedge
+        && !storage_delay
+    {
         return None;
     }
     control.revision = control
@@ -9679,14 +11723,47 @@ pub(crate) fn rearmed_hold(
     Some(control)
 }
 
+/// A hold an earlier build wrote for a writer identity mismatch (the three
+/// refusals that are now [`EngineMsg::WriterIdentityMismatch`]).
+pub(crate) fn writer_identity_hold(control: &nzbd_types::JobControl) -> bool {
+    control.lifecycle == "held"
+        && control.stage == "download_write"
+        && [
+            "payload file identity changed (replaced inode)",
+            "conflicting payload aliases",
+            "writer proven range identity conflict",
+        ]
+        .iter()
+        .any(|marker| control.message.contains(marker))
+}
+
 /// An allocation that failed because the volume stopped answering retries on
 /// its own; any other allocation refusal waits for space or a person.
-fn allocation_hold_cause(message: &str) -> nzbd_types::HoldCause {
-    if crate::is_storage_unavailable(message) {
+fn allocation_hold_cause(error: &(dyn std::error::Error + 'static)) -> nzbd_types::HoldCause {
+    if crate::error_hold_cause(error) == Some(nzbd_types::HoldCause::StorageUnavailable) {
         nzbd_types::HoldCause::StorageUnavailable
     } else {
         nzbd_types::HoldCause::Allocation
     }
+}
+
+/// Params earlier builds persisted for a clock this build no longer runs.
+/// The failed-source cleanup retry (`*PP:failed-cleanup-*`) lives on the
+/// disposal `Operation.next_retry` since M6; a row an older build wrote
+/// still carries these, so they are dropped when the queue loads and are
+/// never written or read again.
+pub(crate) const RETIRED_PARAMS: [&str; 3] = [
+    "*PP:failed-cleanup-next-retry",
+    "*PP:failed-cleanup-blocked-since",
+    "*PP:failed-cleanup-last-error",
+];
+
+/// Drop [`RETIRED_PARAMS`] from a loaded row; true when any was present.
+pub(crate) fn drop_retired_params(job: &mut Job) -> bool {
+    let before = job.params.len();
+    job.params
+        .retain(|(key, _)| !RETIRED_PARAMS.contains(&key.as_str()));
+    job.params.len() != before
 }
 
 /// Apply [`rearmed_hold`] to every held job; returns how many changed.
@@ -9742,23 +11819,10 @@ fn url_submission_sha256(
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn url_admission_generation(job: JobId, token: &str, instance: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
+fn url_admission_generation(job: JobId, token: &str, instance: &str, nonce: &str) -> String {
+    let digest =
+        Sha256::digest(serde_json::to_vec(&(token, nonce)).expect("generation inputs serialize"));
     format!("{}-url-{}-{:x}", instance, job.0, digest)
-}
-
-fn job_status_name(status: JobStatus) -> &'static str {
-    match status {
-        JobStatus::Fetching => "fetching",
-        JobStatus::Queued => "queued",
-        JobStatus::Downloading => "downloading",
-        JobStatus::Paused => "paused",
-        JobStatus::PostQueued => "post_queued",
-        JobStatus::Post { .. } => "post_processing",
-        JobStatus::Completed => "completed",
-        JobStatus::Failed => "failed",
-        JobStatus::Deleted => "deleted",
-    }
 }
 
 /// A recovered-`Fetching` job that duplicates another job's URL: `job`

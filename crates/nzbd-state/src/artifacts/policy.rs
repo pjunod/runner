@@ -85,7 +85,6 @@ impl Inventory {
             }
             a.retention_seconds = u64::from(preview.days) * 86400;
             a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
-            a.eligible_seconds = 0;
             a.revision += 1;
             a.updated_at = now();
             save_artifact(&tx, &a)?;

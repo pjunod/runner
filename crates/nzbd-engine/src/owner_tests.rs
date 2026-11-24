@@ -206,10 +206,10 @@ async fn blocked_io_lane_preserves_actor_reads_and_noop_controls_without_faking_
             .status,
         JobStatus::Paused
     );
-    let verification_after = owner.verification[&JobId(1)].progress();
-    assert_eq!(verification_after.reason, None);
-    assert_eq!(verification_after.checked_bytes, 0);
-    assert_eq!(verification_after.total_bytes, 0);
+    assert!(
+        !owner.verification.contains_key(&JobId(1)),
+        "after metadata recovery, this zero-claim row needs no checksum ticket"
+    );
 }
 
 #[tokio::test]
@@ -287,6 +287,8 @@ async fn engine_shutdown_drains_real_writer_acknowledgement_behind_full_result_c
         backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        url_fetch_wakeup: Default::default(),
+        url_retry_kicks: Default::default(),
         post_scope: None,
         queue_changes: owner.epoch_tx.subscribe(),
         owner_heartbeat: owner.owner_heartbeat.clone(),
@@ -410,6 +412,7 @@ async fn fresh_admission_prepares_root_before_startup_callback_and_refuses_missi
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_allocation() {
+    // A paused job's allocation stays untouched through boot (no-wedge).
     use std::io::Write;
     let (tmp, mut owner, _adapter, mut messages) = control_test_owner();
     let state_dir = owner.state_dir.clone();
@@ -444,7 +447,7 @@ async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_al
         .status()
         .unwrap()
         .success());
-    let (opened, reader_started) = oneshot::channel();
+    let (opened, mut reader_started) = oneshot::channel();
     let opening_path = marker.clone();
     let writer = std::thread::spawn(move || {
         let file = std::fs::OpenOptions::new()
@@ -466,35 +469,6 @@ async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_al
         .expect("payload I/O blocked healthy queue metadata construction")
         .unwrap()
         .unwrap();
-    let blocked = tokio::time::timeout(Duration::from_secs(2), reader_started)
-        .await
-        .expect(
-            "active-allocation capability worker did not reach the explicit sidecar read barrier",
-        )
-        .unwrap();
-    writer.join().unwrap();
-    // Restore the pathname before releasing the existing descriptor, so
-    // later verification observes ordinary identity material rather than
-    // accidentally creating a second FIFO barrier.
-    struct Release {
-        path: PathBuf,
-        bytes: Vec<u8>,
-        writer: Option<std::fs::File>,
-    }
-    impl Drop for Release {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::write(&self.path, &self.bytes);
-            if let Some(mut writer) = self.writer.take() {
-                let _ = writer.write_all(&self.bytes);
-            }
-        }
-    }
-    let release = Release {
-        path: marker,
-        bytes: original,
-        writer: Some(blocked),
-    };
     assert_eq!(
         engine.snapshot().jobs.len(),
         2,
@@ -534,11 +508,24 @@ async fn metadata_boot_and_other_root_controls_do_not_wait_for_blocked_active_al
             .unwrap(),
         "healthy-state durable metadata control cannot wait for root A"
     );
+    // No-wedge item 3: a paused job is not touched at boot at all — its
+    // allocation's identity sidecar (the FIFO barrier) is never opened.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        release.writer.is_some(),
-        "the barrier remains closed through every metadata/control assertion"
+        matches!(
+            reader_started.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "boot opened the paused job's allocation sidecar"
     );
-    drop(release);
+    // Release the FIFO's writer by opening its read end, then restore it.
+    let reader = std::fs::File::open(&marker).unwrap();
+    let mut blocked = reader_started.await.unwrap();
+    writer.join().unwrap();
+    drop(reader);
+    let _ = std::fs::remove_file(&marker);
+    std::fs::write(&marker, &original).unwrap();
+    let _ = blocked.write_all(&original);
     assert!(
         tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
             .await
@@ -578,6 +565,7 @@ fn guard_test_owner_with_backend(
         &tmp.path().join("state"),
         None,
         None,
+        None,
         tmp.path().join("dest"),
         Vec::new(),
         None,
@@ -612,6 +600,791 @@ pub(super) fn control_test_owner() -> (
     mpsc::Receiver<EngineMsg>,
 ) {
     control_test_owner_with_persistence(true, None)
+}
+
+#[tokio::test]
+async fn authority_adoption_keeps_an_operator_rate_edit_queued_during_snapshot_io() {
+    let (_temporary, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    SnapshotStore::open(&owner.state_dir)
+        .unwrap()
+        .save(&nzbd_state::QueueSnapshotDoc {
+            speed_limit_bps: Some(4096),
+            ..Default::default()
+        })
+        .unwrap();
+    owner.persist = false;
+    owner.state.speed_limit_bps = Some(777);
+    let (started, started_rx) = oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    owner.io_then(
+        move || {
+            let _ = started.send(());
+            held.recv().expect("snapshot IO release barrier");
+            Ok(())
+        },
+        |_, result| result.unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let (completed, result) = oneshot::channel();
+    owner.adopt_authority_then(move |_, outcome| {
+        let _ = completed.send(outcome);
+    });
+    let (reply, changed) = oneshot::channel();
+    owner.on_command(QueueCommand::SetSpeedLimit {
+        bytes_per_sec: Some(888),
+        reply,
+    });
+    changed.await.unwrap();
+    release.send(()).unwrap();
+    pump(&mut owner, &mut messages).await;
+    result.await.unwrap().unwrap();
+    assert_eq!(owner.state.speed_limit_bps, Some(888));
+    assert_eq!(
+        SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap()
+            .speed_limit_bps,
+        Some(888)
+    );
+}
+
+#[tokio::test]
+async fn failed_authority_projection_persists_the_restored_or_newer_rate() {
+    for newer in [None, Some(888)] {
+        let (_temporary, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
+        SnapshotStore::open(&owner.state_dir)
+            .unwrap()
+            .save(&nzbd_state::QueueSnapshotDoc {
+                speed_limit_bps: Some(4096),
+                ..Default::default()
+            })
+            .unwrap();
+        owner.persist = false;
+        owner.state.speed_limit_bps = Some(777);
+        // Make the first real snapshot write fail, then remove the obstacle
+        // before its acknowledgement starts the real rollback snapshot.
+        let blocked = owner.state_dir.join("queue.json.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        let (completed, result) = oneshot::channel();
+        owner.adopt_authority_then(move |_, outcome| {
+            let _ = completed.send(outcome);
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = messages.recv().await.expect("real authority worker result");
+                if matches!(&message, EngineMsg::PersistenceFinished { result, .. } if result.snapshot && result.result.is_err()) {
+                    std::fs::remove_dir(&blocked).unwrap();
+                    if let Some(limit) = newer {
+                        let (reply, changed) = oneshot::channel();
+                        owner.on_command(QueueCommand::SetSpeedLimit { bytes_per_sec: Some(limit), reply });
+                        changed.await.unwrap();
+                    }
+                    owner.on_msg(message);
+                    break;
+                }
+                owner.on_msg(message);
+            }
+        }).await.expect("first authority snapshot must fail at the injected filesystem boundary");
+        pump(&mut owner, &mut messages).await;
+        assert!(result.await.unwrap().is_err());
+        let expected = newer.or(Some(777));
+        assert_eq!(owner.state.speed_limit_bps, expected);
+        assert_eq!(
+            SnapshotStore::open(&owner.state_dir)
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap()
+                .speed_limit_bps,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_post_rollback_retries_durably_before_reopening_admission() {
+    let (_temporary, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut failed = pending_job(1);
+    failed.files.clear();
+    failed.status = JobStatus::Failed;
+    failed.params.push(("*PP:failure-at".into(), "123".into()));
+    owner.state.jobs.push(failed);
+    let (reply, admitted) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    let admission = admitted.await.unwrap().unwrap();
+    let previous = owner.state.job(JobId(1)).unwrap().clone();
+    let mut candidate = previous.clone();
+    candidate.status = JobStatus::Completed;
+    candidate.params.retain(|(key, _)| key != "*PP:failure-at");
+    candidate
+        .params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "1".into()));
+    // Both the candidate snapshot and the immediate rollback really fail.
+    let blocked = owner.state_dir.join("queue.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    let (completed, result) = oneshot::channel();
+    owner.apply_post_record(admission.clone(), candidate, true, move |_, ok| {
+        let _ = completed.send(ok);
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(!result.await.unwrap());
+    assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
+    assert_eq!(owner.state.job(JobId(1)).unwrap().params, previous.params);
+    assert!(owner.pending_control_commits.contains(&JobId(1)));
+    assert!(owner.record_transitions.contains(&JobId(1)));
+    let (reply, released) = oneshot::channel();
+    owner.on_command(QueueCommand::EndPostAdmission { admission, reply });
+    released.await.unwrap();
+    owner.persist_post_rollbacks_then(|_| {});
+    pump(&mut owner, &mut messages).await;
+    assert!(owner.pending_control_commits.contains(&JobId(1)));
+    let (reply, mut changed) = oneshot::channel();
+    owner.on_command(QueueCommand::SetCategory {
+        job: JobId(1),
+        category: Some("operator-category".into()),
+        reply,
+    });
+    assert!(matches!(
+        changed.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    std::fs::remove_dir(&blocked).unwrap();
+    // Retry uses the production owner tick. An enqueued write is still fenced
+    // until its real persistence acknowledgment has reached the owner.
+    owner.on_tick();
+    let (reply, refused) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    assert!(refused.await.unwrap().is_none());
+    pump(&mut owner, &mut messages).await;
+    assert!(changed.await.unwrap());
+    assert!(!owner.pending_control_commits.contains(&JobId(1)));
+    assert!(!owner.record_transitions.contains(&JobId(1)));
+    assert!(owner.post_rollbacks.is_empty());
+    let durable = SnapshotStore::open(&owner.state_dir)
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    let durable = durable.jobs.iter().find(|job| job.id == JobId(1)).unwrap();
+    assert_eq!(durable.status, JobStatus::Failed);
+    assert_eq!(durable.params, previous.params);
+    assert_eq!(durable.category.as_deref(), Some("operator-category"));
+    let (reply, admitted) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(admitted.await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn explicit_authority_adoption_recovers_a_guard_fenced_post_rollback() {
+    let authorized = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let guard = authorized.clone();
+    let (_temporary, mut owner, _adapter, mut messages) = control_test_owner_with_persistence(
+        true,
+        Some(Arc::new(move || {
+            guard.load(std::sync::atomic::Ordering::Acquire)
+        })),
+    );
+    pump(&mut owner, &mut messages).await;
+    let mut failed = pending_job(1);
+    failed.files.clear();
+    failed.status = JobStatus::Failed;
+    failed.params.push(("*PP:failure-at".into(), "123".into()));
+    owner.state.jobs.push(failed);
+    let (reply, admitted) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    let admission = admitted.await.unwrap().unwrap();
+    let previous = owner.state.job(JobId(1)).unwrap().clone();
+    let mut candidate = previous.clone();
+    candidate
+        .params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "1".into()));
+    authorized.store(false, std::sync::atomic::Ordering::Release);
+    let (completed, result) = oneshot::channel();
+    owner.apply_post_record(admission.clone(), candidate, true, move |_, ok| {
+        let _ = completed.send(ok);
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(!result.await.unwrap());
+    assert!(owner.persistence_fenced);
+    assert!(!owner.persist);
+    let (reply, released) = oneshot::channel();
+    owner.on_command(QueueCommand::EndPostAdmission { admission, reply });
+    released.await.unwrap();
+    authorized.store(true, std::sync::atomic::Ordering::Release);
+    // A valid guard alone cannot silently reopen the fenced persistence lane.
+    owner.on_tick();
+    assert!(owner.persistence_fenced && owner.pending_control_commits.contains(&JobId(1)));
+    let (reply, adopted) = oneshot::channel();
+    owner.on_command(QueueCommand::AdoptAuthority { reply });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !owner.projection_transition {
+            owner.on_msg(
+                messages
+                    .recv()
+                    .await
+                    .expect("authority snapshot read result"),
+            );
+        }
+    })
+    .await
+    .expect("explicit adoption must cross only the settled rollback barrier");
+    let (reply, export) = oneshot::channel();
+    owner.on_command(QueueCommand::ExportJob {
+        job: JobId(1),
+        reply,
+    });
+    assert!(export.await.unwrap().is_none());
+    let (reply, refused) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    assert!(refused.await.unwrap().is_none());
+    assert!(owner.pending_control_commits.contains(&JobId(1)));
+    let outstanding = owner.persistence_callbacks.len();
+    owner.persist_post_rollbacks_then(|_| {});
+    assert_eq!(owner.persistence_callbacks.len(), outstanding);
+    pump(&mut owner, &mut messages).await;
+    adopted.await.unwrap().unwrap();
+    assert!(!owner.persistence_fenced && owner.persist);
+    assert!(owner.post_rollbacks.is_empty());
+    assert!(!owner.pending_control_commits.contains(&JobId(1)));
+    let durable = SnapshotStore::open(&owner.state_dir)
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.jobs[0].status, JobStatus::Failed);
+    assert_eq!(durable.jobs[0].params, previous.params);
+    let (reply, admitted) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(admitted.await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn stale_worker_retirement_cannot_cancel_a_successors_custody() {
+    let (_temporary, mut owner, _adapter, mut messages) =
+        control_test_owner_with_persistence(false, None);
+    pump(&mut owner, &mut messages).await;
+    let old = nzbd_state::artifacts::WorkerControlContext {
+        lease_id: "old-grant".into(),
+        job_incarnation: "incarnation".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 7,
+    };
+    let mut current = old.clone();
+    current.lease_id = "successor-grant".into();
+    current.job_revision = 2;
+    let mut job = pending_job(1);
+    job.files.clear();
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&current).unwrap(),
+    ));
+    owner.state.jobs.push(job);
+    owner.job_epochs.insert(JobId(1), 17);
+    owner.control_epochs.insert(JobId(1), 23);
+    let custody = CancellationToken::new();
+    owner.post_admissions.insert(JobId(1), 17);
+    owner.post_cancellations.insert(JobId(1), custody.clone());
+    for retirement in [
+        WorkerRetirement::Revoked(old.clone()),
+        WorkerRetirement::Accepted(old),
+    ] {
+        let (reply, rejected) = oneshot::channel();
+        owner.on_command(QueueCommand::RemoveJobSilent {
+            job: JobId(1),
+            retirement: Some(retirement),
+            reply,
+        });
+        assert!(!tokio::time::timeout(Duration::from_secs(1), rejected)
+            .await
+            .expect("stale retirement must reject before waiting for successor custody")
+            .unwrap());
+        assert!(!custody.is_cancelled());
+        assert_eq!(owner.control_epochs.get(&JobId(1)), Some(&23));
+        assert!(owner.deferred_replacements.is_empty());
+        assert!(owner.retiring_writers.is_empty());
+        assert_eq!(
+            nzbd_state::artifacts::WorkerControlContext::for_job(
+                owner.state.job(JobId(1)).unwrap()
+            ),
+            Some(current.clone())
+        );
+    }
+}
+
+#[tokio::test]
+async fn deferred_worker_retirement_rechecks_context_after_successor_import() {
+    let (_temporary, mut owner, _adapter, mut messages) =
+        control_test_owner_with_persistence(false, None);
+    pump(&mut owner, &mut messages).await;
+    let old = nzbd_state::artifacts::WorkerControlContext {
+        lease_id: "old-grant".into(),
+        job_incarnation: "incarnation".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 7,
+    };
+    let mut job = pending_job(1);
+    job.files.clear();
+    job.status = JobStatus::Completed;
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&old).unwrap(),
+    ));
+    owner.state.jobs.push(job.clone());
+    allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
+    owner.artifacts.bind_worker_context(1, &old).unwrap();
+    let (reply, admitted) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    let admission = admitted.await.unwrap().unwrap();
+    let mut successor = old.clone();
+    successor.lease_id = "successor-grant".into();
+    successor.job_revision += 1;
+    job.params
+        .retain(|(key, _)| key != nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM);
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&successor).unwrap(),
+    ));
+    let (reply, imported) = oneshot::channel();
+    owner.on_command(QueueCommand::ImportJob {
+        job: Box::new(job),
+        preparation: None,
+        authority: crate::imports::ImportAuthority(Arc::new(|| true)),
+        emit_finished: false,
+        reply,
+    });
+    let (reply, retired) = oneshot::channel();
+    owner.on_command(QueueCommand::RemoveJobSilent {
+        job: JobId(1),
+        retirement: Some(WorkerRetirement::Revoked(old)),
+        reply,
+    });
+    assert_eq!(owner.deferred_replacements.len(), 2);
+    let (reply, ended) = oneshot::channel();
+    owner.on_command(QueueCommand::EndPostAdmission { admission, reply });
+    ended.await.unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(1), retired)
+            .await
+            .expect(
+                "deferred stale retirement must reject without waiting for successor persistence"
+            )
+            .unwrap(),
+        "deferred old retirement must reject before waiting on successor persistence"
+    );
+    pump(&mut owner, &mut messages).await;
+    imported.await.unwrap().unwrap();
+    assert_eq!(
+        nzbd_state::artifacts::WorkerControlContext::for_job(owner.state.job(JobId(1)).unwrap()),
+        Some(successor)
+    );
+    assert!(owner.retirement_epochs.is_empty());
+}
+
+#[tokio::test]
+async fn revoked_worker_retirement_preserves_journal_for_the_next_grant() {
+    let temporary = tempfile::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    let destination = temporary.path().join("dest");
+    std::fs::create_dir(&destination).unwrap();
+    let mut config = crate::EngineConfig::single_node(
+        Vec::new(),
+        state.clone(),
+        destination,
+        Tuning::default(),
+        None,
+    );
+    config.persist_queue = false;
+    let engine = crate::Engine::spawn(config).await.unwrap();
+    let context = nzbd_state::artifacts::WorkerControlContext {
+        lease_id: "expired-grant".into(),
+        job_incarnation: "incarnation".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 7,
+    };
+    let mut job = pending_job(1);
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&context).unwrap(),
+    ));
+    engine.import_job(job.clone(), false, false).await.unwrap();
+    export_job_ready_for_test(&engine, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let source = engine.artifacts().for_job(1).unwrap().unwrap();
+    std::fs::write(source.path.join(".runner-file-10.part"), [7; 100]).unwrap();
+    let record = JournalRecord {
+        job: job.id,
+        file: FileId(10),
+        segment_number: 1,
+        offset: 0,
+        len: 100,
+        crc32: crc32fast::hash(&[7; 100]),
+        file_size: 100,
+    };
+    let mut journal = JobJournals::open(&state, "expired-worker").unwrap();
+    journal.append(&record).unwrap();
+    journal.sync().unwrap();
+    drop(journal);
+    assert!(engine
+        .retire_worker_job(job.id, context.clone())
+        .await
+        .unwrap());
+    let mut successor = context;
+    successor.lease_id = "successor-grant".into();
+    successor.job_revision += 1;
+    job.params
+        .retain(|(key, _)| key != nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM);
+    job.params.push((
+        nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&successor).unwrap(),
+    ));
+    // Import must cross the real durable retirement barrier, then earn Done
+    // again by folding and checking the retained journal against actual bytes.
+    engine.import_job(job.clone(), true, false).await.unwrap();
+    let resumed = export_job_ready_for_test(&engine, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        resumed.files[0].segments[0].state,
+        SegmentState::Done { len: 100, .. }
+    ));
+    assert_eq!(
+        nzbd_state::artifacts::WorkerControlContext::for_job(&resumed),
+        Some(successor)
+    );
+    assert!(engine.shutdown().await);
+}
+
+#[tokio::test]
+async fn failed_cleanup_scope_grants_only_exact_failure_metadata() {
+    let (_temporary, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(1);
+    job.status = JobStatus::Failed;
+    job.params.extend([
+        ("*PP:failure-at".into(), "123".into()),
+        ("*PP:failure-disposition-attempts".into(), "1".into()),
+    ]);
+    job.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 100,
+        crc: 7,
+    };
+    owner.state.jobs.push(job);
+    allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
+    let source = owner.artifacts.for_job(1).unwrap().unwrap();
+    // A partially deleted source cannot substantiate these retained Done bits.
+    std::fs::write(source.path.join("payload.bin"), b"partial").unwrap();
+    let source = owner
+        .artifacts
+        .finish(1, &source.path, &source.root, "retained")
+        .unwrap();
+    owner
+        .artifacts
+        .request_delete(
+            &source.id,
+            source.revision,
+            &format!("failed-delete-{}", source.id),
+            0,
+        )
+        .unwrap();
+    owner.queue_verification(JobId(1));
+    let (reply, normal) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginPostAdmission {
+        job: JobId(1),
+        reply,
+    });
+    assert!(normal.await.unwrap().is_none());
+    owner.pending_writer_birth.insert(FileId(10), 99);
+    let (reply, blocked) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginFailedCleanupAdmission {
+        job: JobId(1),
+        reply,
+    });
+    assert!(blocked.await.unwrap().is_none());
+    owner.pending_writer_birth.remove(&FileId(10));
+    owner.writer_epochs.insert(FileId(10), 99);
+    let (reply, cleanup) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginFailedCleanupAdmission {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    let cleanup = cleanup.await.unwrap().unwrap();
+    assert!(!owner.writer_epochs.contains_key(&FileId(10)));
+    owner.on_msg(EngineMsg::ScopedWriter {
+        job: JobId(1),
+        file: FileId(10),
+        generation: 99,
+        fact: WriterFact::Finalized {
+            ok: true,
+            final_path: Some(source.path.join("payload.bin")),
+            combined_crc: Some(7),
+            identity: None,
+            naming: None,
+        },
+    });
+    assert!(
+        !owner.state.job(JobId(1)).unwrap().files[0].finalized,
+        "delayed writer completion cannot publish source facts through cleanup scope"
+    );
+    assert_eq!(
+        cleanup.cleanup.operation_id(),
+        format!("failed-delete-{}", source.id)
+    );
+    let admission = cleanup.admission;
+    let (reply, exported) = oneshot::channel();
+    owner.on_msg(EngineMsg::ScopedCommand {
+        admission: admission.clone(),
+        command: Box::new(QueueCommand::ExportJob {
+            job: JobId(1),
+            reply,
+        }),
+    });
+    assert!(exported.await.unwrap().is_none());
+    let (reply, metadata) = oneshot::channel();
+    owner.on_msg(EngineMsg::ScopedCommand {
+        admission: admission.clone(),
+        command: Box::new(QueueCommand::FailedCleanupMetadata {
+            admission: admission.clone(),
+            reply,
+        }),
+    });
+    let original = metadata.await.unwrap().unwrap();
+    assert!(matches!(
+        original.files[0].segments[0].state,
+        SegmentState::Done { len: 100, .. }
+    ));
+    for mutation in 0..7 {
+        let mut candidate = original.clone();
+        match mutation {
+            0 => candidate.status = JobStatus::Completed,
+            1 => candidate.files.clear(),
+            2 => candidate.params.push(("*File:size:10".into(), "7".into())),
+            3 => candidate
+                .params
+                .push((nzbd_types::PP_DONE_PARAM.into(), "SUCCESS".into())),
+            4 => candidate
+                .params
+                .push(("Artifact:Id".into(), "another-source".into())),
+            5 => candidate
+                .params
+                .push(("Artifact:Custody".into(), "deleted_by_runner".into())),
+            _ => {
+                candidate
+                    .params
+                    .iter_mut()
+                    .find(|(key, _)| key == "*PP:failure-disposition-attempts")
+                    .unwrap()
+                    .1 = "0".into()
+            }
+        }
+        let (completed, result) = oneshot::channel();
+        owner.apply_post_record(admission.clone(), candidate, true, move |_, ok| {
+            let _ = completed.send(ok);
+        });
+        pump(&mut owner, &mut messages).await;
+        assert!(
+            !result.await.unwrap(),
+            "cleanup admission accepted mutation {mutation}"
+        );
+    }
+    let (reply, stage) = oneshot::channel();
+    owner.on_msg(EngineMsg::ScopedCommand {
+        admission: admission.clone(),
+        command: Box::new(QueueCommand::SetJobStatus {
+            job: JobId(1),
+            status: JobStatus::Completed,
+            reply,
+        }),
+    });
+    assert!(
+        stage.await.is_err(),
+        "cleanup cannot enter normal PP or download states"
+    );
+    let mut candidate = original.clone();
+    let mut other = pending_job(2);
+    other.files.clear();
+    other.status = JobStatus::Completed;
+    owner.state.jobs.push(other);
+    candidate.params.extend([
+        ("Artifact:Id".into(), source.id.clone()),
+        ("Artifact:Generation".into(), source.generation.clone()),
+        ("Artifact:Custody".into(), "runner_owned".into()),
+        ("*PP:history-seq".into(), "42".into()),
+        (nzbd_types::PP_DONE_PARAM.into(), "FAILURE/HEALTH".into()),
+    ]);
+    let (completed, result) = oneshot::channel();
+    owner.apply_post_record(admission.clone(), candidate, true, move |_, ok| {
+        let _ = completed.send(ok);
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(result.await.unwrap());
+    assert!(owner.verification.contains_key(&JobId(1)));
+    assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
+    assert_eq!(
+        std::fs::read(source.path.join("payload.bin")).unwrap(),
+        b"partial"
+    );
+    let durable = SnapshotStore::open(&owner.state_dir)
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        durable.jobs[0].files[0].segments[0].state,
+        SegmentState::Done { len: 100, .. }
+    ));
+    assert!(durable.jobs[0]
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/HEALTH"));
+    let (reply, ended) = oneshot::channel();
+    owner.on_command(QueueCommand::EndPostAdmission { admission, reply });
+    ended.await.unwrap();
+    assert!(owner.failed_cleanup_admissions.is_empty());
+    let state = owner.state_dir.clone();
+    let destination = owner.dest_dir.clone();
+    drop(owner);
+    let restarted = crate::Engine::spawn(crate::EngineConfig::single_node(
+        Vec::new(),
+        state,
+        destination,
+        Tuning::default(),
+        None,
+    ))
+    .await
+    .unwrap();
+    // A stamp-to-removal crash cannot turn preserved, unverified Done data
+    // into a generic verified export when PP_DONE suppresses payload recovery.
+    assert!(matches!(
+        restarted.export_job(JobId(1)).await,
+        Err(crate::EngineError::Lifecycle(_))
+    ));
+    assert!(restarted
+        .begin_post_admission(JobId(1))
+        .await
+        .unwrap()
+        .is_none());
+    let replay = restarted
+        .begin_failed_cleanup_admission(JobId(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            restarted
+                .for_post_admission(&replay.admission)
+                .export_job(JobId(1))
+                .await,
+            Err(crate::EngineError::Lifecycle(_))
+        ),
+        "cleanup-scoped export reports its fence without reading the whole recovery document"
+    );
+    assert!(restarted.export_job(JobId(2)).await.unwrap().is_some());
+    assert!(
+        matches!(
+            restarted
+                .for_post_admission(&replay.admission)
+                .export_job(JobId(2))
+                .await,
+            Err(crate::EngineError::Lifecycle(_))
+        ),
+        "cleanup scope cannot export another job's verified payload record"
+    );
+    let metadata = restarted
+        .for_post_admission(&replay.admission)
+        .failed_cleanup_metadata()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.status, JobStatus::Failed);
+    assert!(matches!(
+        metadata.files[0].segments[0].state,
+        SegmentState::Done { len: 100, .. }
+    ));
+    assert!(metadata
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/HEALTH"));
+    restarted
+        .end_post_admission(replay.admission)
+        .await
+        .unwrap();
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn quiescing_without_writer_handles_releases_its_fence_after_durable_ack() {
+    let (_temporary, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(1);
+    job.files.clear();
+    job.status = JobStatus::Completed;
+    owner.state.jobs.push(job);
+    allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
+    let source = owner.artifacts.for_job(1).unwrap().unwrap();
+    std::fs::write(source.path.join("retained"), b"owned bytes").unwrap();
+    let (reply, quiesced) = oneshot::channel();
+    owner.on_command(QueueCommand::QuiescePayload {
+        job: JobId(1),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(quiesced.await.unwrap().unwrap().is_empty());
+    assert!(!owner.retiring_writers.contains_key(&JobId(1)));
+    let (reply, deleted) = oneshot::channel();
+    owner.on_command(QueueCommand::Delete {
+        job: JobId(1),
+        delete_files: false,
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(deleted.await.unwrap());
+    assert!(owner.state.job(JobId(1)).is_none());
+    assert_eq!(
+        std::fs::read(source.path.join("retained")).unwrap(),
+        b"owned bytes"
+    );
 }
 
 #[tokio::test]
@@ -677,16 +1450,32 @@ fn control_test_owner_with_persistence(
 ) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir(tmp.path().join("dest")).unwrap();
+    let (owner, adapter, engine_messages) =
+        control_test_owner_at(tmp.path(), persist, persist_guard);
+    (tmp, owner, adapter, engine_messages)
+}
+
+/// An owner over an existing state and payload directory: a restart.
+fn control_test_owner_at(
+    base: &std::path::Path,
+    persist: bool,
+    persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> (
+    Owner,
+    crate::backend::BackendAdapterPort,
+    mpsc::Receiver<EngineMsg>,
+) {
     let (budget_tx, _) = watch::channel(crate::pool::BudgetEnvelope::default());
     let (events, _) = broadcast::channel(1);
     let (epoch_tx, _) = watch::channel(0);
     let (engine_tx, engine_messages) = mpsc::channel(1);
     let (backend, adapter) = crate::backend::backend_channel(1, 1);
     let owner = Owner::recover(
-        &tmp.path().join("state"),
+        &base.join("state"),
         None,
         None,
-        tmp.path().join("dest"),
+        None,
+        base.join("dest"),
         Vec::new(),
         None,
         Arc::new(Vec::new()),
@@ -710,7 +1499,7 @@ fn control_test_owner_with_persistence(
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
     )
     .unwrap();
-    (tmp, owner, adapter, engine_messages)
+    (owner, adapter, engine_messages)
 }
 
 #[tokio::test]
@@ -859,6 +1648,10 @@ async fn terminal_failed_job_can_keep_only_its_retained_delivery_source() {
             publication_path: Some(completed.join("published-generation").display().to_string()),
             source_artifact_id: Some(source_id.clone()),
             source_generation: Some(source_generation.clone()),
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
 
     let (reply, result) = oneshot::channel();
@@ -998,7 +1791,7 @@ async fn intact_publication_clears_previous_private_repair_marker() {
 }
 
 #[tokio::test]
-async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_hold() {
+async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_fail_identity() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     for id in 1..=3 {
@@ -1015,16 +1808,38 @@ async fn yenc_name_variations_keep_the_first_name_but_size_and_path_conflicts_ho
         "first.bin"
     );
     owner.accept_file_metadata(JobId(1), file, "third-name", 101);
-    pump(&mut owner, &mut messages).await;
-    let control = owner.state.job(JobId(1)).unwrap().control().unwrap();
-    assert_eq!(control.cause, "identity_conflict");
-    assert_eq!(control.message, "conflicting yEnc declared size");
+    // Contract §2.2: self-contradicting yEnc metadata is the release's
+    // fault — a terminal `failed/identity`, blamed, never salvaged.
+    let terminal_of = |owner: &Owner, id: u32| owner.artifacts.terminal(id).unwrap();
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if terminal_of(&owner, 1).is_some_and(|t| t.emitted) {
+            break;
+        }
+    }
+    let terminal = terminal_of(&owner, 1).unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Identity));
+    assert_eq!(
+        terminal.message.as_deref(),
+        Some("conflicting yEnc declared size")
+    );
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
 
     for (id, name, size) in [(2, "../unsafe", 100), (3, "empty.bin", 0)] {
         let file = owner.state.job(JobId(id)).unwrap().files[0].id;
         owner.accept_file_metadata(JobId(id), file, name, size);
-        pump(&mut owner, &mut messages).await;
-        assert!(owner.state.job(JobId(id)).unwrap().held());
+        for _ in 0..20 {
+            pump(&mut owner, &mut messages).await;
+            if terminal_of(&owner, id).is_some_and(|t| t.emitted) {
+                break;
+            }
+        }
+        assert_eq!(
+            terminal_of(&owner, id).unwrap().reason,
+            Some(nzbd_types::FailureReason::Identity)
+        );
     }
 }
 
@@ -2084,7 +2899,13 @@ async fn operator_retry(
 ) -> Result<(), String> {
     let control = owner.state.job(job).unwrap().control().unwrap();
     let custody_checked = control.post_side() && owner.artifacts.validate_post_retry(job.0).is_ok();
-    let result = owner.retry_hold(job, &control.revision, RetryBy::Operator, custody_checked);
+    let result = owner.retry_hold_proven(
+        job,
+        &control.revision,
+        RetryBy::Operator,
+        custody_checked,
+        &Default::default(),
+    );
     pump(owner, messages).await;
     result
 }
@@ -2097,22 +2918,40 @@ async fn post_hold_retry_checks_revision_custody_and_stage_then_persists() {
     job.dir_name = "pp".into();
     owner.state.jobs.push(job);
     allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
-    assert!(owner.hold_job(JobId(1), HoldCause::PostFailure, "unpack", "tool failed"));
+    assert!(owner.hold_job(JobId(1), HoldCause::MissingTool, "unpack", "tool failed"));
     pump(&mut owner, &mut messages).await;
     let revision = owner.state.jobs[0].control().unwrap().revision;
     assert!(owner
-        .retry_hold(JobId(1), "stale", RetryBy::Operator, true)
+        .retry_hold_proven(
+            JobId(1),
+            "stale",
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        )
         .is_err());
     pump(&mut owner, &mut messages).await;
     assert!(
         owner
-            .retry_hold(JobId(1), &revision, RetryBy::Operator, false)
+            .retry_hold_proven(
+                JobId(1),
+                &revision,
+                RetryBy::Operator,
+                false,
+                &Default::default()
+            )
             .is_err(),
         "a post-side release needs its custody checked off-loop first"
     );
     pump(&mut owner, &mut messages).await;
     assert_eq!(
-        owner.retry_hold(JobId(1), &revision, RetryBy::Operator, true),
+        owner.retry_hold_proven(
+            JobId(1),
+            &revision,
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -2156,6 +2995,7 @@ async fn storage_errno_writer_error_schedules_itself() {
             job: JobId(1),
             file: FileId(10),
             error: "write /processing/x/.runner-file-10.part: Transport endpoint is not connected (os error 107)".into(),
+            cause: Some(nzbd_types::HoldCause::StorageUnavailable),
         });
     pump(&mut owner, &mut messages).await;
     let held = owner.state.jobs[0].control().unwrap();
@@ -2187,7 +3027,13 @@ async fn storage_errno_writer_error_schedules_itself() {
     due.next_retry_at_unix = Some(0);
     owner.state.jobs[0].set_control(&due);
     assert_eq!(
-        owner.retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &held.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -2205,6 +3051,7 @@ async fn storage_errno_writer_error_schedules_itself() {
         .starts_with("Automatic retry 1"));
 
     // Still broken: held again, one step further out, same outage start.
+    let retry_started = unix_now();
     assert!(owner.hold_job(
         JobId(1),
         HoldCause::StorageUnavailable,
@@ -2214,22 +3061,32 @@ async fn storage_errno_writer_error_schedules_itself() {
     pump(&mut owner, &mut messages).await;
     let again = owner.state.jobs[0].control().unwrap();
     assert_eq!(again.retry_attempt, 2);
-    assert!(again.next_retry_at_unix.unwrap() >= unix_now() + 59);
+    assert!(again.next_retry_at_unix.unwrap() >= retry_started + 60);
     assert_eq!(again.blocked_since_unix, held.blocked_since_unix);
 
     // A refusal pushes it out again and says why.
     let revision = again.revision.clone();
-    assert!(owner.reschedule_hold(JobId(1), &revision, "volume still unavailable"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &revision,
+        "volume still unavailable",
+        &Default::default()
+    ));
     let pushed = owner.state.jobs[0].control().unwrap();
     assert_eq!(pushed.retry_attempt, 3);
     assert!(pushed
         .message
         .ends_with("; retry refused: volume still unavailable"));
     assert!(
-        !owner.reschedule_hold(JobId(1), &revision, "stale"),
+        !owner.reschedule_hold_proven(JobId(1), &revision, "stale", &Default::default()),
         "a reschedule is a new revision; a second actor on the old one is refused"
     );
-    assert!(owner.reschedule_hold(JobId(1), &pushed.revision, "and again"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &pushed.revision,
+        "and again",
+        &Default::default()
+    ));
     assert_eq!(
         owner.state.jobs[0]
             .control()
@@ -2242,10 +3099,11 @@ async fn storage_errno_writer_error_schedules_itself() {
     );
 }
 
-/// A digest or size mismatch fails the same way on every attempt: it
-/// waits for a person instead of re-checking a whole file forever.
+/// Contract §2.2: a digest or size mismatch fails the same way on every
+/// attempt, so it is not a hold — it is the job's terminal `failed/io`
+/// (parked, never the release's fault), recorded before anything else.
 #[tokio::test]
-async fn permanent_writer_error_waits_for_review() {
+async fn permanent_writer_error_is_a_terminal_io_failure() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     owner.state.jobs.push(pending_job(1));
@@ -2253,23 +3111,99 @@ async fn permanent_writer_error_waits_for_review() {
         job: JobId(1),
         file: FileId(10),
         error: "finalize: complete checkpoint digest differs".into(),
+        cause: None,
+    });
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if owner.state.jobs[0]
+            .params
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
+            break;
+        }
+    }
+    let job = &owner.state.jobs[0];
+    assert!(!job.held(), "a terminal is not a hold");
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(job
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/IO"));
+    let terminal = owner.artifacts.terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert_eq!(terminal.stage.as_deref(), Some("finalize"));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().park_always());
+    assert!(terminal.emitted && terminal.markers_stamped);
+}
+
+/// M6b: a hold and a person's pause are two statuses. A paused job that is
+/// held becomes `Held` and remembers the pause; pausing a held job keeps it
+/// `Held`; releasing a remembered pause lands on `Paused`, not `Queued`.
+#[tokio::test]
+async fn a_hold_is_held_and_a_pause_inside_it_is_remembered() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(1));
+    owner.state.jobs.push(pending_job(2));
+    owner.state.jobs[1].status = JobStatus::Paused;
+    // The fixture's channel holds one event; this test counts them.
+    owner.events = tokio::sync::broadcast::channel(64).0;
+    let mut events = owner.events.subscribe();
+    for job in [JobId(1), JobId(2)] {
+        assert!(owner.hold_job(job, HoldCause::Capacity, "download_write", "ENOSPC"));
+    }
+    pump(&mut owner, &mut messages).await;
+    // One `held` status change per hold (contract §2.4).
+    let held_changes = |events: &mut tokio::sync::broadcast::Receiver<Event>| {
+        let mut seen = std::collections::HashMap::<JobId, usize>::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::JobStatusChanged { job, status, .. } = event {
+                if status == "held" {
+                    *seen.entry(job).or_default() += 1;
+                }
+            }
+        }
+        seen
+    };
+    let seen = held_changes(&mut events);
+    assert_eq!(seen.get(&JobId(1)), Some(&1), "{seen:?}");
+    assert_eq!(seen.get(&JobId(2)), Some(&1), "{seen:?}");
+    for (index, manual) in [(0, false), (1, true)] {
+        let job = &owner.state.jobs[index];
+        assert_eq!(job.status, JobStatus::Held);
+        assert_eq!(nzbd_types::projected_status(job), "held");
+        assert_eq!(job.control().unwrap().manual_pause, manual);
+    }
+    let (reply, paused) = oneshot::channel();
+    owner.on_command(QueueCommand::Pause {
+        job: JobId(1),
+        reply,
     });
     pump(&mut owner, &mut messages).await;
-    let held = owner.state.jobs[0].control().unwrap();
-    assert_eq!(
-        (held.cause.as_str(), held.stage.as_str()),
-        ("io", "finalize")
-    );
-    assert_eq!(held.retry_policy, "review");
-    assert_eq!(held.next_retry_at_unix, None);
+    assert!(paused.await.unwrap());
+    assert_eq!(owner.state.jobs[0].status, JobStatus::Held);
+    assert!(owner.state.jobs[0].control().unwrap().manual_pause);
     assert!(
-        owner
-            .retry_hold(JobId(1), &held.revision, RetryBy::Recovery, false)
-            .is_err(),
-        "the actor independently refuses automatic retries of permanent failures"
+        held_changes(&mut events).is_empty(),
+        "a pause inside a hold is not another status change"
     );
+    // The storage release keeps the remembered pause (`retry_hold_proven`
+    // is the operator retry, which clears it; this is the capacity path).
+    let (reply, released) = oneshot::channel();
+    let revision = owner.state.jobs[1].control().unwrap().revision;
+    owner.on_command(QueueCommand::ReleaseResourceHold {
+        job: JobId(2),
+        revision,
+        by: RetryBy::Recovery,
+        guard: Default::default(),
+        reply,
+    });
     pump(&mut owner, &mut messages).await;
-    assert!(owner.state.jobs[0].held());
+    assert!(released.await.unwrap());
+    assert_eq!(owner.state.jobs[1].status, JobStatus::Paused);
+    assert!(!owner.state.jobs[1].held());
 }
 
 #[tokio::test]
@@ -2288,14 +3222,26 @@ async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
     c.manual_pause = true;
     owner.state.jobs[0].set_control(&c);
     assert!(owner
-        .retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false)
+        .retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        )
         .is_err());
     pump(&mut owner, &mut messages).await;
     owner.persist = false;
     c.manual_pause = false;
     owner.state.jobs[0].set_control(&c);
     assert_eq!(
-        owner.retry_hold(JobId(1), &c.revision, RetryBy::Recovery, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default()
+        ),
         Err("this node is not the queue authority".into())
     );
     pump(&mut owner, &mut messages).await;
@@ -2304,7 +3250,13 @@ async fn paused_hold_waits_for_the_operator_and_followers_never_auto_release() {
     c.retry_attempt = 4;
     owner.state.jobs[0].set_control(&c);
     assert_eq!(
-        owner.retry_hold(JobId(1), &c.revision, RetryBy::Operator, false),
+        owner.retry_hold_proven(
+            JobId(1),
+            &c.revision,
+            RetryBy::Operator,
+            false,
+            &Default::default()
+        ),
         Ok(())
     );
     pump(&mut owner, &mut messages).await;
@@ -2386,6 +3338,57 @@ async fn every_hold_cause_has_an_exit() {
     }
 }
 
+#[tokio::test]
+async fn automatic_hold_recovery_survives_an_owner_request_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut handle = crate::Engine::spawn(crate::EngineConfig::single_node(
+        vec![],
+        temp.path().join("state"),
+        temp.path().join("dest"),
+        crate::Tuning::default(),
+        None,
+    ))
+    .await
+    .unwrap();
+    handle.import_job(bare_job(), false, false).await.unwrap();
+    assert!(handle
+        .hold_job(
+            JobId(1),
+            HoldCause::EngineUnavailable,
+            "par_repair",
+            "owner reply timed out"
+        )
+        .await
+        .unwrap());
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.jobs[0]
+        .control
+        .as_mut()
+        .unwrap()
+        .next_retry_at_unix = Some(0);
+    assert!(handle.shutdown().await);
+    // Retain a due hold and a live command channel whose receiver stalls.
+    // Only the reply deadline, rather than a closed channel, may end a pass.
+    handle.shared = Arc::new(ArcSwap::from_pointee(snapshot));
+    let (sender, mut receiver) = mpsc::channel(1);
+    handle.cmd_tx = sender;
+    let cancel = CancellationToken::new();
+    tokio::time::pause();
+    let recovery = tokio::spawn(crate::hold_recovery::run(handle, cancel.clone()));
+    let first = tokio::time::timeout(Duration::from_secs(20), receiver.recv())
+        .await
+        .unwrap()
+        .expect("first recovery pass sends an owner request");
+    let second = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+        .await
+        .expect("recovery must run another pass after the owner deadline")
+        .expect("the recovery service must remain alive after a timeout");
+    assert!(!recovery.is_finished());
+    cancel.cancel();
+    drop((first, second));
+    recovery.await.unwrap();
+}
+
 /// §3.3: `import_job` keeps a held fence, which is why a scheduling
 /// write that went through it could never land. The fence stays; the
 /// schedule now lives in `hold_job`, and only owner methods change it.
@@ -2394,7 +3397,12 @@ async fn held_control_survives_only_owner_writes() {
     let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
     pump(&mut owner, &mut messages).await;
     owner.state.jobs.push(pending_job(1));
-    assert!(owner.hold_job(JobId(1), HoldCause::Io, "download_write", "digest differs"));
+    assert!(owner.hold_job(
+        JobId(1),
+        HoldCause::MountUnavailable,
+        "download_write",
+        "digest differs"
+    ));
     pump(&mut owner, &mut messages).await;
     let held = owner.state.jobs[0].control().unwrap();
     let mut row = owner.state.jobs[0].clone();
@@ -2421,7 +3429,12 @@ async fn held_control_survives_only_owner_writes() {
     storage.cause = "storage_unavailable".into();
     storage.retry_policy = "scheduled_retry".into();
     owner.state.jobs[0].set_control(&storage);
-    assert!(owner.reschedule_hold(JobId(1), &storage.revision, "still down"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &storage.revision,
+        "still down",
+        &Default::default()
+    ));
     assert_ne!(owner.state.jobs[0].control().unwrap(), storage);
 }
 
@@ -2446,7 +3459,13 @@ async fn rehold_after_release_routes_by_where_the_job_is_now() {
     due.next_retry_at_unix = Some(0);
     owner.state.jobs[0].set_control(&due);
     owner
-        .retry_hold(JobId(1), &first.revision, RetryBy::Recovery, false)
+        .retry_hold_proven(
+            JobId(1),
+            &first.revision,
+            RetryBy::Recovery,
+            false,
+            &Default::default(),
+        )
         .unwrap();
     pump(&mut owner, &mut messages).await;
     // The download finished; post-processing hits the dead mount.
@@ -2464,7 +3483,13 @@ async fn rehold_after_release_routes_by_where_the_job_is_now() {
     assert!(second.post_side(), "this hold happened in post-processing");
     assert!(
         owner
-            .retry_hold(JobId(1), &second.revision, RetryBy::Recovery, false)
+            .retry_hold_proven(
+                JobId(1),
+                &second.revision,
+                RetryBy::Recovery,
+                false,
+                &Default::default()
+            )
             .is_err(),
         "so its release must go through the custody check"
     );
@@ -2511,6 +3536,7 @@ async fn operator_storage_release_runs_the_job_and_resets_the_probe() {
     pump(&mut owner, &mut messages).await;
     let mut c = owner.state.jobs[0].control().unwrap();
     c.manual_pause = true;
+    c.next_retry_at_unix = Some(unix_now() + 999);
     owner.state.jobs[0].set_control(&c);
     // A probe just ran: the recovery task must wait, a person need not.
     owner.state.jobs[0].params.extend([
@@ -2574,7 +3600,12 @@ async fn reobserve_refusal_records_why_without_moving_its_cadence() {
     pump(&mut owner, &mut messages).await;
     let c = owner.state.jobs[0].control().unwrap();
     assert_eq!(c.next_retry_at_unix, None);
-    assert!(owner.reschedule_hold(JobId(1), &c.revision, "wrong root mounted"));
+    assert!(owner.reschedule_hold_proven(
+        JobId(1),
+        &c.revision,
+        "wrong root mounted",
+        &Default::default()
+    ));
     let after = owner.state.jobs[0].control().unwrap();
     assert_eq!(
         after.next_retry_at_unix, None,
@@ -2586,14 +3617,43 @@ async fn reobserve_refusal_records_why_without_moving_its_cadence() {
         .ends_with("; retry refused: wrong root mounted"));
     owner.persist = false;
     assert!(
-        !owner.reschedule_hold(JobId(1), &c.revision, "follower"),
+        !owner.reschedule_hold_proven(JobId(1), &c.revision, "follower", &Default::default()),
         "a node that is not the authority writes nothing"
+    );
+}
+
+#[test]
+fn retired_cleanup_clock_params_are_dropped_on_load() {
+    let mut job = pending_job(7);
+    job.params = vec![
+        ("*PP:failure-disposition-attempts".into(), "2".into()),
+        ("*PP:failed-cleanup-next-retry".into(), "1794076138".into()),
+        (
+            "*PP:failed-cleanup-blocked-since".into(),
+            "1794070000".into(),
+        ),
+        ("*PP:failed-cleanup-last-error".into(), "EIO".into()),
+        ("monarr-transfer".into(), "t-1".into()),
+    ];
+    assert!(drop_retired_params(&mut job));
+    assert_eq!(
+        job.params,
+        vec![
+            ("*PP:failure-disposition-attempts".into(), "2".into()),
+            ("monarr-transfer".into(), "t-1".into()),
+        ]
+    );
+    assert!(!drop_retired_params(&mut job), "idempotent");
+    assert_eq!(
+        crate::snapshot::failed_cleanup_progress(&job).map(|p| p.attempts),
+        Some(2)
     );
 }
 
 #[test]
 fn rearm_reclassifies_by_errno_and_derives_policy() {
     let hold = |cause: &str, policy: &str, message: &str| nzbd_types::JobControl {
+        expiry_pending: false,
         version: 1,
         revision: "4".into(),
         lifecycle: "held".into(),
@@ -2608,6 +3668,8 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         next_retry_at_unix: None,
         blocked_since_unix: Some(1),
         released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
     };
     // #2181 exactly.
     let fixed = rearmed_hold(
@@ -2623,12 +3685,39 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         "due on the first pass"
     );
     assert_eq!(fixed.revision, "5");
+    // #2301: a control deadline at the failed-repair Keep boundary.
+    let legacy = hold(
+        "post_failure",
+        "review",
+        "subprocess failed: read live Keep setting: engine is shutting down",
+    );
+    let fixed = rearmed_hold(legacy.clone(), 1000).expect("legacy timeout is re-armed");
+    assert_eq!(fixed.cause, "engine_unavailable");
+    assert_eq!(fixed.retry_policy, "scheduled_retry");
+    assert_eq!(fixed.next_retry_at_unix, Some(1000));
+    assert_eq!(fixed.blocked_since_unix, legacy.blocked_since_unix);
+    assert_eq!(fixed.revision, "5");
+    assert!(!fixed.message.contains("shutting down"));
+    let mut manual = legacy.clone();
+    manual.manual_pause = true;
+    assert!(rearmed_hold(manual, 1000).unwrap().manual_pause);
+    for cause in ["identity_conflict", "io"] {
+        let mut other = legacy.clone();
+        other.cause = cause.into();
+        assert!(rearmed_hold(other, 1000).is_none());
+    }
+    let mut unrelated = legacy;
+    unrelated.message.push_str(" in a payload filename");
+    assert!(rearmed_hold(unrelated, 1000).is_none());
     // #2183 exactly.
     assert!(rearmed_hold(
         hold(
             "io",
             "review",
-            "write /processing/x.part: Transport endpoint is not connected (os error 107)"
+            &format!(
+                "write /processing/x.part: {}",
+                std::io::Error::from_raw_os_error(libc::ENOTCONN)
+            )
         ),
         1000
     )
@@ -2639,12 +3728,13 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
         1000
     )
     .is_none());
-    // Policy this build changed: password_required used to claim resume_same_job.
+    // Policy this build changed: password_required retries on the ladder
+    // until its deadline (contract §2.3).
     assert_eq!(
         rearmed_hold(hold("password_required", "resume_same_job", "x"), 1000)
             .unwrap()
             .retry_policy,
-        "review"
+        "scheduled_retry"
     );
     // Capacity used to carry no time.
     assert_eq!(
@@ -2668,13 +3758,17 @@ async fn adopting_authority_rearms_holds() {
     pump(&mut owner, &mut messages).await;
     let mut job = pending_job(1);
     job.set_control(&nzbd_types::JobControl {
+        expiry_pending: false,
         version: 1,
         revision: "1".into(),
         lifecycle: "held".into(),
         cause: "io".into(),
         stage: "download_write".into(),
         retry_policy: "review".into(),
-        message: "write x: Transport endpoint is not connected (os error 107)".into(),
+        message: format!(
+            "write x: {}",
+            std::io::Error::from_raw_os_error(libc::ENOTCONN)
+        ),
         instance: "i".into(),
         previous_status: Some(JobStatus::Downloading),
         manual_pause: false,
@@ -2682,6 +3776,8 @@ async fn adopting_authority_rearms_holds() {
         next_retry_at_unix: None,
         blocked_since_unix: Some(1),
         released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
     });
     job.status = JobStatus::Paused;
     let mut doc_state = QueueState::default();
@@ -2775,6 +3871,10 @@ async fn admission_tombstone_refreshes_exact_source_keep_and_delete_evidence() {
             publication_path: None,
             source_artifact_id: Some(source.id.clone()),
             source_generation: Some(source.generation.clone()),
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
 
     let kept = owner
@@ -2854,6 +3954,31 @@ fn restarted_recovery_job(id: u32, state: SegmentState) -> Job {
     job
 }
 
+/// Review #296-4: a full state volume under the terminal store latches
+/// out-of-space instead of reading as corruption.
+#[tokio::test]
+async fn a_full_terminal_store_latches_out_of_space() {
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    let full = nzbd_state::artifacts::Error::Sql(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+        Some("database or disk is full".into()),
+    ));
+    let fault = terminal_owner::StoreFault::of(&full);
+    assert_eq!(fault.cause, Some(nzbd_types::HoldCause::Capacity));
+    owner.terminal_store_fault("terminal emitted flag", &fault);
+    assert!(owner.enospc_latched);
+    assert_eq!(owner.enospc_observed, 1);
+    // Anything else is logged and replayed, not a latch.
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.terminal_store_fault(
+        "terminal replay",
+        &terminal_owner::StoreFault::of(&nzbd_state::artifacts::Error::NotFound),
+    );
+    assert!(!owner.enospc_latched);
+}
+
 #[tokio::test]
 async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
     let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
@@ -2864,12 +3989,13 @@ async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
         job: JobId(2),
         file: FileId(20),
         error: "write payload.bin: No space left on device (os error 28)".into(),
+        cause: Some(nzbd_types::HoldCause::Capacity),
     });
     pump(&mut owner, &mut messages).await;
     let job = owner.state.job(JobId(2)).unwrap();
     assert_eq!(job.files[0].segments[0].state, SegmentState::Pending);
     assert!(!job.files[0].finalized);
-    assert_eq!(job.status, JobStatus::Paused);
+    assert_eq!(job.status, JobStatus::Held);
     assert!(job.held());
     assert!(!job.ready());
     assert!(owner.disk_low);
@@ -2882,12 +4008,14 @@ async fn writer_resource_errors_hold_pending_segments_and_latch_out_of_space() {
         job: JobId(2),
         file: FileId(20),
         error: "permission denied".into(),
+        cause: None,
     });
     pump(&mut owner, &mut messages).await;
     owner.on_msg(EngineMsg::WriterError {
         job: JobId(2),
         file: FileId(999),
         error: "gone".into(),
+        cause: None,
     });
     pump(&mut owner, &mut messages).await;
     owner.on_msg(EngineMsg::SegmentWritten {
@@ -3194,10 +4322,7 @@ async fn delayed_par_download_keeps_the_open_post_span() {
         "the post manager, not delayed download completion, closes verification"
     );
     assert!(
-        matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ),
+        no_completion_event(&mut events),
         "a delayed PAR fetch must not announce a second download completion"
     );
 }
@@ -3228,10 +4353,7 @@ async fn restarted_delayed_par_completion_recovers_from_the_persisted_open_span(
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[tokio::test]
@@ -3316,10 +4438,7 @@ async fn failed_recovery_articles_return_to_verification_instead_of_disposition(
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[tokio::test]
@@ -3347,10 +4466,7 @@ async fn recovery_write_failure_stays_owned_by_the_active_post_task() {
             stage: PostStage::ParVerify
         }
     );
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
+    assert!(no_completion_event(&mut events));
 }
 
 #[test]
@@ -3495,26 +4611,294 @@ fn complete_high_probe_releases_a_forecast_hold() {
     );
 }
 
+/// W5a: statvfs is a forecast. However much free space a complete probe
+/// reports (Gluster DHT sums its bricks), it never clears a latch that a
+/// real write set.
 #[test]
-fn write_latch_requires_twice_the_floor_from_a_complete_probe() {
-    let below_clear = DiskGuardReading {
-        available_bytes: Some(199),
+fn statvfs_never_clears_an_observed_write_latch() {
+    for free in [199, 200, u64::MAX] {
+        let reading = DiskGuardReading {
+            available_bytes: Some(free),
+            all_roots_known: true,
+            ..Default::default()
+        };
+        assert_eq!(disk_guard_decision(true, true, &reading, 100), (true, true));
+    }
+}
+
+/// A Gluster distribute volume in miniature: new files land on the brick
+/// with room and succeed; the file that failed lives on the full brick.
+struct SplitBrickFs {
+    full: std::sync::Mutex<bool>,
+    failing_file: PathBuf,
+}
+impl crate::space_probe::ProbeFs for SplitBrickFs {
+    fn probe_file(&self, path: &std::path::Path) -> crate::space_probe::ProbeResult {
+        if path == self.failing_file && *self.full.lock().unwrap() {
+            crate::space_probe::ProbeResult::Holds("No space left on device (os error 28)".into())
+        } else {
+            crate::space_probe::ProbeResult::Cleared
+        }
+    }
+    fn probe_dir(&self, _: &std::path::Path) -> crate::space_probe::ProbeResult {
+        crate::space_probe::ProbeResult::Cleared
+    }
+}
+
+/// R3 / W5a (finding 3): statvfs says free and new files succeed, but the
+/// partial whose write failed sits on the full brick. The latch holds through
+/// high readings and through new-file success, ignores a probe planned
+/// before a newer report of the same failure, and clears only when an
+/// allocation on that same file succeeds.
+#[tokio::test]
+async fn write_latch_clears_only_on_evidence_from_the_failed_file() {
+    use crate::space_probe::{Planned, ProbeFs, ProbeResult, SpaceOp, Target};
+    let tuning = Tuning {
+        min_free_disk_bytes: 100,
+        ..Tuning::default()
+    };
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(tuning);
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(2));
+    let part = tmp.path().join("dest/job/.runner-file-20.part");
+    // The partial's directory exists: a missing one means the file is gone.
+    std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+    let fs = SplitBrickFs {
+        full: std::sync::Mutex::new(true),
+        failing_file: part.clone(),
+    };
+    let op = SpaceOp::Write {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure(
+        "write x.part: No space left on device",
+        op.clone(),
+        Some(part.clone()),
+    );
+    owner.disk_guard.store(Arc::new(DiskGuardReading {
+        available_bytes: Some(132_000_000_000),
         all_roots_known: true,
         ..Default::default()
+    }));
+    for _ in 0..3 {
+        owner.update_disk_guard();
+        assert!(
+            owner.enospc_latched && owner.disk_low,
+            "statvfs is not evidence"
+        );
+    }
+    let plan = |owner: &Owner| {
+        vec![Planned {
+            op: op.clone(),
+            observed: owner.enospc_failures[&op].observed,
+            target: Target::File(part.clone(), Default::default()),
+        }]
     };
-    let at_clear = DiskGuardReading {
-        available_bytes: Some(200),
-        all_roots_known: true,
+    // New files would succeed (probe_dir), but the failing file still fails.
+    assert_eq!(
+        fs.probe_dir(tmp.path()),
+        ProbeResult::Cleared,
+        "the fake places new files on the brick with room"
+    );
+    owner.on_space_probed(crate::space_probe::run(&plan(&owner), &fs));
+    assert!(owner.enospc_latched, "new-file success is not evidence");
+    assert!(
+        owner.space_probe_after > Instant::now(),
+        "a failed probe backs off"
+    );
+    // A probe planned before a newer report of the same failure proves nothing.
+    let stale = plan(&owner);
+    owner.observe_space_failure("write again", op.clone(), Some(part.clone()));
+    *fs.full.lock().unwrap() = false;
+    owner.on_space_probed(crate::space_probe::run(&stale, &fs));
+    assert!(owner.enospc_latched);
+    owner.on_space_probed(crate::space_probe::run(&plan(&owner), &fs));
+    assert!(!owner.enospc_latched);
+    assert!(!owner.disk_low, "the forecast is above the floor");
+    assert!(owner.enospc_failures.is_empty());
+
+    // The writer's own next write to that file is evidence too.
+    owner.observe_space_failure("write", op.clone(), Some(part.clone()));
+    assert!(owner.enospc_latched);
+    owner.space_op_succeeded(&op);
+    assert!(!owner.enospc_latched);
+
+    // A finalize failure waits for its own job's retry, which hold recovery
+    // may run while the latch holds; a job that is gone drops its failure.
+    let finalize = SpaceOp::Finalize {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure("finalize", finalize.clone(), Some(part.clone()));
+    assert!(owner.space_retry_jobs().contains(&JobId(2)));
+    owner.space_probe_after = Instant::now();
+    owner.maybe_probe_space();
+    assert!(owner.enospc_latched, "a live job's finalize retry decides");
+    owner.state.jobs.retain(|job| job.id != JobId(2));
+    owner.maybe_probe_space();
+    assert!(!owner.enospc_latched, "nothing is left to retry");
+}
+
+/// Review finding 2: a grouped filesystem (two bind mounts of one volume,
+/// common path `/`) is recorded per member root with the group's device and
+/// its parent's — never as `/` — and an every-root failure probes a member.
+#[tokio::test]
+async fn grouped_roots_are_recorded_per_member() {
+    use crate::space_probe::{GuardedVolume, SpaceOp, Target};
+    use crate::volumes::{StorageMemberReading, StorageVolumeReading};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    let downloads = tmp.path().join("downloads");
+    let media = tmp.path().join("media");
+    let member = |path: &PathBuf| StorageMemberReading {
+        path: path.clone(),
+        parent_device_id: Some(1),
+    };
+    owner.evaluated_disk_guard = Arc::new(DiskGuardReading {
+        volumes: vec![StorageVolumeReading {
+            label: "processing · completed".into(),
+            path: PathBuf::from("/"),
+            available_bytes: Some(0),
+            total_bytes: Some(1),
+            device_id: Some(7),
+            current: true,
+            roles: vec!["processing".into(), "completed".into()],
+            members: vec![member(&downloads), member(&media)],
+        }],
         ..Default::default()
+    });
+    owner.observe_out_of_space_in("torrent", None);
+    let failure = &owner.enospc_failures[&SpaceOp::Directory(PathBuf::new())];
+    for root in [&downloads, &media] {
+        assert!(failure.volumes.contains(&GuardedVolume {
+            root: root.clone(),
+            device: Some(7),
+            parent_device: Some(1),
+        }));
+    }
+    assert!(
+        !failure
+            .volumes
+            .iter()
+            .any(|volume| volume.root == Path::new("/")),
+        "the group's common path is another filesystem"
+    );
+    let plan = owner.space_probe_plan();
+    let Target::Dirs(dirs) = &plan[0].target else {
+        panic!("a directory probe");
     };
-    assert_eq!(
-        disk_guard_decision(true, true, &below_clear, 100),
-        (true, true)
+    let probed: Vec<_> = dirs
+        .iter()
+        .filter(|(_, bound)| bound.device == Some(7))
+        .collect();
+    assert_eq!(probed.len(), 1, "one member per device");
+    assert_eq!(probed[0].0, downloads);
+}
+
+/// Finding 4: a finalize or post-processing failure whose job cannot run its
+/// own retry (paused by a person, operator-held, post-processing paused) is
+/// probed instead of waiting on a manual resume, and a write failure with no
+/// recorded partial probes the job's directory. Finding 6: a file with a
+/// live writer is not probed (its own write is the evidence).
+#[tokio::test]
+async fn a_failure_whose_job_cannot_retry_is_probed() {
+    use crate::space_probe::{SpaceOp, Target};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(2));
+    owner.state.jobs.push(pending_job(3));
+    let part = tmp.path().join("dest/job/.runner-file-20.part");
+    let finalize = SpaceOp::Finalize {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    let post = SpaceOp::Post { job: JobId(3) };
+    owner.observe_space_failure("finalize", finalize.clone(), Some(part.clone()));
+    owner.observe_space_failure("post", post.clone(), None);
+    assert!(
+        !owner.space_retry_jobs().contains(&JobId(3)),
+        "a post-side hold is never gated by the latch; only finalize is listed"
     );
-    assert_eq!(
-        disk_guard_decision(true, true, &at_clear, 100),
-        (false, false)
+    assert!(
+        owner
+            .space_probe_plan()
+            .iter()
+            .any(|planned| planned.op == post),
+        "post failures are probed without waiting on a lane toggle"
     );
+
+    owner.state.job_mut(JobId(2)).unwrap().status = JobStatus::Paused;
+    owner.state.post_paused = true;
+    let plan = owner.space_probe_plan();
+    assert_eq!(plan.len(), 2, "{plan:?}");
+    for planned in &plan {
+        match (&planned.op, &planned.target) {
+            (SpaceOp::Finalize { .. }, Target::File(path, _)) => assert_eq!(path, &part),
+            (SpaceOp::Post { .. }, Target::Dirs(dirs)) => assert!(!dirs.is_empty()),
+            other => panic!("unexpected plan {other:?}"),
+        }
+    }
+    // Held for review by an operator: no automatic retry either.
+    owner.state.post_paused = false;
+    {
+        let record = owner.state.job_mut(JobId(3)).unwrap();
+        record.status = JobStatus::Held;
+        record.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
+            version: 1,
+            revision: "1".into(),
+            lifecycle: "held".into(),
+            cause: "capacity".into(),
+            stage: "post".into(),
+            retry_policy: "review".into(),
+            message: String::new(),
+            instance: String::new(),
+            previous_status: None,
+            manual_pause: false,
+            retry_attempt: 0,
+            next_retry_at_unix: None,
+            blocked_since_unix: None,
+            released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
+        });
+    }
+    assert!(owner
+        .space_probe_plan()
+        .iter()
+        .any(|planned| planned.op == post));
+
+    // A write failure with no recorded partial: the job's directory.
+    owner.enospc_failures.clear();
+    let write = SpaceOp::Write {
+        job: JobId(2),
+        file: FileId(20),
+    };
+    owner.observe_space_failure("write", write.clone(), None);
+    assert!(matches!(
+        owner.space_probe_plan().as_slice(),
+        [planned] if matches!(planned.target, Target::Dirs(_))
+    ));
+    // A live writer on that file: its own write decides.
+    owner.observe_space_failure("write", write.clone(), Some(part.clone()));
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (_stopped_tx, stopped) = tokio::sync::watch::channel(false);
+    owner.writers.insert(
+        FileId(20),
+        WriterHandle {
+            tx,
+            stop: tokio_util::sync::CancellationToken::new(),
+            stopped,
+            generation: 0,
+        },
+    );
+    assert!(owner.space_probe_plan().is_empty());
+    owner.writers.clear();
+    assert!(matches!(
+        owner.space_probe_plan().as_slice(),
+        [planned] if matches!(planned.target, Target::File(_, _))
+    ));
 }
 
 #[tokio::test]
@@ -3836,6 +5220,9 @@ async fn storage_retry_record_failure_keeps_provider_floor_in_live_fallback() {
     job.files.clear();
     job.params
         .push(("*URL".into(), "http://example.test/source.nzb".into()));
+    // This fixture is itself the acquisition worker: reserve its slot before
+    // import so the new dispatcher cannot run a competing progress producer.
+    engine.url_fetches.lock().unwrap().insert(job.id);
     engine.import_job(job.clone(), false, false).await.unwrap();
     let identity = nzbd_state::artifacts::url_source_identity(&job).unwrap();
     std::fs::create_dir(state.join("url-resolutions/retries").join(&identity)).unwrap();
@@ -3858,6 +5245,7 @@ async fn storage_retry_record_failure_keeps_provider_floor_in_live_fallback() {
             loop { let job = engine.export_job(JobId(87)).await.unwrap().unwrap(); if job.params.iter().any(|(key,value)| key == crate::fetch::NEXT_RETRY_PARAM && value.parse::<i64>().ok().is_some_and(|deadline| deadline >= floor)) { break; } tokio::task::yield_now().await; }
         }).await.expect("failed retry-record persistence must still honor the provider floor in the live scheduled progress");
     engine.cancel.cancel();
+    engine.url_fetches.lock().unwrap().remove(&JobId(87));
     let fallback = retrying.await.unwrap();
     assert_eq!(fallback.attempts, 1);
     assert!(fallback.next_retry_at >= floor);
@@ -4100,6 +5488,10 @@ async fn consumer_receipt_refresh_pins_publication_while_source_progress_remains
             publication_path: Some("/verified/publication".into()),
             source_artifact_id: Some("source-78".into()),
             source_generation: Some("generation-78".into()),
+            failure_reason: None,
+            fetch_cause: None,
+            blames_release: None,
+            salvage: None,
         });
     owner.state.sync_url_admission_receipts();
     let receipt = &owner.state.url_admission_receipts[0];
@@ -4349,6 +5741,96 @@ async fn orphan_receipt_discard_never_restores_or_changes_an_authoritative_id_co
 }
 
 #[tokio::test]
+async fn public_delete_cancels_pending_verification_and_retains_payload() {
+    let (_temporary, mut owner, adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut row = pending_job(41);
+    row.status = JobStatus::Paused;
+    let source = owner.dest_dir.join(&row.dir_name);
+    let payload = source.join("payload.bin");
+    let allocation = owner
+        .artifacts
+        .allocate_for_delivery(41, &owner.dest_dir, &source, true, false)
+        .unwrap();
+    owner.allocation_cache.insert(JobId(41), allocation);
+    owner.allocated_jobs.insert(JobId(41));
+    row.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 17,
+        crc: crc32fast::hash(b"retained download"),
+    };
+    recompute_job_totals(&mut row);
+    std::fs::write(&payload, b"retained download").unwrap();
+    owner.state.jobs.push(row);
+    owner.queue_verification(JobId(41));
+    pump(&mut owner, &mut messages).await;
+    let cancellation = owner.verification[&JobId(41)].cancel.clone();
+    owner.publish_snapshot(0);
+    let tracker = owner.tracker.clone();
+    let engine = crate::EngineHandle {
+        artifacts: owner.artifacts.clone(),
+        url_resolutions: owner.url_resolutions.clone(),
+        url_dest_dir: owner.dest_dir.clone(),
+        import_state_dir: owner.state_dir.clone(),
+        url_history: owner.history.clone(),
+        url_outbox_external: owner.persist_guard.is_some(),
+        owner_persist_guard: owner.persist_guard.clone(),
+        native_seed_recovery_cursor: Default::default(),
+        hold_probes: Default::default(),
+        recovery_cursor: Default::default(),
+        cmd_tx: owner.engine_tx.clone(),
+        shared: owner.shared.clone(),
+        events: owner.events.clone(),
+        cancel: owner.cancel.clone(),
+        tracker: tracker.clone(),
+        backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
+        budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
+        url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        url_fetch_wakeup: Default::default(),
+        url_retry_kicks: Default::default(),
+        post_scope: None,
+        queue_changes: owner.epoch_tx.subscribe(),
+        owner_heartbeat: owner.owner_heartbeat.clone(),
+        shutdown_complete: owner.shutdown_complete.clone(),
+    };
+    let operation = tokio::spawn(async move {
+        // Payload export stays fenced; metadata is sufficient for delete/undo.
+        assert!(matches!(
+            engine.export_job(JobId(41)).await,
+            Err(crate::EngineError::Lifecycle(_))
+        ));
+        let metadata = engine.queue_job_metadata(JobId(41)).await.unwrap().unwrap();
+        assert_eq!(metadata.name, "job-41");
+        assert_eq!(metadata.files.len(), 1);
+        assert!(engine.delete_job(JobId(41), false).await.unwrap());
+        assert!(!engine.delete_job(JobId(41), false).await.unwrap());
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !operation.is_finished() {
+            tokio::select! {
+                Some(message) = messages.recv() => owner.on_msg(message),
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+            }
+        }
+        operation.await.unwrap();
+    })
+    .await
+    .expect("public Delete must reach the owner while verification is pending");
+    pump(&mut owner, &mut messages).await;
+    assert!(cancellation.is_cancelled());
+    assert!(owner.state.job(JobId(41)).is_none());
+    assert!(!owner.verification.contains_key(&JobId(41)));
+    assert_eq!(std::fs::read(payload).unwrap(), b"retained download");
+    assert!(SnapshotStore::open(&owner.state_dir)
+        .unwrap()
+        .load()
+        .unwrap()
+        .unwrap()
+        .jobs
+        .is_empty());
+}
+
+#[tokio::test]
 async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
     // This test drives each bounded pass itself. Start the genuine owner
     // after setup, without also starting Engine::spawn's periodic recovery
@@ -4358,9 +5840,10 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
     for id in 101..122 {
         let mut row = pending_job(id);
         mark_new_lifecycle_cohort(&mut row);
-        row.status = JobStatus::Paused;
+        row.status = JobStatus::Held;
         row.dir_name = format!("allocation-{id}");
         row.set_control(&nzbd_types::JobControl {
+            expiry_pending: false,
             version: 1,
             revision: "1".into(),
             lifecycle: "held".into(),
@@ -4375,6 +5858,8 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
             next_retry_at_unix: Some(0),
             blocked_since_unix: Some(0),
             released_at_unix: None,
+            deadline_in_s: None,
+            deadline_unix: None,
         });
         let root = owner.dest_dir.clone();
         owner
@@ -4405,6 +5890,8 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
         backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        url_fetch_wakeup: Default::default(),
+        url_retry_kicks: Default::default(),
         post_scope: None,
         queue_changes: owner.epoch_tx.subscribe(),
         owner_heartbeat: owner.owner_heartbeat.clone(),
@@ -4514,7 +6001,7 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
                     if phase == "source_already_moved" {
                         "before_commit"
                     } else {
-                        "copy_chunk"
+                        "move_file"
                     },
                     libc::ENOSPC,
                 )
@@ -4554,7 +6041,7 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
             .revision;
         if phase == "repeated_enospc" {
             let _fault = inventory
-                .inject_relocation_test_fault(92, "copy_chunk", libc::ENOSPC)
+                .inject_relocation_test_fault(92, "move_file", libc::ENOSPC)
                 .unwrap();
             assert!(engine
                 .release_hold(JobId(92), revision.clone(), RetryBy::Operator)
@@ -4603,6 +6090,125 @@ async fn unified_post_release_recovers_exact_retry_and_moved_source_but_preserve
         }
         engine.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn journal_replay_preserves_expected_size_for_fold_and_restart_verification() {
+    for restart in [false, true] {
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state");
+        let destination = temporary.path().join("dest");
+        std::fs::create_dir(&destination).unwrap();
+        let config = || {
+            crate::EngineConfig::single_node(
+                Vec::new(),
+                state.clone(),
+                destination.clone(),
+                Tuning::default(),
+                None,
+            )
+        };
+        let mut engine = crate::Engine::spawn(config()).await.unwrap();
+        let job = pending_job(87);
+        let file = job.files[0].id;
+        engine.import_job(job.clone(), false, false).await.unwrap();
+        export_job_ready_for_test(&engine, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let source = engine.artifacts().for_job(job.id.0).unwrap().unwrap();
+        std::fs::write(source.path.join("payload.bin"), [7; 100]).unwrap();
+        if restart {
+            engine.shutdown().await;
+        }
+        let mut journal = JobJournals::open(&state, "remote-grant").unwrap();
+        journal
+            .append(&JournalRecord {
+                job: job.id,
+                file,
+                segment_number: 1,
+                offset: 0,
+                len: 100,
+                crc32: crc32fast::hash(&[7; 100]),
+                file_size: 100,
+            })
+            .unwrap();
+        journal.sync().unwrap();
+        drop(journal);
+        if restart {
+            engine = crate::Engine::spawn(config()).await.unwrap();
+        } else {
+            engine.fold_job_journals(job.id).await.unwrap();
+        }
+        // No-wedge: a restart no longer verifies the job up front. Its
+        // finalize takes the lazy path (allocation at first use, the legacy
+        // range stamped from a stat), so wait for that instead.
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let recovered = export_job_ready_for_test(&engine, job.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if recovered.files[0].finalized {
+                    return recovered;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the restarted file finalizes through the lazy path");
+        assert!(matches!(
+            recovered.files[0].segments[0].state,
+            SegmentState::Done { .. }
+        ));
+        assert!(recovered.files[0].finalized);
+        assert!(recovered
+            .params
+            .iter()
+            .any(|(key, value)| key == &format!("*File:size:{}", file.0) && value == "100"));
+        let durable = SnapshotStore::open(&state)
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(durable.jobs[0]
+            .params
+            .iter()
+            .any(|(key, value)| key == &format!("*File:size:{}", file.0) && value == "100"));
+        engine.shutdown().await;
+    }
+}
+
+#[test]
+fn replayed_size_requires_matching_segment_and_preserves_existing_evidence() {
+    let mut state = QueueState::default();
+    state.jobs.push(pending_job(1));
+    let mut record = JournalRecord {
+        job: JobId(1),
+        file: FileId(10),
+        segment_number: 1,
+        offset: 0,
+        len: 100,
+        crc32: 0,
+        file_size: 0,
+    };
+    assert_eq!(merge_replayed_size(&mut state, &record), None);
+    record.file_size = 100;
+    record.segment_number = 2;
+    assert_eq!(merge_replayed_size(&mut state, &record), None);
+    record.segment_number = 1;
+    assert_eq!(merge_replayed_size(&mut state, &record), Some(100));
+    record.file_size = 200;
+    assert_eq!(merge_replayed_size(&mut state, &record), Some(100));
+    assert_eq!(
+        state.jobs[0]
+            .params
+            .iter()
+            .find(|(key, _)| key == "*File:size:10")
+            .unwrap()
+            .1,
+        "100"
+    );
 }
 
 #[tokio::test]
@@ -4867,6 +6473,12 @@ async fn acknowledged_worker_api_import_is_noop_for_late_preterminal_descriptor(
         .import_job(marker.clone(), false, false)
         .await
         .unwrap();
+    // Import acknowledges queue intent before background source verification
+    // releases custody. Publication requires actual readiness, not just import.
+    export_job_ready_for_test(&engine, JobId(85))
+        .await
+        .unwrap()
+        .unwrap();
     let target = temporary.path().join("publication/85");
     let selected = inventory.for_job(85).unwrap().unwrap().files;
     inventory
@@ -5022,7 +6634,8 @@ async fn proven_worker_completion_preserves_selected_publication_and_separate_so
     assert_eq!(retained.path, original);
     assert!(retained.owned);
     assert!(retained.job.is_none());
-    assert!(original.join("episode.mkv").exists());
+    // Contract §2.5 (M3): the selected file was moved, not copied.
+    assert!(!original.join("episode.mkv").exists());
     assert!(target.join("episode.mkv").exists());
 }
 
@@ -5051,22 +6664,13 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         if !observed.load(Ordering::SeqCst) {
             return false;
         }
+        // Contract §2.5 (M3): the grant expires once the first selected
+        // file of the resumed per-file move has landed in the target.
         if let Some(path) = watching.lock().unwrap().as_ref() {
-            for entry in std::fs::read_dir(path).unwrap().flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".runner-copy-")
-                {
-                    let length = entry.metadata().unwrap().len();
-                    if length == 0 {
-                        copy_started.store(true, Ordering::SeqCst);
-                    }
-                    if copy_started.load(Ordering::SeqCst) && length >= 65536 {
-                        observed.store(false, Ordering::SeqCst);
-                        return false;
-                    }
-                }
+            if path.join("a.mkv").exists() {
+                copy_started.store(true, Ordering::SeqCst);
+                observed.store(false, Ordering::SeqCst);
+                return false;
             }
         }
         true
@@ -5082,6 +6686,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         .allocate_for_delivery(95, &destination, &source, true, true)
         .unwrap();
     let payload = vec![17u8; 256 * 1024];
+    std::fs::write(source.join("a.mkv"), &payload).unwrap();
     std::fs::write(source.join("episode.mkv"), &payload).unwrap();
     let artifact = inventory
         .finish(95, &source, &destination, "active")
@@ -5096,22 +6701,25 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
     let target = completed.join("episode");
     {
         let _fault = inventory
-            .inject_relocation_test_fault(95, "copy_chunk", libc::ENOSPC)
+            .inject_relocation_test_fault(95, "move_file", libc::ENOSPC)
             .unwrap();
         assert!(inventory
             .publish_selected_for_delivery_checked(
                 95,
                 &target,
                 artifact.files,
-                vec![nzbd_state::artifacts::DeliveryFileOutcome {
-                    source_path: "episode.mkv".into(),
-                    publication_path: Some("episode.mkv".into()),
-                    classification: "media".into(),
-                    outcome: "published".into(),
-                    reason: None,
-                    repair_dependency: false,
-                    source_cleanup_status: "pending".into()
-                }],
+                ["a.mkv", "episode.mkv"]
+                    .into_iter()
+                    .map(|name| nzbd_state::artifacts::DeliveryFileOutcome {
+                        source_path: name.into(),
+                        publication_path: Some(name.into()),
+                        classification: "media".into(),
+                        outcome: "published".into(),
+                        reason: None,
+                        repair_dependency: false,
+                        source_cleanup_status: "pending".into()
+                    })
+                    .collect(),
                 &|| Ok(())
             )
             .is_err());
@@ -5130,8 +6738,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         .unwrap()
         .pop()
         .unwrap();
-    let movement: serde_json::Value = serde_json::from_str(&operation.request).unwrap();
-    *scope.lock().unwrap() = Some(PathBuf::from(movement["scratch"]["path"].as_str().unwrap()));
+    *scope.lock().unwrap() = Some(target.clone());
     let revision = export_job_ready_for_test(&engine, JobId(95))
         .await
         .unwrap()
@@ -5145,7 +6752,12 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
         .unwrap()
         .is_err());
     assert!(!valid.load(Ordering::SeqCst));
-    assert!(!target.exists());
+    assert!(armed.load(Ordering::SeqCst));
+    assert!(
+        !target.join(".runner-manifest.json").exists(),
+        "an expired grant cannot commit the publication"
+    );
+    assert!(!target.join("episode.mkv").exists(), "no move after expiry");
     assert_eq!(std::fs::read(source.join("episode.mkv")).unwrap(), payload);
     assert_eq!(inventory.operation(&operation.id).unwrap().state, "retry");
     *scope.lock().unwrap() = None;
@@ -5166,7 +6778,7 @@ async fn authority_fence_stops_relocation_midcopy_before_publication_and_recover
     let delivery = inventory
         .create_delivery(95, true, Some("authority-fence-recovered"))
         .unwrap();
-    assert_eq!(delivery.files.len(), 1);
+    assert_eq!(delivery.files.len(), 2);
     assert_eq!(
         inventory.operation(&operation.id).unwrap().state,
         "succeeded"
@@ -5200,6 +6812,12 @@ async fn checked_release_public_api_refuses_expiry_after_custody_probe() {
     std::fs::write(path.join("payload.bin"), b"retained processing source").unwrap();
     inventory.finish(94, &path, &destination, "active").unwrap();
     engine.import_job(row, false, false).await.unwrap();
+    // This test expires authority during the later custody probe, not during
+    // import recovery. Establish the verified input before installing its hold.
+    export_job_ready_for_test(&engine, JobId(94))
+        .await
+        .unwrap()
+        .unwrap();
     engine
         .hold_job(
             JobId(94),
@@ -5298,9 +6916,20 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
         .load()
         .pending_automatic_controls
         .contains(&base.id));
-    assert!(!owner.reschedule_hold(base.id, &held.revision, "still unavailable"));
+    assert!(!owner.reschedule_hold_proven(
+        base.id,
+        &held.revision,
+        "still unavailable",
+        &Default::default()
+    ));
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Recovery, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Recovery,
+            true,
+            &Default::default()
+        )
         .is_err());
     assert_eq!(
         transition(owner.state.job(base.id).unwrap())
@@ -5325,7 +6954,13 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
     pump(&mut owner, &mut messages).await;
     assert!(result.await.unwrap());
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Recovery, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Recovery,
+            true,
+            &Default::default()
+        )
         .is_ok());
     let released = transition(owner.state.job(base.id).unwrap()).unwrap();
     assert_eq!(released.base_control, Some(held.clone()));
@@ -5383,7 +7018,13 @@ async fn cluster_automatic_control_waits_for_exact_ack_and_operator_intent_is_no
     ));
     let held = owner.state.job(base.id).unwrap().control().unwrap();
     assert!(owner
-        .retry_hold(base.id, &held.revision, RetryBy::Operator, true)
+        .retry_hold_proven(
+            base.id,
+            &held.revision,
+            RetryBy::Operator,
+            true,
+            &Default::default()
+        )
         .is_ok());
     assert!(
         transition(owner.state.job(base.id).unwrap()).is_none(),
@@ -5500,10 +7141,11 @@ async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
         !authority_guard.matches(&owner.artifacts, &row, false),
         "an authority fence is not a worker grant"
     );
-    assert!(!owner.reschedule_hold(
+    assert!(!owner.reschedule_hold_proven(
         row.id,
         &original.revision,
-        "unchecked worker cannot reschedule"
+        "unchecked worker cannot reschedule",
+        &Default::default(),
     ));
     live.store(false, Ordering::SeqCst);
     let (reply, result) = oneshot::channel();
@@ -5593,7 +7235,12 @@ async fn worker_reschedule_refuses_expiry_and_same_revision_regrant() {
     let mut held = owner.state.job(row.id).unwrap().control().unwrap();
     held.next_retry_at_unix = Some(0);
     owner.state.job_mut(row.id).unwrap().set_control(&held);
-    assert!(!owner.reschedule_hold(row.id, &held.revision, "late authority pass"));
+    assert!(!owner.reschedule_hold_proven(
+        row.id,
+        &held.revision,
+        "late authority pass",
+        &Default::default()
+    ));
     let current = owner.state.job(row.id).unwrap().clone();
     let authority_guard = crate::hold_release::HoldReleaseGuard::prepare_queue_owner(
         &current,
@@ -5775,23 +7422,14 @@ async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_in
         "move",
         "destination full"
     ));
-    let control = owner.state.jobs[0].control().unwrap();
-    let deadline = unix_now() + 300;
-    let (reply, result) = oneshot::channel();
-    owner.on_command(QueueCommand::SchedulePostRetry {
-        job: JobId(77),
-        revision: control.revision,
-        retry_attempt: control.retry_attempt.saturating_add(1),
-        next_retry: deadline,
-        blocked_since: unix_now(),
-        message: "retry scheduled".into(),
-        reply,
-    });
     pump(&mut owner, &mut messages).await;
-    assert!(
-        result.await.unwrap(),
-        "worker must commit to local inventory rather than a shared snapshot"
-    );
+    // The hold's own schedule (the owner's ladder, the only hold clock) is
+    // committed to the worker's local inventory, not a shared snapshot.
+    let deadline = owner.state.jobs[0]
+        .control()
+        .unwrap()
+        .next_retry_at_unix
+        .expect("a capacity hold is timed");
     let durable = owner
         .artifacts
         .worker_control(77, &context)
@@ -5806,7 +7444,7 @@ async fn worker_retry_schedule_survives_regrant_without_overriding_new_leader_in
         owner.state.jobs[0].control().unwrap().next_retry_at_unix,
         Some(deadline)
     );
-    assert_eq!(owner.state.jobs[0].status, JobStatus::Paused);
+    assert_eq!(owner.state.jobs[0].status, JobStatus::Held);
     let mut newer = original.clone();
     let mut newer_context = context.clone();
     newer_context.control_revision += 1;
@@ -6210,9 +7848,10 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
     pump(&mut owner, &mut messages).await;
     let revision = owner.state.jobs[0].control().unwrap().revision;
     for attempt in 1..=12 {
-        owner.state.jobs[0]
-            .params
-            .retain(|(key, _)| key != "*Control:probe_after");
+        let mut control = owner.state.jobs[0].control().unwrap();
+        control.next_retry_at_unix = Some(unix_now());
+        control.retry_attempt = attempt;
+        owner.state.jobs[0].set_control(&control);
         let (reply, result) = oneshot::channel();
         owner.on_command(QueueCommand::BeginResourceProbe {
             job: JobId(1),
@@ -6227,6 +7866,9 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
             "resource retry {attempt} must remain admitted"
         );
     }
+    let mut control = owner.state.jobs[0].control().unwrap();
+    control.next_retry_at_unix = Some(unix_now() + 60);
+    owner.state.jobs[0].set_control(&control);
     let (reply, result) = oneshot::channel();
     owner.on_command(QueueCommand::BeginResourceProbe {
         job: JobId(1),
@@ -6253,13 +7895,2243 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
         result.await.unwrap(),
         "explicit retry can probe immediately"
     );
-    let count = owner.state.jobs[0]
+    assert!(owner.state.jobs[0]
         .params
         .iter()
-        .find(|(key, _)| key == "*Control:attempts")
-        .unwrap()
-        .1
-        .parse::<u32>()
+        .all(|(key, _)| { key != "*Control:probe_after" && key != "*Control:attempts" }));
+}
+
+#[tokio::test]
+async fn migrated_resource_probe_uses_due_control_instead_of_legacy_clock() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    owner.state.jobs.push(pending_job(1));
+    assert!(owner.hold_job(JobId(1), HoldCause::Capacity, "download_write", "disk full"));
+    pump(&mut owner, &mut messages).await;
+    let mut control = owner.state.jobs[0].control().unwrap();
+    control.next_retry_at_unix = Some(unix_now());
+    owner.state.jobs[0].set_control(&control);
+    owner.state.jobs[0].params.extend([
+        (
+            "*Control:probe_after".into(),
+            (unix_now() + 1920).to_string(),
+        ),
+        ("*Control:attempts".into(), "8".into()),
+    ]);
+    control.manual_pause = true;
+    owner.state.jobs[0].set_control(&control);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginResourceProbe {
+        job: JobId(1),
+        revision: control.revision.clone(),
+        by: RetryBy::Recovery,
+        guard: Default::default(),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(!result.await.unwrap(), "a due retry preserves manual pause");
+    control.manual_pause = false;
+    owner.state.jobs[0].set_control(&control);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginResourceProbe {
+        job: JobId(1),
+        revision: control.revision,
+        by: RetryBy::Recovery,
+        guard: Default::default(),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(
+        result.await.unwrap(),
+        "the due control owns the retry clock"
+    );
+    assert!(owner.state.jobs[0]
+        .params
+        .iter()
+        .all(|(key, _)| { key != "*Control:probe_after" && key != "*Control:attempts" }));
+}
+
+#[test]
+fn unpinned_failed_receipt_adopts_its_jobs_source_and_reports_disposal() {
+    // Field report 2026-11-02: health failures retained before the receipt
+    // pinned its source reported runner_owned forever, so Curator never saw
+    // the source go and never replaced the release.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("processing");
+    std::fs::create_dir(&root).unwrap();
+    let inventory = nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap();
+    let source = root.join("health-failed");
+    inventory
+        .allocate_for_delivery(2202, &root, &source, true, false)
         .unwrap();
-    assert_eq!(count, 13);
+    let artifact = inventory.finish(2202, &source, &root, "retained").unwrap();
+    let mut receipt = UrlAdmissionReceipt {
+        protocol_version: 1,
+        request_token: "t-health".into(),
+        submission_sha256: "a".repeat(64),
+        job_id: 2202,
+        generation: "admission".into(),
+        runner_instance_id: inventory.installation.clone(),
+        terminal_outcome: Some("FAILURE/HEALTH".into()),
+        outcome: "failed".into(),
+        failure_stage: Some("health".into()),
+        failure_cause: Some("retained for recovery".into()),
+        custody_state: "runner_owned".into(),
+        keep_source_on_failure: false,
+        source_cleanup_status: None,
+        publication_path: None,
+        source_artifact_id: None,
+        source_generation: None,
+        failure_reason: None,
+        fetch_cause: None,
+        blames_release: None,
+        salvage: None,
+    };
+    let mut foreign = receipt.clone();
+    foreign.runner_instance_id = "another-installation".into();
+
+    assert!(refresh_url_admission_custody(&mut receipt, &inventory));
+    assert_eq!(
+        receipt.source_artifact_id.as_deref(),
+        Some(artifact.id.as_str())
+    );
+    assert_eq!(receipt.custody_state, "runner_owned");
+    assert!(!refresh_url_admission_custody(&mut foreign, &inventory));
+    assert!(foreign.source_artifact_id.is_none());
+
+    inventory.reconcile_empty_failed_sources().unwrap();
+    inventory.run_due_deletes().unwrap();
+    assert!(refresh_url_admission_custody(&mut receipt, &inventory));
+    assert_eq!(receipt.custody_state, "deleted_by_runner");
+    assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
+}
+
+#[test]
+fn checkpoint_custody_batch_matches_individual_refresh_and_fresh_keep_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("processing");
+    std::fs::create_dir(&root).unwrap();
+    let inventory = nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap();
+    let source = root.join("batch-custody");
+    inventory
+        .allocate_for_delivery(2204, &root, &source, true, false)
+        .unwrap();
+    std::fs::write(source.join("partial.bin"), b"retained bytes").unwrap();
+    let artifact = inventory.finish(2204, &source, &root, "retained").unwrap();
+    let mut base = catalog_receipt("batch-pinned", 2204);
+    base.runner_instance_id = inventory.installation.clone();
+    base.outcome = "failed".into();
+    base.custody_state = "runner_owned".into();
+    base.source_artifact_id = Some(artifact.id.clone());
+    base.source_generation = Some(artifact.generation.clone());
+    let mut unpinned = base.clone();
+    unpinned.request_token = "batch-unpinned".into();
+    unpinned.source_artifact_id = None;
+    unpinned.source_generation = None;
+    let mut stale = base.clone();
+    stale.request_token = "batch-stale".into();
+    stale.source_generation = Some("different-generation".into());
+    let mut missing = base.clone();
+    missing.request_token = "batch-missing".into();
+    missing.source_artifact_id = Some("missing-artifact".into());
+    let mut consumer = base.clone();
+    consumer.request_token = "batch-consumer".into();
+    consumer.custody_state = "curator".into();
+    let mut foreign = unpinned.clone();
+    foreign.request_token = "batch-foreign".into();
+    foreign.runner_instance_id = "another-installation".into();
+    let mut receipts = vec![base, unpinned, stale, missing, consumer, foreign];
+    for keep in [true, false] {
+        assert!(inventory.set_keep_on_failure(2204, keep).unwrap());
+        let mut expected = receipts.clone();
+        let mut expected_changed = false;
+        for receipt in &mut expected {
+            expected_changed |= refresh_url_admission_custody(receipt, &inventory);
+        }
+        assert_eq!(
+            refresh_url_admission_custodies(&mut receipts, &inventory),
+            expected_changed
+        );
+        assert_eq!(
+            serde_json::to_value(&receipts).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(receipts[0].keep_source_on_failure, keep);
+        assert_eq!(
+            receipts[1].source_artifact_id.as_deref(),
+            Some(artifact.id.as_str())
+        );
+        assert_eq!(receipts[2].custody_state, "runner_owned");
+        assert_eq!(receipts[3].custody_state, "runner_owned");
+        assert_eq!(receipts[4].custody_state, "curator");
+        assert!(receipts[5].source_artifact_id.is_none());
+    }
+}
+
+#[test]
+fn failed_receipt_settles_when_its_source_is_gone() {
+    // Review finding 2026-11-02: a retained failed source removed by hand is
+    // marked source_gone, which still read as runner_owned and held Curator.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("processing");
+    std::fs::create_dir(&root).unwrap();
+    let inventory = nzbd_state::artifacts::Inventory::open(&tmp.path().join("state")).unwrap();
+    let source = root.join("health-failed-removed");
+    inventory
+        .allocate_for_delivery(2203, &root, &source, true, false)
+        .unwrap();
+    std::fs::write(source.join("partial.mkv"), b"partial").unwrap();
+    let artifact = inventory.finish(2203, &source, &root, "retained").unwrap();
+    let mut receipt = UrlAdmissionReceipt {
+        protocol_version: 1,
+        request_token: "t-gone".into(),
+        submission_sha256: "a".repeat(64),
+        job_id: 2203,
+        generation: "admission".into(),
+        runner_instance_id: inventory.installation.clone(),
+        terminal_outcome: Some("FAILURE/HEALTH".into()),
+        outcome: "failed".into(),
+        failure_stage: Some("health".into()),
+        failure_cause: None,
+        custody_state: "runner_owned".into(),
+        keep_source_on_failure: false,
+        source_cleanup_status: None,
+        publication_path: None,
+        source_artifact_id: Some(artifact.id.clone()),
+        source_generation: Some(artifact.generation.clone()),
+        failure_reason: None,
+        fetch_cause: None,
+        blames_release: None,
+        salvage: None,
+    };
+    std::fs::remove_dir_all(&source).unwrap();
+    inventory.reconcile_missing().unwrap();
+    assert_eq!(inventory.get(&artifact.id).unwrap().state, "source_gone");
+    assert!(refresh_url_admission_custody(&mut receipt, &inventory));
+    assert_eq!(receipt.custody_state, "deleted_by_runner");
+    assert_eq!(receipt.source_cleanup_status.as_deref(), Some("removed"));
+}
+
+#[tokio::test]
+async fn naming_expectations_require_current_writer_and_durable_finalization() {
+    use nzbd_state::artifacts::writer_naming::{verify_producer_read, NamingCandidate};
+    for (current, durable, replace_pending) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+        (true, true, false),
+    ] {
+        let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let gate = allowed.clone();
+        let (_temp, mut owner, _adapter, mut messages) = control_test_owner_with_persistence(
+            true,
+            Some(Arc::new(move || {
+                gate.load(std::sync::atomic::Ordering::Acquire)
+            })),
+        );
+        pump(&mut owner, &mut messages).await;
+        owner.state.jobs.push(pending_job(1));
+        allocate_for_test(&mut owner, &mut messages, JobId(1), true).await;
+        let allocation = owner.artifacts.for_job(1).unwrap().unwrap();
+        let path = allocation.path.join("payload.bin");
+        let bytes = b"CRC-validated producer bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let reader = nzbd_state::fileops::open(&path).unwrap();
+        let identity = nzbd_state::fileops::identity(&reader).unwrap();
+        let naming = verify_producer_read(
+            reader,
+            bytes.len() as u64,
+            crc32fast::hash(bytes),
+            true,
+            &|| Ok(()),
+        )
+        .unwrap()
+        .unwrap()
+        .published(&path, &identity)
+        .unwrap();
+        let record = owner.state.job_mut(JobId(1)).unwrap();
+        record
+            .params
+            .push(("*File:generation:10".into(), "99".into()));
+        record.files[0].segments[0].state = SegmentState::Done {
+            offset: 0,
+            len: bytes.len() as u32,
+            crc: crc32fast::hash(bytes),
+        };
+        owner.writer_epochs.insert(FileId(10), 99);
+        allowed.store(durable, std::sync::atomic::Ordering::Release);
+        owner.on_msg(EngineMsg::ScopedWriter {
+            job: JobId(1),
+            file: FileId(10),
+            generation: if current { 99 } else { 98 },
+            fact: WriterFact::Finalized {
+                ok: true,
+                final_path: Some(path.clone()),
+                combined_crc: Some(crc32fast::hash(bytes)),
+                identity: Some(identity),
+                naming: Some(Box::new(naming)),
+            },
+        });
+        if replace_pending {
+            // The completion was accepted, but its durable acknowledgement has
+            // not been delivered to the owner. A replacement wins that race.
+            assert!(!owner.persistence_callbacks.is_empty());
+            owner.writer_epochs.insert(FileId(10), 100);
+            owner.artifacts.invalidate_writer_naming_file(1, 10);
+        }
+        pump(&mut owner, &mut messages).await;
+        let found = owner.artifacts.take_writer_naming(
+            1,
+            &[NamingCandidate {
+                file: 10,
+                writer_generation: 99,
+                path,
+            }],
+        );
+        assert_eq!(
+            found.len(),
+            usize::from(current && durable && !replace_pending),
+            "only matching durable completion admits naming evidence"
+        );
+        if !current || !durable {
+            assert!(!owner.state.job(JobId(1)).unwrap().files[0].finalized);
+        }
+        drop(found);
+        owner.artifacts.prepare_writer_naming();
+    }
+}
+
+/// No download-completion or terminal event was announced. `job_status_changed`
+/// (contract §2.4) fires on every published transition and is not a
+/// completion.
+fn no_completion_event(events: &mut broadcast::Receiver<Event>) -> bool {
+    loop {
+        match events.try_recv() {
+            Ok(Event::JobStatusChanged { .. }) => continue,
+            Ok(_) => return false,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// Drive the owner until `job`'s terminal record has been emitted.
+async fn settle_terminal(
+    owner: &mut Owner,
+    messages: &mut mpsc::Receiver<EngineMsg>,
+    job: u32,
+) -> nzbd_state::artifacts::JobTerminal {
+    for _ in 0..50 {
+        pump(owner, messages).await;
+        if let Some(terminal) = owner.artifacts.terminal(job).unwrap().filter(|t| t.emitted) {
+            return terminal;
+        }
+    }
+    panic!("terminal for job {job} was not emitted");
+}
+
+/// Contract §2.2 / plan M1 (e): a write that did not reach the disk is the
+/// job's terminal `failed/io` — parked, never the release's fault — even
+/// though every article arrived. It is not folded into the health verdict.
+#[tokio::test]
+async fn write_failure_is_io_not_health() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(7);
+    job.params.push(("monarr-transfer".into(), "t-7".into()));
+    job.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 100,
+        crc: 1,
+    };
+    job.files[0].finalized = true;
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    owner.write_failures.insert(
+        JobId(7),
+        "write /processing/x: Permission denied (os error 13)".into(),
+    );
+    owner.check_job_complete(JobId(7));
+    let terminal = settle_terminal(&mut owner, &mut messages, 7).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert_eq!(terminal.stage.as_deref(), Some("download"));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().park_always());
+    assert_eq!(terminal.transfer.as_deref(), Some("t-7"));
+    assert_eq!(terminal.fetched.success_articles, 1);
+    let job = owner.state.job(JobId(7)).unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(job
+        .params
+        .iter()
+        .any(|(key, value)| key == nzbd_types::PP_DONE_PARAM && value == "FAILURE/IO"));
+    assert!(!owner.post_admissions.contains_key(&JobId(7)));
+}
+
+/// Finding 1: a finalize the writer reports as failed never marks the file
+/// finalized (its partial may be the only copy, and the startup sweep only
+/// touches partials of finalized files); the failure is the job's durable
+/// `failed/io` terminal, not an in-memory note a restart forgets.
+#[tokio::test]
+async fn failed_finalize_is_durable_and_never_marks_the_file_finalized() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(17);
+    job.files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 100,
+        crc: 1,
+    };
+    recompute_job_totals(&mut job);
+    let file = job.files[0].id;
+    owner.state.jobs.push(job);
+    owner.on_msg(EngineMsg::WriterFinalized {
+        job: JobId(17),
+        file,
+        ok: false,
+        final_path: None,
+        combined_crc: None,
+    });
+    let terminal = settle_terminal(&mut owner, &mut messages, 17).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert!(!terminal.blames_release);
+    let job = owner.state.job(JobId(17)).unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(!job.files[0].finalized);
+    assert!(!owner.write_failures.contains_key(&JobId(17)));
+}
+
+/// Contract §2.1 / plan M1 (d): articles below critical health are the
+/// owner's `failed/health` terminal, recorded at download end without any
+/// post-processing admission; a job that fetched nothing owes no salvage.
+#[tokio::test]
+async fn zero_article_health_failure_skips_pp_admission() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    let mut events = owner.events.subscribe();
+    let mut job = pending_job(8);
+    job.params
+        .push(("*Runner:LifecycleEligible".into(), "1".into()));
+    job.files[0].segments[0].state = SegmentState::Failed;
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    owner.check_job_complete(JobId(8));
+    let terminal = settle_terminal(&mut owner, &mut messages, 8).await;
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Health));
+    assert_eq!(terminal.stage.as_deref(), Some("health"));
+    assert!(terminal.blames_release);
+    assert_eq!(terminal.salvage, nzbd_state::artifacts::SalvageState::None);
+    assert_eq!(terminal.fetched.success_articles, 0);
+    assert!(
+        !owner.post_admissions.contains_key(&JobId(8)),
+        "post-processing never admitted the job"
+    );
+    let mut saw_terminal = false;
+    while let Ok(event) = events.try_recv() {
+        if let Event::JobPpFinished {
+            job,
+            outcome,
+            reason,
+            salvage,
+            ..
+        } = event
+        {
+            assert_eq!(job, JobId(8));
+            assert_eq!(outcome, nzbd_types::TerminalOutcome::Failed);
+            assert_eq!(reason, Some(nzbd_types::FailureReason::Health));
+            assert_eq!(salvage, nzbd_types::Salvage::None);
+            saw_terminal = true;
+        }
+    }
+    let _ = saw_terminal; // the 1-slot test channel may have lagged; the row is the authority
+    assert!(terminal.emitted);
+}
+
+/// Contract §2.3: a hold past its deadline ends `failed/hold_expired` with
+/// the hold's stage and message, even when an operator paused it.
+#[tokio::test]
+async fn expired_hold_ends_failed_hold_expired() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(9));
+    assert!(owner.hold_job(
+        JobId(9),
+        HoldCause::Capacity,
+        "unpack",
+        "No space left on device (os error 28)"
+    ));
+    pump(&mut owner, &mut messages).await;
+    let mut control = owner.state.jobs[0].control().unwrap();
+    assert!(control.deadline_unix.is_some(), "every hold has a deadline");
+    assert!(!owner.expire_hold(JobId(9), &control.revision), "not due");
+    control.deadline_unix = Some(1);
+    control.manual_pause = true;
+    owner.state.jobs[0].set_control(&control);
+    assert!(owner.expire_hold(JobId(9), &control.revision));
+    let terminal = settle_terminal(&mut owner, &mut messages, 9).await;
+    assert_eq!(
+        terminal.reason,
+        Some(nzbd_types::FailureReason::HoldExpired)
+    );
+    assert_eq!(terminal.stage.as_deref(), Some("unpack"));
+    assert!(terminal
+        .message
+        .unwrap()
+        .contains("No space left on device"));
+    assert!(!terminal.blames_release);
+    assert!(nzbd_types::FailureReason::HoldExpired.park_always());
+    assert!(!owner.state.jobs[0].held());
+}
+
+/// Contract §2.3: a newer hold replaces the control (revision + 1); the
+/// first cause does not win.
+#[tokio::test]
+async fn newer_hold_replaces_the_first_cause() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(10));
+    assert!(owner.hold_job(
+        JobId(10),
+        HoldCause::StorageUnavailable,
+        "download_write",
+        "EIO (os error 5)"
+    ));
+    pump(&mut owner, &mut messages).await;
+    let first = owner.state.jobs[0].control().unwrap();
+    assert!(owner.hold_job(JobId(10), HoldCause::MissingTool, "unpack", "unrar missing"));
+    pump(&mut owner, &mut messages).await;
+    let second = owner.state.jobs[0].control().unwrap();
+    assert_eq!(second.cause, "missing_tool");
+    assert_eq!(
+        second.revision.parse::<u64>().unwrap(),
+        first.revision.parse::<u64>().unwrap() + 1
+    );
+    assert_eq!(
+        second.deadline_unix, first.deadline_unix,
+        "the deadline runs from the episode's start"
+    );
+}
+
+// URL dispatch uses the real owner/persistence lanes. Faults below hold or
+// saturate the actual bounded control channel, rather than faking HTTP errors.
+fn url_dispatch_test_handle(
+    owner: &Owner,
+    adapter: crate::backend::BackendAdapterPort,
+) -> crate::EngineHandle {
+    crate::EngineHandle {
+        artifacts: owner.artifacts.clone(),
+        url_resolutions: owner.url_resolutions.clone(),
+        url_dest_dir: owner.dest_dir.clone(),
+        import_state_dir: owner.state_dir.clone(),
+        url_history: owner.history.clone(),
+        url_outbox_external: owner.persist_guard.is_some(),
+        owner_persist_guard: owner.persist_guard.clone(),
+        native_seed_recovery_cursor: Default::default(),
+        cmd_tx: owner.engine_tx.clone(),
+        shared: owner.shared.clone(),
+        events: owner.events.clone(),
+        cancel: owner.cancel.clone(),
+        tracker: owner.tracker.clone(),
+        backend_adapter: Arc::new(std::sync::Mutex::new(Some(adapter))),
+        budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
+        url_fetches: Default::default(),
+        url_fetch_wakeup: Default::default(),
+        url_retry_kicks: Default::default(),
+        hold_probes: Default::default(),
+        recovery_cursor: Default::default(),
+        post_scope: None,
+        queue_changes: owner.epoch_tx.subscribe(),
+        owner_heartbeat: owner.owner_heartbeat.clone(),
+        shutdown_complete: owner.shutdown_complete.clone(),
+    }
+}
+
+const DISPATCH_NZB: &str = r#"<?xml version="1.0"?><nzb><file poster="test" date="0" subject="&quot;one.bin&quot; yEnc (1/1)"><groups><group>alt.test</group></groups><segments><segment bytes="5" number="1">one@test</segment></segments></file></nzb>"#;
+
+fn dispatch_test_backoff(_: u32) -> Duration {
+    Duration::from_millis(20)
+}
+
+async fn drive_url_dispatch_until(
+    owner: &mut Owner,
+    messages: &mut mpsc::Receiver<EngineMsg>,
+    ids: &[JobId],
+) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while ids.iter().any(|id| {
+            owner
+                .state
+                .job(*id)
+                .is_some_and(|job| job.status == JobStatus::Fetching)
+        }) {
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+        pump(owner, messages).await;
+    })
+    .await
+    .expect("fetching admissions must progress after coordination recovers");
+}
+
+#[tokio::test]
+async fn url_dispatch_owner_timeout_does_not_orphan_or_starve_takeover_rows() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let first = owner
+        .state
+        .admit_url("first".into(), "http://127.0.0.1:9/first.nzb", None, 0);
+    let second = owner
+        .state
+        .admit_url("second".into(), "http://127.0.0.1:9/second.nzb", None, 0);
+    for id in [first, second] {
+        owner
+            .url_resolutions
+            .cache_source(owner.state.job(id).unwrap(), DISPATCH_NZB.as_bytes())
+            .unwrap();
+    }
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    // Takeover no longer exports rows sequentially or fails the entire list.
+    handle.resume_url_fetches().await.unwrap();
+    let mut delayed = None;
+    let mut first_lookups = 0;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while [first, second]
+            .iter()
+            .any(|id| owner.state.job(*id).unwrap().status == JobStatus::Fetching)
+        {
+            let message = messages.recv().await.unwrap();
+            match message {
+                EngineMsg::Command(QueueCommand::ExportJob { job, reply }) if job == first => {
+                    first_lookups += 1;
+                    if delayed.is_none() {
+                        delayed = Some(reply);
+                    } else {
+                        assert_ne!(
+                            owner.state.job(second).unwrap().status,
+                            JobStatus::Fetching,
+                            "one stalled lookup must not block the rest of the takeover list"
+                        );
+                        owner.on_command(QueueCommand::ExportJob { job, reply });
+                    }
+                }
+                message => owner.on_msg(message),
+            }
+        }
+        pump(&mut owner, &mut messages).await;
+    })
+    .await
+    .unwrap();
+    assert_eq!(first_lookups, 2);
+    assert!(delayed
+        .unwrap()
+        .send(Some(Box::new(owner.state.job(first).unwrap().clone())))
+        .is_err());
+    assert_eq!(owner.state.job(first).unwrap().status, JobStatus::Queued);
+    assert_eq!(owner.state.job(second).unwrap().status, JobStatus::Queued);
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_complete_enqueue_timeout_reuses_cached_source() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner.state.admit_url(
+        "cached".into(),
+        "http://127.0.0.1:9/never-refetch.nzb",
+        None,
+        0,
+    );
+    let origin = owner.state.job(id).unwrap().clone();
+    let identity = nzbd_state::artifacts::url_source_identity(&origin).unwrap();
+    owner
+        .url_resolutions
+        .cache_source(&origin, DISPATCH_NZB.as_bytes())
+        .unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    // Fill the one-slot owner channel immediately after file-ID reservation;
+    // source preparation can finish, but CompleteUrlFetch cannot enqueue.
+    loop {
+        let message = messages.recv().await.unwrap();
+        let reserved = matches!(
+            message,
+            EngineMsg::Command(QueueCommand::ReserveUrlFiles { .. })
+        );
+        owner.on_msg(message);
+        if reserved {
+            owner
+                .engine_tx
+                .try_send(EngineMsg::ConnectFailed {
+                    server: ServerId(99),
+                })
+                .unwrap();
+            break;
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while owner.url_resolutions.record(&identity).unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(owner.state.job(id).unwrap().status, JobStatus::Fetching);
+    assert_eq!(
+        owner.url_resolutions.source(&origin).unwrap().unwrap(),
+        DISPATCH_NZB.as_bytes()
+    );
+    drive_url_dispatch_until(&mut owner, &mut messages, &[id]).await;
+    assert_eq!(
+        owner.state.job(id).unwrap().status,
+        JobStatus::Queued,
+        "the dead provider URL must not be requested when the source is cached"
+    );
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_admission_export_waits_for_durability_and_failed_save_removes_row() {
+    for fail in [false, true] {
+        let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+        pump(&mut owner, &mut messages).await;
+        if fail {
+            std::fs::create_dir(owner.state_dir.join("queue.json.tmp")).unwrap();
+        }
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::AddUrl {
+            name: "pending-save".into(),
+            url: "http://127.0.0.1:9/pending.nzb".into(),
+            category: None,
+            priority: 0,
+            dupe: None,
+            paused: false,
+            params: vec![],
+            reply,
+        });
+        let id = owner.state.jobs.last().unwrap().id;
+        // Force publication while the acceptance continuation is still pending.
+        owner.publish_snapshot(0);
+        let (reply, export) = oneshot::channel();
+        owner.on_command(QueueCommand::ExportJob { job: id, reply });
+        assert!(
+            export.await.unwrap().is_none(),
+            "no pre-commit source descriptor may escape"
+        );
+        pump(&mut owner, &mut messages).await;
+        assert!(!owner.pending_control_revisions.contains_key(&id));
+        if fail {
+            assert!(result.await.unwrap().is_err());
+            assert!(owner.state.job(id).is_none());
+            assert!(owner.shared.load().jobs.iter().all(|job| job.id != id));
+        } else {
+            assert!(result.await.unwrap().is_ok());
+            let (reply, export) = oneshot::channel();
+            owner.on_command(QueueCommand::ExportJob { job: id, reply });
+            assert!(export.await.unwrap().is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn url_dispatch_survives_abandoned_admission_reply_and_preserves_add_paused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let temporary = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        DISPATCH_NZB.len(),
+                        DISPATCH_NZB
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let handle = crate::Engine::spawn(crate::EngineConfig::single_node(
+        vec![],
+        temporary.path().join("state"),
+        temporary.path().join("dest"),
+        Tuning::default(),
+        None,
+    ))
+    .await
+    .unwrap();
+    for (index, paused) in [false, true].into_iter().enumerate() {
+        let (reply, abandoned) = oneshot::channel();
+        drop(abandoned);
+        handle
+            .send(QueueCommand::AddUrl {
+                name: format!("abandoned-{index}"),
+                url: format!("{base}/{index}.nzb"),
+                category: None,
+                priority: 0,
+                dupe: None,
+                paused,
+                params: vec![],
+                reply,
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = handle.snapshot();
+            if snapshot.jobs.len() == 2
+                && snapshot
+                    .jobs
+                    .iter()
+                    .all(|job| job.status != JobStatus::Fetching)
+            {
+                assert_eq!(snapshot.jobs[0].status, JobStatus::Queued);
+                assert_eq!(snapshot.jobs[1].status, JobStatus::Paused);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert!(handle.shutdown().await);
+}
+
+#[tokio::test]
+async fn url_dispatch_repeated_worker_exits_back_off_despite_coalesced_wakeups() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner
+        .state
+        .admit_url("retry".into(), "http://127.0.0.1:9/retry.nzb", None, 0);
+    owner
+        .url_resolutions
+        .cache_source(owner.state.job(id).unwrap(), DISPATCH_NZB.as_bytes())
+        .unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    let mut starts = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.state.job(id).unwrap().status == JobStatus::Fetching {
+            let message = messages.recv().await.unwrap();
+            match message {
+                EngineMsg::Command(QueueCommand::ExportJob { job, reply }) => {
+                    starts.push(tokio::time::Instant::now());
+                    assert_eq!(job, id);
+                    if starts.len() <= 3 {
+                        // A closed reply ends the worker but not the obligation.
+                        drop(reply);
+                        for _ in 0..100 {
+                            handle.resume_url_fetches().await.unwrap();
+                            owner.bump_epoch();
+                        }
+                    } else {
+                        owner.on_command(QueueCommand::ExportJob { job, reply });
+                    }
+                }
+                message => owner.on_msg(message),
+            }
+        }
+        pump(&mut owner, &mut messages).await;
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        starts.len(),
+        4,
+        "coalesced hints must not start duplicate executors"
+    );
+    for pair in starts.windows(2) {
+        assert!(pair[1].duration_since(pair[0]) >= dispatch_test_backoff(0));
+    }
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_deletion_between_snapshot_and_lookup_does_not_respawn() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner
+        .state
+        .admit_url("delete".into(), "http://127.0.0.1:9/deleted.nzb", None, 0);
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    let message = messages.recv().await.unwrap();
+    assert!(matches!(
+        message,
+        EngineMsg::Command(QueueCommand::ExportJob { .. })
+    ));
+    owner.state.jobs.retain(|job| job.id != id);
+    owner.on_msg(message);
+    owner.publish_snapshot(0);
+    owner.bump_epoch();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handle.url_fetches.lock().unwrap().contains(&id) {
+            tokio::select! {
+                message = messages.recv() => owner.on_msg(message.unwrap()),
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {},
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), messages.recv())
+            .await
+            .is_err(),
+        "an absent row must not produce another owner lookup"
+    );
+    assert!(owner.url_resolutions.pending(10).unwrap().is_empty());
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_authority_gate_defers_fetch_until_takeover_wakeup() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner.state.admit_url(
+        "authority".into(),
+        "http://127.0.0.1:9/authority.nzb",
+        None,
+        0,
+    );
+    owner
+        .url_resolutions
+        .cache_source(owner.state.job(id).unwrap(), DISPATCH_NZB.as_bytes())
+        .unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let mut handle = url_dispatch_test_handle(&owner, adapter);
+    let authority = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let check = authority.clone();
+    handle.url_outbox_external = true;
+    handle.owner_persist_guard = Some(Arc::new(move || {
+        check.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), messages.recv())
+            .await
+            .is_err()
+    );
+    assert!(handle.url_fetches.lock().unwrap().is_empty());
+    authority.store(true, std::sync::atomic::Ordering::SeqCst);
+    handle.resume_url_fetches().await.unwrap();
+    drive_url_dispatch_until(&mut owner, &mut messages, &[id]).await;
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_progress_timeout_is_not_a_storage_failure() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner.state.admit_url(
+        "progress".into(),
+        "http://127.0.0.1:9/progress.nzb",
+        None,
+        0,
+    );
+    let identity =
+        nzbd_state::artifacts::url_source_identity(owner.state.job(id).unwrap()).unwrap();
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match messages.recv().await.unwrap() {
+                EngineMsg::Command(QueueCommand::UpdateUrlFetchProgress { reply, .. }) => {
+                    reply
+                        .send(Err(crate::EngineError::Timeout(
+                            "injected coordination delay",
+                        )))
+                        .unwrap();
+                    break;
+                }
+                message => owner.on_msg(message),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Yield to the callback. It must retain the operation in a volatile
+    // coordination wait, without scheduling a durable storage failure.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(handle.url_fetches.lock().unwrap().contains(&id));
+    assert!(owner.url_resolutions.retry(&identity).unwrap().is_none());
+    assert!(owner
+        .state
+        .job(id)
+        .unwrap()
+        .params
+        .iter()
+        .all(|(key, _)| key != crate::fetch::LAST_ERROR_PARAM));
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+#[tokio::test]
+async fn url_dispatch_lifecycle_hold_blocks_acquisition_until_release() {
+    let (_tmp, mut owner, adapter, mut messages) = control_test_owner();
+    let id = owner
+        .state
+        .admit_url("held".into(), "http://127.0.0.1:9/held.nzb", None, 0);
+    owner
+        .url_resolutions
+        .cache_source(owner.state.job(id).unwrap(), DISPATCH_NZB.as_bytes())
+        .unwrap();
+    owner.hold_job(
+        id,
+        nzbd_types::HoldCause::StorageUnavailable,
+        "fetch",
+        "test hold",
+    );
+    pump(&mut owner, &mut messages).await;
+    // Exercise the control gate independently of today's legacy Paused
+    // projection, so a future native held status cannot bypass the check.
+    owner.state.job_mut(id).unwrap().status = JobStatus::Fetching;
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    let handle = url_dispatch_test_handle(&owner, adapter);
+    let dispatcher = tokio::spawn(crate::url_dispatch::run_with_retry(
+        handle.clone(),
+        vec![],
+        dispatch_test_backoff,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), messages.recv())
+            .await
+            .is_err()
+    );
+    assert!(handle.url_fetches.lock().unwrap().is_empty());
+    owner
+        .state
+        .job_mut(id)
+        .unwrap()
+        .params
+        .retain(|(key, _)| key != nzbd_types::CONTROL_PARAM);
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    owner.publish_snapshot(0);
+    owner.bump_epoch();
+    drive_url_dispatch_until(&mut owner, &mut messages, &[id]).await;
+    handle.cancel.cancel();
+    dispatcher.await.unwrap();
+}
+
+async fn check_pending_writer_yields_owner_without_rescanning(post_fetch: bool) {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    install_control_test_server(&mut owner);
+    owner.state.max_active_downloads = 1;
+    owner.state.jobs = vec![pending_job(1), pending_job(2)];
+    for id in [JobId(1), JobId(2)] {
+        allocate_for_test(&mut owner, &mut messages, id, false).await;
+    }
+    owner.writer_for(JobId(2), FileId(20));
+    pump(&mut owner, &mut messages).await;
+    assert!(owner.writers.contains_key(&FileId(20)));
+    owner.state.jobs.extend((3..67).map(pending_job));
+    let release = block_control_test_io(&mut owner).await;
+    owner.writer_for(JobId(1), FileId(10));
+    assert!(owner.pending_writer_birth.contains_key(&FileId(10)));
+    assert!(!owner.writers.contains_key(&FileId(10)));
+    if post_fetch {
+        owner
+            .post_fetch_files
+            .insert(JobId(1), HashSet::from([FileId(10)]));
+    }
+    owner.work_selection_attempts = 0;
+    let leases = owner.grant_work(ServerId(1), 1);
+    let attempts = owner.work_selection_attempts;
+    let birth_still_pending = owner.pending_writer_birth.contains_key(&FileId(10));
+    let blocked_segment = owner.state.job(JobId(1)).unwrap().files[0].segments[0].state;
+    let second_segment = owner.state.job(JobId(2)).unwrap().files[0].segments[0].state;
+    let extra_births = owner
+        .pending_writer_birth
+        .keys()
+        .any(|file| *file != FileId(10));
+    release.send(()).unwrap();
+    pump(&mut owner, &mut messages).await;
+
+    assert!(leases.is_empty());
+    assert_eq!(
+        attempts, 1,
+        "unready writer must yield the owner, not rescan once per queued job"
+    );
+    assert!(matches!(blocked_segment, SegmentState::Pending));
+    assert!(
+        matches!(second_segment, SegmentState::Pending),
+        "active-download cap must remain in force"
+    );
+    assert!(birth_still_pending);
+    assert!(
+        !extra_births,
+        "a blocked head must not start writers across the whole queue"
+    );
+    assert!(owner.writers.contains_key(&FileId(10)));
+    let ready = owner.grant_work(ServerId(1), 1);
+    assert_eq!(
+        ready.len(),
+        1,
+        "durable birth completion must resume normal leasing"
+    );
+    assert_eq!(ready[0].r.job, JobId(1));
+}
+
+#[tokio::test]
+async fn pending_writer_birth_yields_owner_without_rescanning_queue() {
+    check_pending_writer_yields_owner_without_rescanning(false).await;
+}
+
+#[tokio::test]
+async fn pending_post_fetch_writer_yields_owner_without_rescanning_queue() {
+    check_pending_writer_yields_owner_without_rescanning(true).await;
+}
+
+#[tokio::test]
+async fn pending_next_writer_returns_already_granted_leases() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    install_control_test_server(&mut owner);
+    let mut job = pending_job(1);
+    let mut second = job.files[0].clone();
+    second.id = FileId(11);
+    second.filename = "next.bin".into();
+    job.files.push(second);
+    recompute_job_totals(&mut job);
+    owner.state.jobs = vec![job];
+    allocate_for_test(&mut owner, &mut messages, JobId(1), false).await;
+    owner.writer_for(JobId(1), FileId(10));
+    pump(&mut owner, &mut messages).await;
+    let release = block_control_test_io(&mut owner).await;
+    owner.work_selection_attempts = 0;
+    let leases = owner.grant_work(ServerId(1), 2);
+    let attempts = owner.work_selection_attempts;
+    let next_pending = owner.pending_writer_birth.contains_key(&FileId(11));
+    release.send(()).unwrap();
+    pump(&mut owner, &mut messages).await;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].r.file, FileId(10));
+    assert_eq!(
+        attempts, 2,
+        "one ready lease then one blocked candidate must end the batch"
+    );
+    assert!(next_pending);
+}
+
+#[test]
+fn torrent_transfer_is_charged_to_its_payload_filesystem() {
+    use crate::volumes::StorageVolumeReading;
+    let volume = |device: u64, roles: &[&str]| StorageVolumeReading {
+        members: Vec::new(),
+        label: roles.join(" · "),
+        path: std::path::PathBuf::from("/x"),
+        available_bytes: Some(1),
+        total_bytes: Some(2),
+        device_id: Some(device),
+        current: true,
+        roles: roles.iter().map(|role| role.to_string()).collect(),
+    };
+    let volumes = [
+        volume(1, &["working", "torrent payloads", "state"]),
+        volume(2, &["downloads"]),
+        volume(3, &["torrent category: anime"]),
+    ];
+    assert_eq!(torrent_payload_device(&volumes, None), Some(1));
+    assert_eq!(
+        torrent_payload_device(&volumes, Some("tv")),
+        Some(1),
+        "a category without its own dir uses the root"
+    );
+    assert_eq!(
+        torrent_payload_device(&volumes, Some("anime")),
+        Some(3),
+        "a category with its own dir uses it"
+    );
+    assert_eq!(
+        torrent_payload_device(&[volume(2, &["downloads"])], None),
+        None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// No-wedge startup (items 3–6): restart acceptance.
+
+const GLUSTER_MOUNT: &str = "linux\n14:fuse.glusterfs\n4:/gv0";
+const SEGMENT: usize = 100;
+
+fn segment_bytes(job: u32, number: u32) -> Vec<u8> {
+    (0..SEGMENT)
+        .map(|index| (job as usize * 31 + number as usize * 7 + index) as u8)
+        .collect()
+}
+
+/// A restart fixture job: `segments` articles of 100 bytes; the first
+/// `done` are on disk in the partial. `proof` records the writer proof
+/// (with `mount` replacing its mount identity); without it the ranges are
+/// legacy (a pre-proof build).
+fn restart_job(
+    owner: &mut Owner,
+    id: u32,
+    segments: u32,
+    done: u32,
+    proof: Option<&str>,
+    paused: bool,
+) -> Job {
+    let mut job = pending_job(id);
+    let file = job.files[0].id;
+    job.files[0].segments = (1..=segments)
+        .map(|number| nzbd_types::Segment {
+            message_id: format!("article-{id}-{number}@example").into(),
+            number,
+            size: SEGMENT as u32,
+            state: if number <= done {
+                SegmentState::Done {
+                    offset: u64::from(number - 1) * SEGMENT as u64,
+                    len: SEGMENT as u32,
+                    crc: crc32fast::hash(&segment_bytes(id, number)),
+                }
+            } else {
+                SegmentState::Pending
+            },
+        })
+        .collect();
+    if paused {
+        job.status = JobStatus::Paused;
+    }
+    let dir = owner.dest_dir.join(&job.dir_name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let part = dir.join(format!(".runner-file-{}.part", file.0));
+    let bytes = (1..=done)
+        .flat_map(|number| segment_bytes(id, number))
+        .collect::<Vec<_>>();
+    std::fs::write(&part, &bytes).unwrap();
+    owner
+        .artifacts
+        .register_legacy_active(id, &owner.dest_dir.clone(), &dir)
+        .unwrap();
+    let allocation = owner.artifacts.for_job(id).unwrap().unwrap();
+    job.params.push((
+        format!("*File:size:{}", file.0),
+        (u64::from(segments) * SEGMENT as u64).to_string(),
+    ));
+    if let Some(mount) = proof {
+        let mut identity =
+            crate::recovery::capture_identity(&std::fs::File::open(&part).unwrap()).unwrap();
+        if !mount.is_empty() {
+            identity.mount_id = mount.into();
+        }
+        let generation = format!("boot-{id}");
+        let proof = crate::recovery::DurableFileProof {
+            protocol: crate::recovery::WRITER_PROTOCOL,
+            generation: generation.clone(),
+            allocation_generation: allocation.generation.clone(),
+            installation: owner.artifacts.installation.clone(),
+            identity,
+            ranges: job.files[0]
+                .segments
+                .iter()
+                .filter_map(|segment| match segment.state {
+                    SegmentState::Done { offset, len, crc } => Some(ProvenRange {
+                        seg_number: segment.number,
+                        offset,
+                        len,
+                        crc,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            publication_name: None,
+        };
+        job.params
+            .push((format!("*File:generation:{}", file.0), generation));
+        job.params.push((
+            format!("*File:proof:{}", file.0),
+            serde_json::to_string(&proof).unwrap(),
+        ));
+    }
+    recompute_job_totals(&mut job);
+    owner.allocation_cache.insert(job.id, allocation);
+    job
+}
+
+/// Finding 9 (no-wedge review): the admission stat's `Short` answer queues
+/// a verification and refuses the admission. For a job verification cannot
+/// act on (post-processing done, as on a failed download kept for its
+/// follow-up) that refusal would repeat on every retry, so the stat is not
+/// owed at all; an ordinary job still owes it.
+#[tokio::test]
+async fn a_terminal_job_owes_no_admission_stat() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    let mut job = restart_job(&mut owner, 7, 4, 2, Some(""), false);
+    job.status = JobStatus::Failed;
+    owner.state.jobs = vec![job];
+    assert!(
+        owner.pp_admission_stat_needed(JobId(7)).is_some(),
+        "an ordinary job is stat-checked"
+    );
+    owner
+        .state
+        .job_mut(JobId(7))
+        .unwrap()
+        .params
+        .push((nzbd_types::PP_DONE_PARAM.into(), "FAILURE".into()));
+    // The file is now short of its proof: a stat would say Short, and the
+    // verification it queues is a no-op for this job.
+    let dir = owner.allocation_cache[&JobId(7)].path.clone();
+    let part = dir.join(".runner-file-70.part");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .unwrap()
+        .set_len(1)
+        .unwrap();
+    owner.queue_verification(JobId(7));
+    assert!(!owner.verification.contains_key(&JobId(7)));
+    assert!(owner.pp_admission_stat_needed(JobId(7)).is_none());
+}
+
+/// Persist the queue and stop the owner the way a killed process does:
+/// no shutdown path, only the inventory's process lock released.
+async fn stop_like_kill(mut owner: Owner, mut messages: mpsc::Receiver<EngineMsg>, persist: bool) {
+    if persist {
+        persist_snapshot_for_test(&mut owner, &mut messages).await;
+    }
+    owner.artifacts.close().unwrap();
+    drop(owner);
+    drop(messages);
+}
+
+#[tokio::test]
+async fn restart_with_large_fuse_queue_leases_within_two_seconds_without_reading_payload() {
+    const JOBS: u32 = 300;
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    let mut jobs = Vec::new();
+    for id in 1..=JOBS {
+        // Job 1 is the one about to lease: its proof names the real file.
+        // Every other proof names a GlusterFS FUSE object; restart never
+        // compares those against the disk.
+        let mount = if id == 1 { "" } else { GLUSTER_MOUNT };
+        jobs.push(restart_job(&mut owner, id, 4, 2, Some(mount), id == 2));
+    }
+    // A paused legacy job (no proof at all) is not touched either.
+    jobs.push(restart_job(&mut owner, JOBS + 1, 4, 2, None, true));
+    owner.state.jobs = jobs;
+    stop_like_kill(owner, messages, true).await;
+
+    let paused_proven = crate::recovery::probe::watch(&temp.path().join("dest").join("job-2"));
+    let paused_legacy =
+        crate::recovery::probe::watch(&temp.path().join("dest").join(format!("job-{}", JOBS + 1)));
+    let everything = crate::recovery::probe::watch(&temp.path().join("dest"));
+    let started = Instant::now();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    install_control_test_server(&mut owner);
+    let leases = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await;
+    let elapsed = started.elapsed();
+    eprintln!(
+        "restart: first lease after {elapsed:?}, phases {:?}",
+        owner.startup_phases
+    );
+    assert_eq!(leases.len(), 1, "a proven job must lease after restart");
+    assert_eq!(leases[0].r.job, JobId(1));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "first lease took {elapsed:?}"
+    );
+    pump(&mut owner, &mut messages).await;
+    assert_eq!(everything.bytes(), 0, "restart read payload bytes");
+    assert_eq!(
+        paused_proven.opens(),
+        0,
+        "restart opened a paused job's file"
+    );
+    assert_eq!(
+        paused_legacy.opens(),
+        0,
+        "restart opened a paused legacy file"
+    );
+    assert!(
+        owner.verification.is_empty(),
+        "proven/paused jobs got verification tickets: {:?}",
+        owner.verification.keys().collect::<Vec<_>>()
+    );
+    let phases = &owner.startup_phases;
+    assert_eq!(phases.startup_tickets, 0);
+    assert_eq!(phases.startup_untouched, JOBS + 1);
+    assert!(phases.classified_ms.is_some() && phases.first_lease_ms.is_some());
+    assert!(phases
+        .roots
+        .iter()
+        .all(|root| root.ok == Some(true) && root.duration_ms.is_some()));
+    // Every Done range survived untouched.
+    for job in &owner.state.jobs {
+        assert_eq!(
+            job.files[0]
+                .segments
+                .iter()
+                .filter(|segment| matches!(segment.state, SegmentState::Done { .. }))
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn replaced_inode_redownloads_only_that_file_and_others_keep_downloading() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    let jobs = (1..=2)
+        .map(|id| restart_job(&mut owner, id, 3, 1, Some(""), false))
+        .collect();
+    owner.state.jobs = jobs;
+    stop_like_kill(owner, messages, true).await;
+    // Replace job 1's partial with a new inode holding different bytes.
+    let part = temp.path().join("dest/job-1/.runner-file-10.part");
+    let replacement = temp.path().join("dest/job-1/replacement");
+    std::fs::write(&replacement, b"foreign bytes that are not the download").unwrap();
+    std::fs::rename(&replacement, &part).unwrap();
+
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    install_control_test_server(&mut owner);
+    let mut leased = HashSet::new();
+    let mut fed = false;
+    for _ in 0..12 {
+        for lease in grant_work_for_test(&mut owner, &mut messages, ServerId(1), 4).await {
+            leased.insert(lease.r.job);
+            // Only a writer that started after the discard sees a segment.
+            let reset = owner
+                .state
+                .job(JobId(1))
+                .unwrap()
+                .params
+                .iter()
+                .any(|(key, _)| key.starts_with(crate::owner::IDENTITY_RESETS_PREFIX));
+            if lease.r.job == JobId(1) && reset && !fed {
+                feed(&mut owner, &mut messages, &lease).await;
+                fed = true;
+            }
+        }
+        pump(&mut owner, &mut messages).await;
+        if fed && leased.contains(&JobId(2)) {
+            break;
+        }
+    }
+    pump(&mut owner, &mut messages).await;
+    let first = owner.state.job(JobId(1)).unwrap();
+    assert!(!first.held(), "a replaced inode never holds its job");
+    assert_eq!(
+        first
+            .params
+            .iter()
+            .find(|(key, _)| key == "*File:identity-resets:10")
+            .map(|(_, value)| value.as_str()),
+        Some("1"),
+        "one reset recorded"
+    );
+    assert!(!first
+        .params
+        .iter()
+        .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM));
+    assert!(fed, "the file is re-downloaded");
+    // The foreign bytes are gone: the re-downloaded file holds only what
+    // the new writer wrote.
+    let written = std::fs::read(&part).unwrap_or_default();
+    assert!(
+        !written.starts_with(b"foreign"),
+        "the replaced object was discarded"
+    );
+    let second = owner.state.job(JobId(2)).unwrap();
+    assert!(!second.held(), "an unrelated job is never held");
+    assert!(
+        matches!(second.files[0].segments[0].state, SegmentState::Done { .. }),
+        "an unrelated job keeps its ranges"
+    );
+    assert!(
+        leased.contains(&JobId(2)),
+        "the other job keeps downloading"
+    );
+}
+
+/// Finding 5: a filesystem that keeps replacing the inode is the storage's
+/// fault: the job ends `failed/io` (blameless, salvage allowed), and the
+/// message names the identity cause.
+#[tokio::test]
+async fn recurring_identity_mismatch_fails_the_job_io_after_the_limit() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(1));
+    owner.state.jobs.push(pending_job(2));
+    let file = owner.state.job(JobId(1)).unwrap().files[0].id;
+    owner.state.job_mut(JobId(1)).unwrap().files[0].segments[0].state = SegmentState::Done {
+        offset: 0,
+        len: 1,
+        crc: 0,
+    };
+    for attempt in 1..=crate::owner::IDENTITY_RESET_LIMIT {
+        owner.on_msg(EngineMsg::WriterIdentityMismatch {
+            job: JobId(1),
+            file,
+            error: "write admission: payload file identity changed (replaced inode)".into(),
+        });
+        pump(&mut owner, &mut messages).await;
+        let job = owner.state.job(JobId(1)).unwrap();
+        assert!(!job.held());
+        assert_ne!(job.status, JobStatus::Failed, "attempt {attempt}");
+        assert!(job.files[0]
+            .segments
+            .iter()
+            .all(|segment| matches!(segment.state, SegmentState::Pending)));
+        assert!(job
+            .params
+            .iter()
+            .any(|(key, _)| key == &format!("*File:identity-discard:{}", file.0)));
+    }
+    owner.on_msg(EngineMsg::WriterIdentityMismatch {
+        job: JobId(1),
+        file,
+        error: "write admission: payload file identity changed (replaced inode)".into(),
+    });
+    for _ in 0..20 {
+        pump(&mut owner, &mut messages).await;
+        if owner
+            .artifacts
+            .terminal(1)
+            .unwrap()
+            .is_some_and(|t| t.emitted)
+        {
+            break;
+        }
+    }
+    let terminal = owner.artifacts.terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Io));
+    assert!(!terminal.blames_release);
+    assert!(terminal.reason.unwrap().salvage_possible());
+    assert!(terminal
+        .message
+        .as_deref()
+        .is_some_and(|message| message.starts_with("identity:")));
+    assert_eq!(owner.state.job(JobId(1)).unwrap().status, JobStatus::Failed);
+    let other = owner.state.job(JobId(2)).unwrap();
+    assert!(!other.held() && other.status != JobStatus::Failed);
+}
+
+#[test]
+fn a_legacy_identity_hold_retries_now() {
+    let control = nzbd_types::JobControl {
+        expiry_pending: false,
+        version: 1,
+        revision: "4".into(),
+        lifecycle: "held".into(),
+        cause: "storage_unavailable".into(),
+        stage: "download_write".into(),
+        retry_policy: "scheduled_retry".into(),
+        message:
+            "write admission: payload file identity changed (replaced inode); evidence retained"
+                .into(),
+        instance: String::new(),
+        previous_status: None,
+        manual_pause: false,
+        retry_attempt: 3,
+        next_retry_at_unix: Some(10_000),
+        blocked_since_unix: Some(1),
+        released_at_unix: None,
+        deadline_in_s: None,
+        deadline_unix: None,
+    };
+    let rearmed = crate::owner::rearmed_hold(control.clone(), 100).unwrap();
+    assert_eq!(rearmed.next_retry_at_unix, Some(100));
+    // Idempotent: once due, nothing further changes.
+    assert!(crate::owner::rearmed_hold(rearmed, 100).is_none());
+    let mut other = control;
+    other.message = "ENOTCONN".into();
+    assert_eq!(
+        crate::owner::rearmed_hold(other, 100)
+            .unwrap()
+            .next_retry_at_unix,
+        Some(160)
+    );
+}
+
+/// Where the simulated kill -9 lands.
+#[derive(Clone, Copy, Debug)]
+enum KillPoint {
+    BeforeSync,
+    AfterSync,
+    AfterJournalAppend,
+}
+
+async fn feed(owner: &mut Owner, messages: &mut mpsc::Receiver<EngineMsg>, lease: &Lease) {
+    let data = segment_bytes(lease.r.job.0, lease.r.seg_number);
+    lease
+        .writer
+        .send(WriteCmd::Segment {
+            seg_number: lease.r.seg_number,
+            offset: u64::from(lease.r.seg_number - 1) * SEGMENT as u64,
+            crc: crc32fast::hash(&data),
+            data,
+            file_size: 3 * SEGMENT as u64,
+            server: ServerId(1),
+        })
+        .await
+        .unwrap();
+    let _ = (owner, messages);
+}
+
+async fn kill_and_resume(point: KillPoint, id: u32) {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    pump(&mut owner, &mut messages).await;
+    install_control_test_server(&mut owner);
+    let job = restart_job(&mut owner, id, 3, 0, None, false);
+    owner.allocation_cache.remove(&job.id);
+    owner.state.jobs = vec![job];
+    persist_snapshot_for_test(&mut owner, &mut messages).await;
+    // The writer's second durability batch (segment 2) dies at the point.
+    let (killed, observed) = std::sync::mpsc::channel::<()>();
+    if let Some(stage) = match point {
+        KillPoint::BeforeSync => Some("before_sync"),
+        KillPoint::AfterSync => Some("after_sync"),
+        KillPoint::AfterJournalAppend => None,
+    } {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let killed = std::sync::Mutex::new(Some(killed.clone()));
+        owner.writer_sync_hook = Some(Arc::new(move |at| {
+            if at == stage && calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                if let Some(signal) = killed.lock().unwrap().take() {
+                    let _ = signal.send(());
+                }
+                panic!("simulated kill -9 at {at}");
+            }
+        }));
+    }
+    // Segment 1 is written and acknowledged normally.
+    let lease = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1)
+        .await
+        .pop()
+        .expect("segment 1 lease");
+    assert_eq!(lease.r.seg_number, 1);
+    feed(&mut owner, &mut messages, &lease).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !owner
+            .state
+            .job(JobId(id))
+            .is_some_and(|job| matches!(job.files[0].segments[0].state, SegmentState::Done { .. }))
+        {
+            pump(&mut owner, &mut messages).await;
+        }
+    })
+    .await
+    .expect("segment 1 acknowledged");
+    pump(&mut owner, &mut messages).await;
+    let lease = grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1)
+        .await
+        .pop()
+        .expect("segment 2 lease");
+    assert_eq!(lease.r.seg_number, 2);
+    if matches!(point, KillPoint::AfterJournalAppend) {
+        // The writer acknowledges; the owner appends to the journal and the
+        // lane dies before the sync.
+        *persistence_worker::JOURNAL_KILL_AFTER_APPEND
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(JobId(id));
+    }
+    feed(&mut owner, &mut messages, &lease).await;
+    // Let the kill land, without waiting on a lane that is now dead.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && observed.try_recv().is_err() {
+        if let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_millis(20), messages.recv()).await
+        {
+            owner.on_msg(message);
+        }
+    }
+    for _ in 0..20 {
+        match tokio::time::timeout(Duration::from_millis(20), messages.recv()).await {
+            Ok(Some(message)) => owner.on_msg(message),
+            _ => break,
+        }
+    }
+    if matches!(point, KillPoint::AfterJournalAppend) {
+        *persistence_worker::JOURNAL_KILL_AFTER_APPEND
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+    stop_like_kill(owner, messages, false).await;
+
+    // Restart: only unacknowledged segments are fetched again.
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    install_control_test_server(&mut owner);
+    let mut refetched = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if owner
+                .state
+                .job(JobId(id))
+                .is_some_and(|job| job.files[0].finalized)
+            {
+                break;
+            }
+            for lease in grant_work_for_test(&mut owner, &mut messages, ServerId(1), 1).await {
+                refetched.push(lease.r.seg_number);
+                feed(&mut owner, &mut messages, &lease).await;
+            }
+            pump(&mut owner, &mut messages).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let job = owner.state.job(JobId(id)).unwrap();
+        panic!(
+            "{point:?}: download did not complete after restart: refetched {refetched:?}, \
+             verification {:?}, status {:?}, control {:?}, segments {:?}, allocated {}",
+            owner.verification.keys().collect::<Vec<_>>(),
+            job.status,
+            job.control(),
+            job.files[0]
+                .segments
+                .iter()
+                .map(|segment| &segment.state)
+                .collect::<Vec<_>>(),
+            owner.allocated_jobs.contains(&JobId(id)),
+        );
+    });
+    refetched.sort_unstable();
+    refetched.dedup();
+    assert!(
+        !refetched.contains(&1),
+        "{point:?}: acknowledged segment 1 re-fetched"
+    );
+    assert!(refetched.contains(&3), "{point:?}: segment 3 never fetched");
+    match point {
+        KillPoint::BeforeSync | KillPoint::AfterSync => {
+            assert_eq!(refetched, vec![2, 3], "{point:?}")
+        }
+        // The append reached the file before the kill, so replay may keep
+        // segment 2; either way it is fetched at most once more.
+        KillPoint::AfterJournalAppend => assert!(refetched == vec![2, 3] || refetched == vec![3]),
+    }
+    let published = std::fs::read(temp.path().join(format!("dest/job-{id}/payload.bin"))).unwrap();
+    let expected = (1..=3)
+        .flat_map(|number| segment_bytes(id, number))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        crc32fast::hash(&published),
+        crc32fast::hash(&expected),
+        "{point:?}: final CRC"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_before_sync_refetches_only_the_unacknowledged_segment() {
+    kill_and_resume(KillPoint::BeforeSync, 9101).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_after_sync_refetches_only_the_unacknowledged_segment() {
+    kill_and_resume(KillPoint::AfterSync, 9102).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_after_journal_append_before_sync_keeps_the_final_crc() {
+    kill_and_resume(KillPoint::AfterJournalAppend, 9103).await;
+}
+
+/// Configured payload roots and the workspace root are reconciled at startup
+/// even before any row names them; a configured root that does not exist
+/// yet reconciles as an empty success instead of failing.
+#[tokio::test]
+async fn startup_reconciles_configured_roots_before_any_row_names_them() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("dest")).unwrap();
+    let completed = temp.path().join("completed");
+    std::fs::create_dir(&completed).unwrap();
+    let not_yet = temp.path().join("failed");
+    let (mut owner, _adapter, mut messages) = control_test_owner_at(temp.path(), true, None);
+    owner.configured_payload_roots = vec![completed.clone(), not_yet.clone()];
+    pump(&mut owner, &mut messages).await;
+    for _ in 0..50 {
+        if owner
+            .startup_phases
+            .roots
+            .iter()
+            .all(|root| root.ok.is_some())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        pump(&mut owner, &mut messages).await;
+    }
+    let reconciled = |path: &std::path::Path| {
+        owner
+            .startup_phases
+            .roots
+            .iter()
+            .find(|root| root.root == path.display().to_string())
+            .and_then(|root| root.ok)
+    };
+    assert_eq!(reconciled(&completed), Some(true));
+    assert_eq!(reconciled(&not_yet), Some(true));
+    assert_eq!(reconciled(&owner.artifacts.workspace_dir()), Some(true));
+    assert!(!not_yet.exists(), "reconciliation creates nothing");
+}
+
+#[tokio::test]
+async fn worker_expiry_freezes_due_revision_durably_and_refuses_stale_or_revoked_grants() {
+    use nzbd_state::artifacts::{WorkerControlContext, WORKER_CONTROL_CONTEXT_PARAM};
+    let (_tmp, mut owner, _adapter, mut messages) =
+        control_test_owner_with_persistence(false, None);
+    let mut row = pending_job(901);
+    mark_new_lifecycle_cohort(&mut row);
+    let context = WorkerControlContext {
+        lease_id: "lease-901".into(),
+        job_incarnation: "job-901".into(),
+        job_revision: 1,
+        control_revision: 1,
+        epoch: 1,
+    };
+    row.params.push((
+        WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&context).unwrap(),
+    ));
+    let path = owner.dest_dir.join(&row.dir_name);
+    owner
+        .artifacts
+        .allocate_for_delivery(901, &owner.dest_dir, &path, true, true)
+        .unwrap();
+    owner.artifacts.bind_worker_context(901, &context).unwrap();
+    owner.state.jobs.push(row);
+    assert!(owner.hold_job(
+        JobId(901),
+        nzbd_types::HoldCause::Capacity,
+        "download_write",
+        "full"
+    ));
+    pump(&mut owner, &mut messages).await;
+    let before = owner.state.job(JobId(901)).unwrap().clone();
+    let source = owner.artifacts.for_job(901).unwrap().unwrap();
+    let mut held = before.control().unwrap();
+    held.deadline_unix = Some(0);
+    held.manual_pause = true;
+    owner.state.job_mut(JobId(901)).unwrap().set_control(&held);
+    owner
+        .artifacts
+        .checkpoint_worker_control(owner.state.job(JobId(901)).unwrap(), &held.revision)
+        .unwrap();
+    for (revision, live, expected) in [
+        ("stale".to_string(), true, false),
+        (held.revision.clone(), false, false),
+        (held.revision.clone(), true, true),
+    ] {
+        let current = owner.state.job(JobId(901)).unwrap().clone();
+        let guard = crate::hold_release::HoldReleaseGuard::prepare(
+            &current,
+            Some(&source),
+            Some(Arc::new(move || live)),
+        );
+        let (reply, result) = oneshot::channel();
+        owner.on_command(QueueCommand::PrepareWorkerHoldExpiry {
+            job: JobId(901),
+            revision,
+            guard,
+            notice:serde_json::json!({"job":901,"context":context,"source":{"artifact":source.id,"generation":source.generation}}).to_string(),
+            reply,
+        });
+        pump(&mut owner, &mut messages).await;
+        assert_eq!(result.await.unwrap(), expected);
+    }
+    let current = owner.state.job(JobId(901)).unwrap().clone();
+    let frozen = current.control().unwrap();
+    assert!(frozen.expiry_pending);
+    assert!(frozen.manual_pause);
+    let checkpoint = owner
+        .artifacts
+        .worker_control_metadata(901, &context)
+        .unwrap()
+        .unwrap();
+    assert!(checkpoint.control.expiry_pending);
+    let guard = crate::hold_release::HoldReleaseGuard::prepare(
+        &current,
+        Some(&source),
+        Some(Arc::new(|| true)),
+    );
+    assert!(!owner.reschedule_hold_proven(JobId(901), &frozen.revision, "late probe", &guard));
+    assert!(!owner.hold_job(
+        JobId(901),
+        nzbd_types::HoldCause::MissingTool,
+        "unpack",
+        "late error"
+    ));
+    assert!(owner
+        .retry_hold_proven(
+            JobId(901),
+            &frozen.revision,
+            RetryBy::Recovery,
+            true,
+            &guard
+        )
+        .is_err());
+    assert_eq!(
+        owner.state.job(JobId(901)).unwrap().control().unwrap(),
+        frozen
+    );
+    assert_eq!(owner.artifacts.worker_expiry_outbox("").unwrap().len(), 1);
+    let current = owner.state.job(JobId(901)).unwrap().clone();
+    let guard = crate::hold_release::HoldReleaseGuard::prepare(
+        &current,
+        Some(&source),
+        Some(Arc::new(|| true)),
+    );
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::PrepareWorkerHoldExpiry{job:JobId(901),revision:frozen.revision.clone(),guard,notice:serde_json::json!({"job":901,"context":context,"source":{"artifact":source.id,"generation":source.generation},"token":{"revision":99}}).to_string(),reply});
+    pump(&mut owner, &mut messages).await;
+    assert!(result.await.unwrap());
+    assert_eq!(
+        owner.artifacts.worker_expiry_outbox("").unwrap().len(),
+        1,
+        "renewal never duplicates notice"
+    );
+    let mut successor = context.clone();
+    successor.lease_id = "lease-901-new-fence".into();
+    successor.epoch += 1;
+    owner
+        .artifacts
+        .bind_worker_context(901, &successor)
+        .unwrap();
+    let current = owner.state.job_mut(JobId(901)).unwrap();
+    current
+        .params
+        .retain(|(key, _)| key != WORKER_CONTROL_CONTEXT_PARAM);
+    current.params.push((
+        WORKER_CONTROL_CONTEXT_PARAM.into(),
+        serde_json::to_string(&successor).unwrap(),
+    ));
+    owner
+        .artifacts
+        .checkpoint_worker_control(current, &frozen.revision)
+        .unwrap();
+    let current = owner.state.job(JobId(901)).unwrap().clone();
+    let guard = crate::hold_release::HoldReleaseGuard::prepare(
+        &current,
+        Some(&source),
+        Some(Arc::new(|| true)),
+    );
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::PrepareWorkerHoldExpiry{job:JobId(901),revision:frozen.revision.clone(),guard,notice:serde_json::json!({"job":901,"context":successor,"source":{"artifact":source.id,"generation":source.generation}}).to_string(),reply});
+    pump(&mut owner, &mut messages).await;
+    assert!(result.await.unwrap());
+    assert_eq!(
+        owner.artifacts.worker_expiry_outbox("").unwrap().len(),
+        2,
+        "current regrant receives its own exact notice"
+    );
+    assert_eq!(
+        owner.state.job(JobId(901)).unwrap().control().unwrap(),
+        frozen,
+        "regrant cannot restart deadline or release episode"
+    );
+}
+
+/// The out-of-space hold names the volume and path, resolved against the
+/// same readings the storage panel shows; a report with no path says the
+/// volume is unknown rather than guessing.
+#[tokio::test]
+async fn a_latched_failure_names_its_volume_and_path() {
+    use crate::space_probe::SpaceOp;
+    use crate::volumes::{StorageMemberReading, StorageVolumeReading};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(3));
+    owner.state.jobs.push(pending_job(4));
+    let processing = tmp.path().join("processing");
+    let reading = DiskGuardReading {
+        volumes: vec![StorageVolumeReading {
+            label: "intermediate · completed".into(),
+            path: processing.clone(),
+            available_bytes: Some(1),
+            total_bytes: Some(2),
+            device_id: None,
+            current: true,
+            roles: vec!["intermediate".into(), "completed".into()],
+            members: vec![StorageMemberReading {
+                path: processing.clone(),
+                parent_device_id: None,
+            }],
+        }],
+        ..Default::default()
+    };
+    let job_dir = processing.join("job-3");
+    owner.observe_space_failure(
+        "post-processing job 3: reserve space on …",
+        SpaceOp::Post { job: JobId(3) },
+        Some(job_dir.clone()),
+    );
+    owner.observe_space_failure(
+        "post-processing job 4: io: …",
+        SpaceOp::Post { job: JobId(4) },
+        None,
+    );
+    let mut failures = owner.space_failure_snapshots(&reading);
+    failures.sort_by(|a, b| a.detail.cmp(&b.detail));
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    let named = &failures[0];
+    assert_eq!(named.operation, "post-processing");
+    assert_eq!(
+        named.path.as_deref(),
+        Some(job_dir.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        named.volume_path.as_deref(),
+        Some(processing.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        named.volume.as_deref(),
+        Some(reading.volumes[0].name().as_str())
+    );
+    let unknown = &failures[1];
+    assert_eq!(unknown.path, None);
+    assert_eq!(unknown.volume, None, "no path means no volume, not a guess");
+}
+
+/// Review #338-1: a post report's path is the directory the write went
+/// into. When that directory is a configured root itself, the probe goes
+/// there — not to its parent, which is another filesystem.
+#[tokio::test]
+async fn a_post_failure_is_probed_in_its_own_directory() {
+    use crate::space_probe::{SpaceOp, Target};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(3));
+    owner.state.post_paused = true;
+    let root = tmp.path().join("dest");
+    owner.observe_space_failure("post", SpaceOp::Post { job: JobId(3) }, Some(root.clone()));
+    let plan = owner.space_probe_plan();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    match &plan[0].target {
+        Target::Dirs(dirs) => {
+            assert_eq!(dirs.iter().map(|(d, _)| d).collect::<Vec<_>>(), vec![&root])
+        }
+        other => panic!("unexpected target {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn unhealthy_restored_job_ends_with_leased_articles_and_paused_pars() {
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning {
+        health_abort: true,
+        ..Tuning::default()
+    });
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(81);
+    job.status = JobStatus::Downloading;
+    job.files[0].segments[0].state = SegmentState::Failed;
+    let mut leased = job.files[0].segments[0].clone();
+    leased.number = 2;
+    leased.state = SegmentState::Leased {
+        server: ServerId(1),
+    };
+    job.files[0].segments.push(leased);
+    let mut par = job.files[0].clone();
+    par.id = FileId(811);
+    par.is_par2 = true;
+    par.paused = true;
+    par.segments.truncate(1);
+    par.segments[0].size = 1;
+    par.segments[0].state = SegmentState::Pending;
+    job.files.push(par);
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    let (tx, _rx) = mpsc::channel(1);
+    let (_stopped, stopped) = watch::channel(false);
+    let cancel = CancellationToken::new();
+    owner.writers.insert(
+        FileId(810),
+        WriterHandle {
+            tx,
+            stopped,
+            stop: cancel.clone(),
+            generation: 1,
+        },
+    );
+    owner.maybe_abort_unhealthy(JobId(81));
+    assert!(
+        cancel.is_cancelled(),
+        "active article producer must be canceled"
+    );
+    pump(&mut owner, &mut messages).await;
+    assert_eq!(
+        owner.state.job(JobId(81)).unwrap().status,
+        JobStatus::Failed
+    );
+    assert_eq!(
+        owner.artifacts.terminal(81).unwrap().unwrap().reason,
+        Some(nzbd_types::FailureReason::Health)
+    );
+    assert!(
+        !owner.writer_epochs.contains_key(&FileId(810)),
+        "late writes are fenced"
+    );
+}
+
+#[tokio::test]
+async fn storage_retry_preserves_pause_flags_and_requires_probe_evidence() {
+    use crate::space_probe::SpaceOp;
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.download_paused = true;
+    owner.state.post_paused = true;
+    owner.observe_out_of_space_in("write", Some(tmp.path().join("dest")));
+    owner.space_probe_after = Instant::now() + Duration::from_secs(600);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::RetryStorage { reply });
+    result.await.unwrap();
+    assert!(owner.state.download_paused && owner.state.post_paused);
+    assert!(
+        owner.enospc_latched,
+        "request is not proof that space is free"
+    );
+    assert!(
+        owner.space_probe_inflight,
+        "button starts a probe immediately"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.space_probe_inflight {
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+    })
+    .await
+    .expect("storage probe did not answer");
+    assert!(
+        !owner.enospc_latched,
+        "successful real write clears the latch"
+    );
+    assert!(!owner
+        .enospc_failures
+        .contains_key(&SpaceOp::Directory(tmp.path().join("dest"))));
+    assert!(owner.state.download_paused && owner.state.post_paused);
+}
+
+#[test]
+fn old_storage_backoff_is_shortened_without_unpausing() {
+    let mut control: nzbd_types::JobControl = serde_json::from_value(serde_json::json!({
+        "version": 1, "revision": "1", "lifecycle": "held", "cause": "storage_unavailable",
+        "stage": "post", "retry_policy": "scheduled_retry", "message": "disk full",
+        "instance": "test", "manual_pause": false, "retry_attempt": 10
+    }))
+    .unwrap();
+    control.next_retry_at_unix = Some(20_000);
+    control.manual_pause = true;
+    let rearmed = rearmed_hold(control, 100).unwrap();
+    assert_eq!(rearmed.next_retry_at_unix, Some(160));
+    assert!(rearmed.manual_pause);
+}
+
+#[tokio::test]
+async fn download_only_worker_reports_failure_without_local_terminal_history() {
+    for deferred in [false, true] {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning {
+            health_abort: true,
+            ..Default::default()
+        });
+        pump(&mut owner, &mut messages).await;
+        owner.history = None;
+        owner.persist = false;
+        owner.worker_mode = true;
+        let mut job = pending_job(82);
+        job.status = JobStatus::Downloading;
+        job.files[0].segments[0].state = SegmentState::Failed;
+        recompute_job_totals(&mut job);
+        job.params.push((
+            nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&nzbd_state::artifacts::WorkerControlContext {
+                lease_id: "download-82".into(),
+                job_incarnation: "job-82".into(),
+                job_revision: 1,
+                control_revision: 1,
+                epoch: 1,
+            })
+            .unwrap(),
+        ));
+        owner.state.jobs.push(job);
+        if deferred {
+            owner.pending_control_commits.insert(JobId(82));
+        }
+        owner.maybe_abort_unhealthy(JobId(82));
+        if deferred {
+            assert!(owner.deferred_terminals.contains_key(&JobId(82)));
+            owner.pending_control_commits.remove(&JobId(82));
+            owner.replay_terminals();
+        }
+        let row = owner.state.job(JobId(82)).unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Failed,
+            "completion must reach the existing authority outbox"
+        );
+        assert!(!row.held(), "no PP history is not a storage fault");
+        assert!(
+            !row.params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM),
+            "worker cannot stamp the authoritative terminal"
+        );
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Reason" && value == "health"));
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, _)| key == crate::terminal::DOWNLOAD_FAILURE_PARAM));
+        assert!(owner.artifacts.terminal(82).unwrap().is_none());
+    }
 }

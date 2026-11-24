@@ -1,4 +1,4 @@
-//! Seq-stamped engine events with a replay ring (INTEGRATION_PLAN N2).
+//! Seq-stamped engine events with a replay ring (`docs/archive/INTEGRATION_PLAN.md` N2; the wire contract is `docs/INTEGRATION.md` §2).
 //!
 //! The engine's broadcast channel is lossy by design: a slow subscriber is
 //! dropped rather than allowed to stall the queue owner. That is the right

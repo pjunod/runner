@@ -70,22 +70,16 @@ fn digest(file: &mut File) -> Result<String> {
 /// 2026-09-28: a 46.8 GiB staging copy across two network mounts ran for 24
 /// minutes and then recorded "filesystem: Invalid argument (os error 22)" —
 /// no operation, no path, nothing to act on.
+/// The original error stays its `source()`, so its errno still decides a
+/// hold (`crate::io_context`).
 fn at<T>(r: std::io::Result<T>, op: &str, path: &Path) -> Result<T> {
-    r.map_err(|e| {
-        Error::Io(std::io::Error::new(
-            e.kind(),
-            format!("{op} {}: {e}", path.display()),
-        ))
-    })
+    r.map_err(|e| Error::Io(crate::io_context(e, format!("{op} {}", path.display()))))
 }
 
 /// Same, for a step that already returns this module's `Result`.
 fn at_dir<T>(r: Result<T>, op: &str, path: &Path) -> Result<T> {
     r.map_err(|e| match e {
-        Error::Io(io) => Error::Io(std::io::Error::new(
-            io.kind(),
-            format!("{op} {}: {io}", path.display()),
-        )),
+        Error::Io(io) => Error::Io(crate::io_context(io, format!("{op} {}", path.display()))),
         other => other,
     })
 }
@@ -223,6 +217,29 @@ impl Inventory {
         paths: &[String],
         root: &Path,
     ) -> Result<Recovery> {
+        // An operator's recovery copy serializes behind a maintenance pass's
+        // momentary reconciliation lease on the source instead of failing
+        // against it; the wait happens outside the mutation guard, which
+        // the lease's release needs.
+        loop {
+            if let Ok(source) = self.get(key) {
+                self.wait_reconciliation_released(&source);
+            }
+            match self.stage_recovery_once(key, revision, request_id, paths, root) {
+                Err(Error::Conflict(reason)) if reason == RECOVERY_SOURCE_IN_USE => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn stage_recovery_once(
+        &self,
+        key: &str,
+        revision: u64,
+        request_id: &str,
+        paths: &[String],
+        root: &Path,
+    ) -> Result<Recovery> {
         let source_lease;
         let mut guard = Some(self.mutation_guard()?);
         if paths.is_empty() || paths.len() > 1000 || request_id.is_empty() || request_id.len() > 128
@@ -270,9 +287,23 @@ impl Inventory {
                 "recovery root overlaps source or state".into(),
             ));
         }
-        source_lease = self
-            .reserve_reconciliation_locked(std::slice::from_ref(&a), None, guard.as_ref().unwrap())?
-            .ok_or_else(|| Error::Conflict("recovery source remains in use".into()))?;
+        source_lease = match self.reserve_reconciliation_locked(
+            std::slice::from_ref(&a),
+            None,
+            guard.as_ref().unwrap(),
+        )? {
+            Some(lease) => lease,
+            // Only a maintenance lease is waited out (`stage_recovery`); a
+            // processing attempt or a changed generation is a refusal.
+            None if self.reconciliation_in_use(&a) => {
+                return Err(Error::Conflict(RECOVERY_SOURCE_IN_USE.into()))
+            }
+            None => {
+                return Err(Error::Conflict(
+                    "recovery source is in use by processing or changed; inspect again".into(),
+                ))
+            }
+        };
         drop(guard.take());
         let source = self.verify(&a)?;
         let observed = fs::manifest(&source, 100_000)?;
@@ -824,7 +855,6 @@ impl Inventory {
         let mut a = self.get(&r.artifact)?;
         if complete {
             a.hold = None;
-            a.eligible_seconds = 0;
             a.deadline = Some(now().saturating_add(a.retention_seconds as i64));
             // Unselected media is never implicitly authorized for expiry.
             if a.files.iter().filter(|f| !f.identity.directory).count() != r.files.len() {
@@ -839,7 +869,6 @@ impl Inventory {
             staged.state = "recovery_imported".into();
             staged.hold = None;
             staged.deadline = Some(now() + 86400);
-            staged.eligible_seconds = 0;
             staged.revision += 1;
             save_artifact(&tx, &staged)?;
         }
@@ -1057,3 +1086,5 @@ impl Inventory {
         Ok(())
     }
 }
+
+const RECOVERY_SOURCE_IN_USE: &str = "recovery source remains in use";

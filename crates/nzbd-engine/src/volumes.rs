@@ -264,6 +264,132 @@ pub struct StorageVolumeReading {
     /// present, are conservative last-known data retained after a timeout or
     /// inaccessible path.
     pub current: bool,
+    /// The configured roles on this filesystem, one entry per role as
+    /// `Config::storage_roots` names them (`label` is these joined with
+    /// ` · `, which cannot be split back safely: a category name may
+    /// contain ` · ` itself).
+    pub roles: Vec<String>,
+    /// The configured roots on this filesystem, each as measured. `path`
+    /// is their common path, which for two bind mounts of one filesystem
+    /// (`/downloads`, `/media`) is another filesystem (`/`): anything that
+    /// stats the volume uses a member root instead.
+    pub members: Vec<StorageMemberReading>,
+}
+
+/// The volume holding `path` and the configured root it is under: the
+/// deepest member root that contains it (a volume with no members is its
+/// own root). `None` when no configured root contains the path.
+pub fn volume_containing<'a>(
+    volumes: &'a [StorageVolumeReading],
+    path: &Path,
+) -> Option<(&'a StorageVolumeReading, &'a Path)> {
+    volumes
+        .iter()
+        .flat_map(|volume| {
+            let roots: Vec<&Path> = if volume.members.is_empty() {
+                vec![volume.path.as_path()]
+            } else {
+                volume
+                    .members
+                    .iter()
+                    .map(|member| member.path.as_path())
+                    .collect()
+            };
+            roots.into_iter().map(move |root| (volume, root))
+        })
+        .filter(|(_, root)| !root.as_os_str().is_empty() && path.starts_with(root))
+        .max_by_key(|(_, root)| root.components().count())
+}
+
+/// One configured root of a [`StorageVolumeReading`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageMemberReading {
+    pub path: PathBuf,
+    /// The device of the filesystem holding the root's parent directory:
+    /// what the root shows when its own volume is not mounted.
+    pub parent_device_id: Option<u64>,
+}
+
+impl StorageMemberReading {
+    fn measure(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            parent_device_id: path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .and_then(nearest_existing_ancestor)
+                .and_then(|parent| filesystem_device_id(&parent)),
+        }
+    }
+}
+
+impl StorageVolumeReading {
+    /// What the dashboard names the row: processing, completed, or both.
+    pub fn name(&self) -> String {
+        self.roles
+            .iter()
+            .fold(StorageKinds::default(), |kinds, role| {
+                kinds.union(StorageKinds::of_role(role))
+            })
+            .name(&self.label)
+    }
+
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|candidate| candidate == role)
+    }
+}
+
+/// How role labels are joined, here and in `Config::storage_roots` (which
+/// merges roles that share an exact path into one root). Splitting on it
+/// recovers the roles; a category whose own name contains it would be split
+/// too, which only matters if that category's directory is also on a
+/// different filesystem from the torrent root.
+const ROLE_JOIN: &str = " · ";
+
+/// What a filesystem holds, from the roles of the configured paths on it.
+///
+/// `label` keeps the exact roles (`state · working · failed`) because the
+/// disk guard, its log lines and the file-lifecycle code key on them. The
+/// dashboard instead names a filesystem by the one thing an operator cares
+/// about: is this where jobs are worked on, or where finished jobs land?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageKinds {
+    pub processing: bool,
+    pub completed: bool,
+}
+
+impl StorageKinds {
+    /// Classify one role label as produced by `Config::storage_roots`.
+    /// Finished output (the downloads directory and category destinations)
+    /// is "completed"; everything Runner works in on the way there (state,
+    /// working, failed, intermediate, temporary, watch folders, torrent
+    /// control, and torrent payloads, which download and seed in place) is
+    /// "processing".
+    pub fn of_role(role: &str) -> Self {
+        let completed = role == "downloads" || role.starts_with("category: ");
+        StorageKinds {
+            processing: !completed,
+            completed,
+        }
+    }
+
+    pub fn union(self, other: StorageKinds) -> StorageKinds {
+        StorageKinds {
+            processing: self.processing || other.processing,
+            completed: self.completed || other.completed,
+        }
+    }
+
+    /// The dashboard name, falling back to the role label when nothing has
+    /// been classified.
+    pub fn name(self, fallback: &str) -> String {
+        match (self.processing, self.completed) {
+            (true, true) => "processing · completed".to_owned(),
+            (true, false) => "processing".to_owned(),
+            (false, true) => "completed".to_owned(),
+            (false, false) => fallback.to_owned(),
+        }
+    }
 }
 
 struct StorageMember<'a> {
@@ -507,12 +633,17 @@ fn default_probe_spawner() -> ProbeSpawner {
 
 fn unknown_storage_volume(label: String, path: PathBuf) -> StorageVolumeReading {
     StorageVolumeReading {
+        roles: vec![label.clone()],
         label,
-        path,
         available_bytes: None,
         total_bytes: None,
         device_id: None,
         current: false,
+        members: vec![StorageMemberReading {
+            path: path.clone(),
+            parent_device_id: None,
+        }],
+        path,
     }
 }
 
@@ -698,12 +829,23 @@ pub fn storage_volume_readings(roots: &[DiskGuardRoot]) -> Vec<StorageVolumeRead
                     .iter()
                     .map(|member| member.root.label.as_str())
                     .collect::<Vec<_>>()
-                    .join(" · "),
+                    .join(ROLE_JOIN),
                 path: common_storage_path(&group.members),
                 available_bytes: space.map(|reading| reading.available),
                 total_bytes: space.map(|reading| reading.total),
                 device_id: group.device,
                 current: space.is_some(),
+                roles: group
+                    .members
+                    .iter()
+                    .flat_map(|member| member.root.label.split(ROLE_JOIN))
+                    .map(str::to_owned)
+                    .collect(),
+                members: group
+                    .members
+                    .iter()
+                    .map(|member| StorageMemberReading::measure(&member.root.path))
+                    .collect(),
             }
         })
         .collect()
@@ -800,10 +942,12 @@ fn coalesce_storage_volumes(
         });
         if let Some(index) = existing {
             let group = &mut groups[index];
-            group.label.push_str(" · ");
+            group.label.push_str(ROLE_JOIN);
             group.label.push_str(&reading.label);
             group.path = common_path_pair(&group.path, &reading.path);
             group.current &= reading.current;
+            group.roles.extend(reading.roles);
+            group.members.extend(reading.members);
             if let Some(available) = reading.available_bytes {
                 let should_replace = group
                     .available_bytes
@@ -932,27 +1076,33 @@ mod tests {
     fn disk_guard_selects_the_lowest_volume_and_keeps_its_identity() {
         let reading = select_limiting_volume([
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "state".into(),
                 path: PathBuf::from("/state"),
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(1),
+                roles: Vec::new(),
                 current: true,
             },
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "category: tv".into(),
                 path: PathBuf::from("/library/tv"),
                 available_bytes: Some(100),
                 total_bytes: Some(1000),
                 device_id: Some(2),
+                roles: Vec::new(),
                 current: true,
             },
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "temporary".into(),
                 path: PathBuf::from("/scratch"),
                 available_bytes: Some(500),
                 total_bytes: Some(1000),
                 device_id: Some(3),
+                roles: Vec::new(),
                 current: true,
             },
         ]);
@@ -967,11 +1117,13 @@ mod tests {
     #[test]
     fn disk_guard_without_a_measurement_is_explicitly_unknown() {
         let reading = select_limiting_volume([StorageVolumeReading {
+            members: Vec::new(),
             label: "unavailable".into(),
             path: PathBuf::from("/missing"),
             available_bytes: None,
             total_bytes: None,
             device_id: None,
+            roles: Vec::new(),
             current: false,
         }]);
         assert_eq!(reading.available_bytes, None);
@@ -997,19 +1149,23 @@ mod tests {
     fn stale_low_reading_is_retained_but_never_counts_as_recovery_proof() {
         let reading = select_limiting_volume([
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "stale".into(),
                 path: PathBuf::from("/stale"),
                 available_bytes: Some(10),
                 total_bytes: Some(1000),
                 device_id: Some(1),
+                roles: Vec::new(),
                 current: false,
             },
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "healthy".into(),
                 path: PathBuf::from("/healthy"),
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(2),
+                roles: Vec::new(),
                 current: true,
             },
         ]);
@@ -1022,19 +1178,23 @@ mod tests {
     fn fresh_low_root_on_a_shared_filesystem_beats_stale_high_evidence() {
         let reading = select_limiting_volume(coalesce_storage_volumes([
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "stale role".into(),
                 path: PathBuf::from("/shared/stale"),
                 available_bytes: Some(900),
                 total_bytes: Some(1000),
                 device_id: Some(7),
+                roles: Vec::new(),
                 current: false,
             },
             StorageVolumeReading {
+                members: Vec::new(),
                 label: "fresh role".into(),
                 path: PathBuf::from("/shared/fresh"),
                 available_bytes: Some(10),
                 total_bytes: Some(1000),
                 device_id: Some(7),
+                roles: Vec::new(),
                 current: true,
             },
         ]));
@@ -1047,19 +1207,23 @@ mod tests {
     #[test]
     fn unknown_shared_filesystem_member_never_erases_a_known_capacity() {
         let known = StorageVolumeReading {
+            members: Vec::new(),
             label: "known".into(),
             path: PathBuf::from("/shared/known"),
             available_bytes: Some(10),
             total_bytes: Some(1000),
             device_id: Some(7),
+            roles: Vec::new(),
             current: true,
         };
         let unknown = StorageVolumeReading {
+            members: Vec::new(),
             label: "unknown".into(),
             path: PathBuf::from("/shared/unknown"),
             available_bytes: None,
             total_bytes: None,
             device_id: Some(7),
+            roles: Vec::new(),
             current: false,
         };
         for readings in [
@@ -1091,11 +1255,13 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
                 Some(StorageVolumeReading {
+                    members: Vec::new(),
                     label: root.label,
                     path: root.path,
                     available_bytes: Some(500),
                     total_bytes: Some(1000),
                     device_id: None,
+                    roles: Vec::new(),
                     current: true,
                 })
             })
@@ -1226,11 +1392,13 @@ mod tests {
             default_probe_spawner(),
             |root| {
                 Some(StorageVolumeReading {
+                    members: Vec::new(),
                     label: root.label,
                     path: root.path,
                     available_bytes: Some(1),
                     total_bytes: Some(2),
                     device_id: None,
+                    roles: Vec::new(),
                     current: true,
                 })
             },
@@ -1274,11 +1442,13 @@ mod tests {
                 // individual call remains inside its own response window.
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 Some(StorageVolumeReading {
+                    members: Vec::new(),
                     label: root.label,
                     path: root.path,
                     available_bytes: Some(100),
                     total_bytes: Some(200),
                     device_id: None,
+                    roles: Vec::new(),
                     current: true,
                 })
             },
@@ -1394,11 +1564,13 @@ mod tests {
             calls_for_probe.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(120));
             Some(StorageVolumeReading {
+                members: Vec::new(),
                 label: root.label,
                 path: root.path,
                 available_bytes: Some(500),
                 total_bytes: Some(1000),
                 device_id: None,
+                roles: Vec::new(),
                 current: true,
             })
         };
@@ -1421,11 +1593,13 @@ mod tests {
         let third = probe
             .probe_with(&roots, std::time::Duration::from_millis(20), |root| {
                 Some(StorageVolumeReading {
+                    members: Vec::new(),
                     label: root.label,
                     path: root.path,
                     available_bytes: Some(600),
                     total_bytes: Some(1000),
                     device_id: None,
+                    roles: Vec::new(),
                     current: true,
                 })
             })
@@ -1492,6 +1666,35 @@ mod tests {
         assert!(!reading[0].current);
     }
 
+    #[test]
+    fn roles_name_a_filesystem_processing_or_completed() {
+        let name = |roles: &[&str]| {
+            roles
+                .iter()
+                .fold(StorageKinds::default(), |kinds, role| {
+                    kinds.union(StorageKinds::of_role(role))
+                })
+                .name("fallback")
+        };
+        assert_eq!(name(&["downloads"]), "completed");
+        assert_eq!(name(&["category: tv"]), "completed");
+        // The live nuc3 layout: torrents download and seed in place on the
+        // processing volume, so that volume is processing, not both.
+        assert_eq!(
+            name(&[
+                "working",
+                "torrent payloads",
+                "state",
+                "failed",
+                "torrent control"
+            ]),
+            "processing"
+        );
+        assert_eq!(name(&["torrent category: tv"]), "processing");
+        assert_eq!(name(&["working", "downloads"]), "processing · completed");
+        assert_eq!(name(&[]), "fallback");
+    }
+
     #[cfg(unix)]
     #[test]
     fn configured_roots_on_one_filesystem_are_one_failure_domain() {
@@ -1529,5 +1732,55 @@ mod tests {
         ]);
         assert_eq!(readings.len(), 2);
         assert!(readings.iter().all(|reading| reading.current));
+    }
+
+    fn reading(path: &str, members: &[&str]) -> StorageVolumeReading {
+        StorageVolumeReading {
+            label: path.to_owned(),
+            path: PathBuf::from(path),
+            available_bytes: None,
+            total_bytes: None,
+            device_id: None,
+            current: true,
+            roles: Vec::new(),
+            members: members
+                .iter()
+                .map(|member| StorageMemberReading {
+                    path: PathBuf::from(member),
+                    parent_device_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_failing_path_resolves_to_its_volume_by_whole_components() {
+        let volumes = [reading("/processing", &[]), reading("/processing2", &[])];
+        let (volume, root) =
+            volume_containing(&volumes, Path::new("/processing2/job/a.mkv")).unwrap();
+        assert_eq!(volume.path, Path::new("/processing2"));
+        assert_eq!(root, Path::new("/processing2"));
+        assert!(volume_containing(&volumes, Path::new("/processingx/a")).is_none());
+        assert!(volume_containing(&volumes, Path::new("/state/a")).is_none());
+    }
+
+    #[test]
+    fn the_deepest_configured_root_wins_across_members_and_nested_volumes() {
+        // Two bind mounts of one filesystem share a volume whose `path` is
+        // their common parent; a nested root on another filesystem is its own.
+        let volumes = [
+            reading("/", &["/downloads", "/media"]),
+            reading("/downloads/incoming", &[]),
+        ];
+        let (volume, root) = volume_containing(&volumes, Path::new("/media/tv/x.mkv")).unwrap();
+        assert_eq!(volume.path, Path::new("/"));
+        assert_eq!(root, Path::new("/media"));
+        let (volume, root) =
+            volume_containing(&volumes, Path::new("/downloads/incoming/x.part")).unwrap();
+        assert_eq!(volume.path, Path::new("/downloads/incoming"));
+        assert_eq!(root, Path::new("/downloads/incoming"));
+        // A volume with members is matched by its members, not its common
+        // parent: `/` is not a configured root.
+        assert!(volume_containing(&volumes, Path::new("/etc/passwd")).is_none());
     }
 }

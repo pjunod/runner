@@ -18,6 +18,7 @@ mod delivery;
 pub mod election;
 mod grant_receipts;
 pub mod http;
+mod job_disposition;
 pub mod layout;
 pub mod leader;
 pub mod proto;
@@ -68,6 +69,8 @@ pub struct ClusterConfig {
     pub download: bool,
     pub max_download_jobs: u32,
     pub post_process: bool,
+    /// Retain failed source copies after custody settles.
+    pub keep_failed_downloads: bool,
     /// Concurrent PP pipelines this node may run (C2).
     pub pp_slots: u32,
     pub lease_interval: Duration,
@@ -84,6 +87,8 @@ pub struct ClusterConfig {
     /// enforcing low-disk guard.
     pub disk_guard_roots: Vec<nzbd_engine::volumes::DiskGuardRoot>,
     pub torrent_payload_roots: Vec<PathBuf>,
+    /// Transform workspace root (`paths.workspace_dir`); `None` = default.
+    pub workspace_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,9 +264,11 @@ impl ClusterRuntime {
             download_enabled: false,
             state_dir: layout.state_dir(),
             artifact_dir: Some(cfg.control_dir.join("file-lifecycle")),
+            workspace_dir: cfg.workspace_dir.clone(),
             expected_installation_id,
             dest_dir: dest_dir.clone(),
             torrent_payload_roots: cfg.torrent_payload_roots.clone(),
+            payload_roots: Vec::new(),
             history: pp.as_ref().map(|setup| setup.history.clone()),
             disk_guard_roots: cfg.disk_guard_roots.clone(),
             tuning,
@@ -301,11 +308,13 @@ impl ClusterRuntime {
             let cancel = cancel.clone();
             tracker.spawn(async move {
                 let mut cleanup_cursor=0;
+                let mut disposition_cursor=0;
                 loop {
                     if cancel.is_cancelled(){break;}
                     if shared.view.borrow().is_me && shared.authority_ready() {
                         if let Err(error)=delivery::migrate_local_deliveries(&shared).await {tracing::warn!(%error,"cluster Delivery catalog adoption remains pending");}
                         if let Err(error)=cluster_keep::reconcile_one(&shared).await {tracing::warn!(%error,"cluster Keep owner application remains pending");}
+                        if let Err(error)=job_disposition::reconcile_one(&shared,&mut disposition_cursor).await {tracing::debug!(%error,"cluster job disposition remains pending");}
                         if let Err(error)=delivery::cleanup_one_copy(&shared,&mut cleanup_cursor).await {tracing::warn!(%error,"cluster source-copy cleanup remains pending");}
                     }
                     tokio::select!{_=cancel.cancelled()=>break,_=tokio::time::sleep(std::time::Duration::from_secs(1))=>{}}
@@ -552,6 +561,10 @@ impl ClusterRuntime {
             .layer(middleware::from_fn_with_state(
                 self.leader_shared.clone(),
                 cluster_keep::serve,
+            ))
+            .layer(middleware::from_fn_with_state(
+                self.leader_shared.clone(),
+                job_disposition::serve,
             )),
             auth.clone(),
         )
@@ -581,22 +594,27 @@ impl ClusterRuntime {
             .merge(proxied)
     }
 
-    /// Stop cluster tasks, then flush the engine.
+    /// Revoke cluster work, close control requests, then join and flush.
     pub async fn shutdown(&self) -> bool {
         if let Some(worker) = &self.history_worker {
             worker.stop();
         }
         self.cancel.cancel();
-        self.tracker.wait().await;
-        self.leader_shared.control_proofs.shutdown().await;
-        let mut complete = self.engine.shutdown().await;
-
+        let mut complete = true;
+        // A task may be awaiting a quorum request when the final voter loses
+        // its peers. Close the owned Raft/client streams before joining those
+        // tasks, so their pending requests resolve rather than deadlock with
+        // the control shutdown that used to follow tracker.wait(). Raft owns
+        // the accepted-write drain; filesystem workers are still joined below.
         if let Some(control) = &self.control {
             if let Err(error) = control.shutdown().await {
                 tracing::warn!(%error, "replicated control shutdown did not complete cleanly");
                 complete = false;
             }
         }
+        self.tracker.wait().await;
+        self.leader_shared.control_proofs.shutdown().await;
+        complete &= self.engine.shutdown().await;
         complete
     }
 }
@@ -606,7 +624,7 @@ async fn commit_control_mutation(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if cluster_keep::serves(&request) {
+    if cluster_keep::serves(&request) || job_disposition::job_id(&request).is_some() {
         return next.run(request).await;
     }
     let observations = shared
@@ -642,14 +660,45 @@ async fn commit_control_mutation(
     if (safe && !compat_mutation) || !shared.view.borrow().is_me {
         return next.run(request).await;
     }
-    let _serial = shared.mutation_serial.lock().await;
+    // Reject a lost quorum before waiting behind a background reconciliation
+    // that may itself be awaiting that quorum. No mutation has run yet.
+    let healthy = match &shared.control {
+        Some(control) => control.is_healthy().await,
+        None => false,
+    };
+    if !healthy {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "replicated control quorum is unavailable; mutation not accepted"
+            })),
+        )
+            .into_response();
+    }
+    // Catalog acceptance/retry has its own serialized replicated CAS. Keep
+    // quorum, proxy, authentication and authority checks, but do not attach
+    // an unrelated queue projection transaction after the receipt commits.
+    if delivery::is_catalog_mutation(&request) {
+        return next.run(request).await;
+    }
+    let Ok(_serial) =
+        tokio::time::timeout(Duration::from_secs(2), shared.mutation_serial.lock()).await
+    else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "control reconciliation is busy; mutation not accepted"})),
+        ).into_response();
+    };
     if !shared.authority_ready() {
         let review = match &shared.control {
-            Some(control) => control
-                .delivery_meta("admission_migration_review")
-                .await
-                .ok()
-                .flatten(),
+            Some(control) => tokio::time::timeout(
+                Duration::from_secs(2),
+                control.delivery_meta("admission_migration_review"),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten(),
             None => None,
         };
         return (
@@ -684,7 +733,14 @@ async fn commit_control_mutation(
         Ok(jobs) => jobs,
         Err(error) => {
             tracing::error!(%error, "could not capture queue projection before mutation");
-            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "queue_projection_unavailable",
+                    "detail": error,
+                })),
+            )
+                .into_response();
         }
     };
     let mut affected_ids: Vec<u64> = before.keys().copied().collect();
@@ -792,7 +848,7 @@ async fn migrate_legacy_control(
     let snapshot = if bytes.is_empty() {
         nzbd_state::QueueSnapshotDoc::default()
     } else {
-        serde_json::from_slice(&bytes)
+        nzbd_state::SnapshotStore::decode(&bytes)
             .map_err(|error| format!("decode legacy queue for migration: {error}"))?
     };
 

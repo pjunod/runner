@@ -1,5 +1,5 @@
 //! Immutable, checksummed URL inputs and resolution outbox in shared state.
-use super::{Error, Result};
+use super::{retry_delay, Error, Result};
 use nzbd_types::Job;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,7 +10,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-const MAX_SOURCE: usize = 64 * 1024 * 1024;
+/// The largest fetched NZB the URL cache stores durably.
+pub const MAX_SOURCE: usize = 64 * 1024 * 1024;
 const MAX_RECORD: usize = 16 * 1024 * 1024;
 const MAX_OUTBOX_PAGE: usize = 32 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -92,7 +93,7 @@ pub fn url_storage_retry_deadline(
     previous: i64,
     not_before: Option<i64>,
 ) -> i64 {
-    let base = [30, 60, 120, 300][attempts.min(3) as usize];
+    let base = retry_delay(attempts.saturating_add(1));
     let seed = u64::from_str_radix(id.get(..16).unwrap_or("0"), 16).unwrap_or(0)
         ^ now as u64
         ^ attempts as u64;
@@ -676,6 +677,21 @@ impl UrlResolutionStore {
             b"admission cancelled\n",
         )
     }
+    /// The disposition caller has joined the native descriptor writer.
+    /// Keep any descriptor still referenced by an independently owned seed.
+    pub fn dispose_disposition_input(
+        &self,
+        origin: &Job,
+        descriptor_references: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let identity = url_source_identity(origin)?;
+        if !descriptor_references.contains(&identity) {
+            self.cancel(origin)?;
+            self.compact_settled(&identity)?;
+        }
+        Ok(())
+    }
+
     /// Bounded cleanup of exact owned temporaries and late writes whose
     /// authoritative acceptance/cancellation tombstone already committed.
     pub fn maintenance(&self, limit: usize) -> Result<usize> {
@@ -1019,18 +1035,22 @@ mod tests {
         );
         let jittered = url_storage_retry_deadline(&identity, 0, now, 0, None);
         assert!((now + 30..=now + 33).contains(&jittered));
+        // Persistence may cross a wall-clock second. Measure the retry floor
+        // before scheduling, rather than moving it forward after the write.
+        let first_started = super::super::now();
         let first = store
             .schedule_storage_retry(&identity, "destination full")
             .unwrap();
-        assert!(first.next_retry_at >= super::super::now() + 30);
+        assert!(first.next_retry_at >= first_started + 30);
         drop(store);
         let store = UrlResolutionStore::open(temporary.path()).unwrap();
         assert_eq!(store.retry(&identity).unwrap().unwrap().attempts, 1);
+        let second_started = super::super::now();
         let second = store
             .schedule_storage_retry(&identity, "still full")
             .unwrap();
         assert_eq!(second.blocked_since, first.blocked_since);
-        assert!(second.next_retry_at >= super::super::now() + 60);
+        assert!(second.next_retry_at >= second_started + 60);
         let source = store.path(&identity, "source").unwrap();
         let mut bytes = std::fs::read(&source).unwrap();
         bytes[77] ^= 1;

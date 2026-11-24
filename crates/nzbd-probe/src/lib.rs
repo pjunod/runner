@@ -1,5 +1,5 @@
 //! Read the decoded head of a release's main media file without downloading
-//! the release (Curator ADR 0026 §6).
+//! the release (Curator ADR 0031 §6).
 //!
 //! Bytes, not opinions: this crate picks the file, fetches only the NNTP
 //! articles covering its first bytes, decodes the yEnc, and unwraps a
