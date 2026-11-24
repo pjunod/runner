@@ -328,6 +328,7 @@ impl ControlStore {
         let store = Self { client };
         crate::cancellation::install_schema(&store).await?;
         crate::cluster_keep::install_schema(&store).await?;
+        crate::job_disposition::install_schema(&store).await?;
         Ok(store)
     }
 
@@ -843,6 +844,26 @@ impl ControlStore {
         authority: Option<(&str, &str, u64)>,
         removals: &std::collections::BTreeMap<u32, crate::cancellation::RemovalMode>,
     ) -> Result<(), String> {
+        self.commit_job_delta_with_statements(
+            changes,
+            expected_rows,
+            admissions,
+            authority,
+            removals,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_job_delta_with_statements(
+        &self,
+        changes: &[(u64, Option<nzbd_types::Job>)],
+        expected_rows: &std::collections::HashMap<u64, u64>,
+        admissions: &[nzbd_state::UrlAdmissionReceipt],
+        authority: Option<(&str, &str, u64)>,
+        removals: &std::collections::BTreeMap<u32, crate::cancellation::RemovalMode>,
+        additional: Vec<(String, hiqlite::Params)>,
+    ) -> Result<(), String> {
         let now = unix_ms()?;
         let mut statements: Vec<(String, hiqlite::Params)> = Vec::new();
         if let Some(authority) = authority {
@@ -936,6 +957,7 @@ impl ControlStore {
             }
         }
         statements.extend(crate::admissions::admission_statements(admissions)?);
+        statements.extend(additional);
         if statements.is_empty() {
             return Ok(());
         }
@@ -2075,6 +2097,7 @@ pub(crate) mod coordinator_protocol_tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         drop(raft);
         drop(api);

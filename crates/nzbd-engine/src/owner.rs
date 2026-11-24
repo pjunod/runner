@@ -8,6 +8,8 @@
 //! about state. Sends toward writer tasks use `try_send` with a
 //! retry-on-tick fallback so owner ⇄ writer backpressure can never deadlock.
 
+#[path = "owner_disposition.rs"]
+mod disposition;
 #[path = "owner_native_failure.rs"]
 mod native_failure;
 #[path = "owner_lifecycle.rs"]
@@ -90,6 +92,167 @@ fn prepare_unenrolled_payload_root(
             .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
     }
     Ok(())
+}
+
+/// A checkpoint's distinct members, in order: an identical repeat of a
+/// segment is dropped; `None` when two members name the same segment with
+/// different extents or CRCs.
+fn checkpoint_members(
+    segments: Vec<crate::writer::WrittenSegment>,
+) -> Option<Vec<crate::writer::WrittenSegment>> {
+    let mut seen: HashMap<u32, (u64, u32, u32)> = HashMap::with_capacity(segments.len());
+    let mut members = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let extent = (segment.offset, segment.len, segment.crc);
+        match seen.insert(segment.seg_number, extent) {
+            None => members.push(segment),
+            Some(prior) if prior == extent => {}
+            Some(_) => return None,
+        }
+    }
+    Some(members)
+}
+
+/// True when any range of `batch` shares a segment number with, or overlaps,
+/// a different range — already proven or elsewhere in the batch. Sorting
+/// the (small) batch makes this one pass over the proof instead of a pass
+/// per new range.
+fn proof_overlaps(proven: &[ProvenRange], batch: &[ProvenRange]) -> bool {
+    // Empty or unbounded extents break the ordering argument below; the
+    // writer never sends them, but keep the result exact if one appears.
+    if batch
+        .iter()
+        .any(|range| range.len == 0 || range.end().is_none())
+    {
+        let mut seen = proven.to_vec();
+        for range in batch {
+            if seen
+                .iter()
+                .any(|prior| prior.seg_number == range.seg_number || prior.overlaps(range))
+            {
+                return true;
+            }
+            seen.push(range.clone());
+        }
+        return false;
+    }
+    let mut sorted: Vec<&ProvenRange> = batch.iter().collect();
+    sorted.sort_by_key(|range| range.offset);
+    let numbers: HashSet<u32> = batch.iter().map(|range| range.seg_number).collect();
+    if numbers.len() != batch.len() || sorted.windows(2).any(|pair| pair[0].overlaps(pair[1])) {
+        return true;
+    }
+    proven.iter().any(|prior| {
+        if numbers.contains(&prior.seg_number) {
+            return true;
+        }
+        let Some(prior_end) = prior.end() else {
+            return true;
+        };
+        // Batch extents are non-empty and disjoint, so sorted by offset their
+        // ends ascend too: the first one ending after `prior` starts is the
+        // only one that can overlap it.
+        let first =
+            sorted.partition_point(|range| range.end().is_some_and(|end| end <= prior.offset));
+        sorted
+            .get(first)
+            .is_some_and(|range| range.offset < prior_end && range.overlaps(prior))
+    })
+}
+
+#[cfg(test)]
+mod proof_overlap_tests {
+    use super::{proof_overlaps, ProvenRange};
+
+    fn next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The per-segment rule the checkpoint replaced: each new range, in
+    /// order, against everything already proven including earlier members.
+    fn sequential(proven: &[ProvenRange], batch: &[ProvenRange]) -> bool {
+        let mut seen = proven.to_vec();
+        for range in batch {
+            if seen
+                .iter()
+                .any(|prior| prior.seg_number == range.seg_number || prior.overlaps(range))
+            {
+                return true;
+            }
+            seen.push(range.clone());
+        }
+        false
+    }
+
+    fn member(seg_number: u32, offset: u64, crc: u32) -> crate::writer::WrittenSegment {
+        crate::writer::WrittenSegment {
+            seg_number,
+            offset,
+            len: 2,
+            crc,
+            file_size: 8,
+            server: nzbd_types::ServerId(1),
+        }
+    }
+
+    #[test]
+    fn checkpoint_repeats_are_idempotent_unless_they_contradict() {
+        let members =
+            super::checkpoint_members(vec![member(1, 0, 7), member(1, 0, 7), member(2, 2, 9)])
+                .expect("an identical re-ack inside one checkpoint is not a conflict");
+        assert_eq!(
+            members.iter().map(|m| m.seg_number).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let batch: Vec<_> = members
+            .iter()
+            .map(|m| ProvenRange {
+                seg_number: m.seg_number,
+                offset: m.offset,
+                len: m.len,
+                crc: m.crc,
+            })
+            .collect();
+        assert!(!proof_overlaps(&[], &batch));
+        assert!(super::checkpoint_members(vec![member(1, 0, 7), member(1, 0, 8)]).is_none());
+        assert!(super::checkpoint_members(vec![member(1, 0, 7), member(1, 2, 7)]).is_none());
+    }
+
+    #[test]
+    fn batch_check_matches_the_per_segment_rule() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..2000 {
+            let mut proven = Vec::new();
+            let mut cursor = 0;
+            for seg_number in 0..(next(&mut state) % 12) as u32 {
+                cursor += next(&mut state) % 5;
+                let len = 1 + (next(&mut state) % 6) as u32;
+                proven.push(ProvenRange {
+                    seg_number,
+                    offset: cursor,
+                    len,
+                    crc: 0,
+                });
+                cursor += u64::from(len);
+            }
+            let batch: Vec<_> = (0..1 + next(&mut state) % 5)
+                .map(|_| ProvenRange {
+                    seg_number: (next(&mut state) % 20) as u32,
+                    offset: next(&mut state) % (cursor + 10),
+                    len: (next(&mut state) % 6) as u32,
+                    crc: 0,
+                })
+                .collect();
+            assert_eq!(
+                proof_overlaps(&proven, &batch),
+                sequential(&proven, &batch),
+                "{proven:?} + {batch:?}"
+            );
+        }
+    }
 }
 
 fn set_owner_param(params: &mut Vec<(String, String)>, key: &str, value: Option<String>) {
@@ -383,6 +546,13 @@ pub(crate) enum QueueCommand {
         context: nzbd_state::artifacts::WorkerControlContext,
         reply: oneshot::Sender<bool>,
     },
+    AdvanceJobDisposition {
+        job: JobId,
+        native_joined: bool,
+        url_joined: bool,
+        request: nzbd_state::artifacts::JobDispositionRequest,
+        reply: oneshot::Sender<Result<nzbd_state::artifacts::JobDisposition, crate::EngineError>>,
+    },
     QuiescePayload {
         job: JobId,
         reply: oneshot::Sender<Result<Vec<WriterHandle>, String>>,
@@ -423,6 +593,9 @@ pub(crate) enum QueueCommand {
         /// Requesting client (UA / "web-ui") — logged and carried on the
         /// event so pause flapping is attributable.
         source: String,
+        reply: oneshot::Sender<()>,
+    },
+    RetryStorage {
         reply: oneshot::Sender<()>,
     },
     ResumeAll {
@@ -814,6 +987,7 @@ pub(crate) struct Lease {
     pub message_id: String,
     pub writer: mpsc::Sender<WriteCmd>,
     pub generation: u64,
+    pub cancel: CancellationToken,
 }
 
 /// Everything that reaches the owner task.
@@ -974,6 +1148,8 @@ pub(crate) struct Owner {
     writer_epochs: HashMap<FileId, u64>,
     job_epochs: HashMap<JobId, u64>,
     control_epochs: HashMap<JobId, u64>,
+    disposition_in_flight: HashSet<JobId>,
+    disposition_fences: HashMap<JobId, (String, String)>,
     post_admissions: HashMap<JobId, u64>,
     post_cancellations: HashMap<JobId, CancellationToken>,
     failed_cleanup_admissions: HashMap<JobId, nzbd_state::artifacts::FailedCleanupProof>,
@@ -1111,6 +1287,9 @@ pub(crate) struct Owner {
     history: Option<Arc<nzbd_state::history::HistoryDb>>,
 
     state_dir: PathBuf,
+    /// Where the terminal store (`artifacts.sqlite`, the artifact inventory)
+    /// lives: the path an out-of-space terminal write is reported against.
+    terminal_store_dir: PathBuf,
     persistence: Persistence,
     persistence_callbacks: HashMap<u64, Continuation>,
     // Saturated journal admission is covered by one coalesced owner snapshot.
@@ -1418,8 +1597,17 @@ impl Owner {
                 }
             }
             state.jobs.retain(|job| !retired.contains(&job.id));
+            state
+                .pending_admissions
+                .retain(|pending| !retired.contains(&pending.job_id));
             for receipt in &mut state.url_admission_receipts {
-                if retired.contains(&JobId(receipt.job_id)) && receipt.custody_state != "curator" {
+                if retired.contains(&JobId(receipt.job_id))
+                    && receipt.custody_state != "curator"
+                    && receipt
+                        .terminal_outcome
+                        .as_deref()
+                        .is_none_or(|terminal| terminal == "DELETED")
+                {
                     receipt.outcome = "deleted".into();
                 }
             }
@@ -1557,6 +1745,19 @@ impl Owner {
             .collect::<HashSet<_>>();
         let initial_disk_hold = tuning.min_free_disk_bytes > 0;
         let initial_quota_hold = tuning.daily_quota_bytes > 0 || tuning.monthly_quota_bytes > 0;
+        let disposition_fences = artifacts
+            .job_disposition_fences()
+            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+            .into_iter()
+            .filter(|(job, transfer, generation)| {
+                state.url_admission_receipts.iter().any(|receipt| {
+                    receipt.job_id == *job
+                        && receipt.request_token == *transfer
+                        && receipt.generation == *generation
+                })
+            })
+            .map(|(job, transfer, generation)| (JobId(job), (transfer, generation)))
+            .collect();
         let mut owner = Owner {
             state,
             admission_adoption: None,
@@ -1570,6 +1771,8 @@ impl Owner {
             writer_epochs: HashMap::new(),
             job_epochs: HashMap::new(),
             control_epochs: HashMap::new(),
+            disposition_in_flight: HashSet::new(),
+            disposition_fences,
             post_admissions: HashMap::new(),
             post_cancellations: HashMap::new(),
             failed_cleanup_admissions: HashMap::new(),
@@ -1634,6 +1837,7 @@ impl Owner {
             applied_torrent_limit: None,
             history,
             state_dir: state_dir.to_path_buf(),
+            terminal_store_dir: artifact_dir.unwrap_or(state_dir).to_path_buf(),
             persistence: Persistence::start(
                 journal,
                 SnapshotStore::open(state_dir)?,
@@ -1924,6 +2128,7 @@ impl Owner {
         let mut to_check = Vec::new();
         for job in &self.state.jobs {
             if self.pending_control_commits.contains(&job.id)
+                || self.job_disposing(job.id)
                 || self.verification.contains_key(&job.id)
                 || self.retiring_writers.contains_key(&job.id)
             {
@@ -2243,6 +2448,16 @@ impl Owner {
             }
             return;
         }
+        let cmd = match cmd {
+            QueueCommand::RemoveJobSilent { job, reply, .. }
+            | QueueCommand::Delete { job, reply, .. }
+                if self.job_disposing(job) =>
+            {
+                let _ = reply.send(false);
+                return;
+            }
+            command => command,
+        };
         let pending_job = match &cmd {
             QueueCommand::Pause { job, .. }
             | QueueCommand::Resume { job, .. }
@@ -2704,7 +2919,8 @@ impl Owner {
             QueueCommand::BeginPostAdmission { job, reply } => {
                 let allowed = !self.cancel.is_cancelled()
                     && self.state.job(job).is_some_and(|j| {
-                        !j.held()
+                        (!self.job_disposing(job) || Self::disposition_allows_failed_followup(j))
+                            && !j.held()
                             && !transitions::failed_cleanup_only(j)
                             && matches!(
                                 j.status,
@@ -3300,11 +3516,19 @@ impl Owner {
                             request_token: token.clone(),
                             submission_sha256: submission_sha256.clone().unwrap_or_default(),
                             job_id: id.0,
-                            generation: url_admission_generation(
-                                id,
-                                token,
-                                &self.consumer_instance_id,
-                            ),
+                            generation: existing_job
+                                .params
+                                .iter()
+                                .find(|(key, _)| key == "*URL:AdmissionGeneration")
+                                .map(|(_, generation)| generation.clone())
+                                .unwrap_or_else(|| {
+                                    url_admission_generation(
+                                        id,
+                                        token,
+                                        &self.consumer_instance_id,
+                                        &crate::admissions::generation_nonce(),
+                                    )
+                                }),
                             runner_instance_id: self.consumer_instance_id.clone(),
                             terminal_outcome: None,
                             outcome: existing_job.status.as_str().into(),
@@ -3404,6 +3628,9 @@ impl Owner {
                     return;
                 }
                 let id = self.state.admit_url(name.clone(), &url, category, priority);
+                let admission_nonce = request_token
+                    .as_ref()
+                    .map(|_| crate::admissions::generation_nonce());
                 if let Some(j) = self.state.job_mut(id) {
                     mark_new_lifecycle_cohort(j);
                     if let Some(dupe) = dupe {
@@ -3414,26 +3641,39 @@ impl Owner {
                     }
                     j.params.extend(params);
                     j.delivery_lifecycle = nzbd_types::has_delivery_intent(&j.params);
-                    if let Some(token) = request_token.as_deref() {
+                    if let (Some(token), Some(nonce)) = (request_token.as_deref(), &admission_nonce)
+                    {
                         // Public consumer identity can change across authority
                         // adoption; the fetch origin remains bound to this
                         // storage installation for its complete lifetime.
                         j.params.push((
                             "*URL:AdmissionGeneration".into(),
-                            url_admission_generation(id, token, &self.artifacts.installation),
+                            url_admission_generation(
+                                id,
+                                token,
+                                &self.artifacts.installation,
+                                nonce,
+                            ),
                         ));
                     }
                 }
                 let name = self.name_from_requestor(id, true).unwrap_or(name);
-                if let (Some(token), Some(fingerprint)) =
-                    (request_token.as_ref(), submission_sha256.as_ref())
-                {
+                if let (Some(token), Some(fingerprint), Some(nonce)) = (
+                    request_token.as_ref(),
+                    submission_sha256.as_ref(),
+                    &admission_nonce,
+                ) {
                     let receipt = UrlAdmissionReceipt {
                         protocol_version: 1,
                         request_token: token.clone(),
                         submission_sha256: fingerprint.clone(),
                         job_id: id.0,
-                        generation: url_admission_generation(id, token, &self.consumer_instance_id),
+                        generation: url_admission_generation(
+                            id,
+                            token,
+                            &self.consumer_instance_id,
+                            nonce,
+                        ),
                         runner_instance_id: self.consumer_instance_id.clone(),
                         terminal_outcome: None,
                         outcome: "fetching".into(),
@@ -3859,6 +4099,10 @@ impl Owner {
                 });
             }
             QueueCommand::Resume { job, reply } => {
+                if self.job_disposing(job) {
+                    let _ = reply.send(false);
+                    return;
+                }
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
                 if self
                     .state
@@ -4099,6 +4343,15 @@ impl Owner {
             }
             QueueCommand::ForgetClusterWriterStops { context, reply } => {
                 let _ = reply.send(self.cluster_writer_stops.forget_joined(&context));
+            }
+            QueueCommand::AdvanceJobDisposition {
+                job,
+                request,
+                native_joined,
+                url_joined,
+                reply,
+            } => {
+                self.advance_job_disposition(job, request, native_joined, url_joined, reply);
             }
             QueueCommand::QuiescePayload { job, reply } => {
                 let scope_generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
@@ -4614,6 +4867,14 @@ impl Owner {
                 self.publish_now();
                 let _ = reply.send(());
             }
+            QueueCommand::RetryStorage { reply } => {
+                // Retry probes, not pause flags or the evidence-based safety latch.
+                self.space_probe_after = Instant::now();
+                self.space_probe_failures = 0;
+                self.maybe_probe_space();
+                self.publish_now();
+                let _ = reply.send(());
+            }
             QueueCommand::ResumeAll { source, reply } => {
                 tracing::info!(
                     %source,
@@ -5090,36 +5351,19 @@ impl Owner {
                 if quiescent {
                     if let Some(j) = self.state.job_mut(job) {
                         let current = j.control();
-                        let after = j
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == "*Control:probe_after")
-                            .and_then(|(_, v)| v.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        let count = j
-                            .params
-                            .iter()
-                            .find(|(k, _)| k == "*Control:attempts")
-                            .and_then(|(_, v)| v.parse::<u32>().ok())
-                            .unwrap_or(0);
                         if current.is_some_and(|c| {
                             c.revision == revision
                                 && c.lifecycle == "held"
                                 && matches!(c.cause.as_str(), "capacity" | "quota")
-                        }) && (after <= now || by == RetryBy::Operator)
-                        {
-                            // The spacing paces the recovery task; a person
-                            // asking is the health probe's to answer, not
-                            // the backoff's.
+                                && (by == RetryBy::Operator
+                                    || (!c.manual_pause
+                                        && c.next_retry_at_unix.is_none_or(|after| after <= now)))
+                        }) {
+                            // JobControl owns the retry clock. Legacy probe
+                            // parameters must not delay a migrated hold.
                             j.params.retain(|(k, _)| {
                                 k != "*Control:probe_after" && k != "*Control:attempts"
                             });
-                            j.params.push((
-                                "*Control:probe_after".into(),
-                                (now + 30 * (1i64 << count.min(6))).to_string(),
-                            ));
-                            j.params
-                                .push(("*Control:attempts".into(), (count + 1).to_string()));
                             self.dirty = true;
                             accepted = true;
                         }
@@ -5612,6 +5856,10 @@ impl Owner {
     ) {
         if self.persistence_fenced || !self.persist {
             callback(self, Err(crate::EngineError::OwnershipLost));
+            return;
+        }
+        if self.job_disposing(job) {
+            callback(self, Ok(false));
             return;
         }
         let Some(before) = self
@@ -6342,9 +6590,12 @@ impl Owner {
             .state
             .jobs
             .iter()
-            .filter(|job| transitions::failed_cleanup_only(job))
+            .filter(|job| transitions::failed_cleanup_only(job) || self.job_disposing(job.id))
         {
-            excluded.insert(job.id, "failed cleanup metadata only".into());
+            excluded.insert(
+                job.id,
+                "job is fenced for disposition or failed cleanup".into(),
+            );
         }
         for job in self
             .verification
@@ -6353,6 +6604,7 @@ impl Owner {
             .chain(self.pending_control_commits.iter())
             .chain(self.pending_control_revisions.keys())
             .chain(self.allocating_jobs.iter())
+            .chain(self.deferred_terminals.keys())
         {
             excluded.insert(*job, "verification/replacement".into());
         }
@@ -6471,6 +6723,7 @@ impl Owner {
                 message_id,
                 writer,
                 generation,
+                cancel: self.writers[&r.file].stop.clone(),
             });
         }
         if !leases.is_empty() && self.startup_phases.first_lease_ms.is_none() {
@@ -6482,6 +6735,174 @@ impl Owner {
     }
 
     // -- outcomes ------------------------------------------------------------
+
+    /// One writer durability checkpoint: every segment was written before
+    /// the shared `fdatasync`, and all name the same post-sync identity. The
+    /// file's proof is parsed, checked and re-serialized once per checkpoint,
+    /// not once per segment — the proof holds every range of the file, so a
+    /// per-segment round trip is quadratic in the file's article count and
+    /// saturated the owner on large files.
+    fn on_written_checkpoint(
+        &mut self,
+        job: JobId,
+        file: FileId,
+        generation: u64,
+        segments: Vec<crate::writer::WrittenSegment>,
+        identity: nzbd_state::artifacts::Identity,
+    ) {
+        // W5a: the same file's write landed.
+        self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
+        // Segments this checkpoint still has to record. A repeat — of a Done
+        // segment or of one earlier in this checkpoint (the writer re-acks a
+        // duplicate delivery) — is idempotent when identical and an identity
+        // failure when it contradicts.
+        let Some(segments) = checkpoint_members(segments) else {
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Identity,
+                None,
+                "download_write",
+                "writer acknowledgement contradicts completed logical segment",
+            );
+            return;
+        };
+        let mut fresh = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let reference = SegRef {
+                job,
+                file,
+                seg_number: segment.seg_number,
+            };
+            let Some(state) = self.state.segment_mut(reference) else {
+                continue;
+            };
+            if let SegmentState::Done {
+                offset: old,
+                len: old_len,
+                crc: old_crc,
+            } = state.state
+            {
+                if (old, old_len, old_crc) != (segment.offset, segment.len, segment.crc) {
+                    self.fail_job_terminal(
+                        job,
+                        nzbd_types::FailureReason::Identity,
+                        None,
+                        "download_write",
+                        "writer acknowledgement contradicts completed logical segment",
+                    );
+                    return;
+                }
+                continue;
+            }
+            fresh.push(segment);
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let Some(allocation) = self.allocation_cache.get(&job) else {
+            return;
+        };
+        let record = self.state.job(job).unwrap();
+        let key = format!("*File:proof:{}", file.0);
+        let file_generation = record
+            .params
+            .iter()
+            .find(|(key, _)| key == &format!("*File:generation:{}", file.0))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        if file_generation != generation.to_string() {
+            return;
+        }
+        let mut proof = record
+            .params
+            .iter()
+            .find(|(candidate, _)| candidate == &key)
+            .and_then(|(_, value)| serde_json::from_str::<DurableFileProof>(value).ok())
+            .filter(|proof| {
+                proof.protocol == WRITER_PROTOCOL
+                    && proof.generation == file_generation
+                    && proof.allocation_generation == allocation.generation
+                    && proof.installation == self.artifacts.installation
+                    && proof.identity.same_object(&identity)
+            })
+            .unwrap_or_else(|| DurableFileProof {
+                protocol: WRITER_PROTOCOL,
+                generation: file_generation.clone(),
+                allocation_generation: allocation.generation.clone(),
+                installation: self.artifacts.installation.clone(),
+                identity: identity.clone(),
+                ranges: vec![],
+                publication_name: None,
+            });
+        let batch: Vec<ProvenRange> = fresh
+            .iter()
+            .map(|segment| ProvenRange {
+                seg_number: segment.seg_number,
+                offset: segment.offset,
+                len: segment.len,
+                crc: segment.crc,
+            })
+            .collect();
+        if proof_overlaps(&proof.ranges, &batch) {
+            self.fail_job_terminal(
+                job,
+                nzbd_types::FailureReason::Identity,
+                None,
+                "download_write",
+                "writer acknowledgement overlaps durable evidence",
+            );
+            return;
+        }
+        proof.identity = identity;
+        let mut journal_proof = DurableFileProof {
+            ranges: vec![],
+            ..proof.clone()
+        };
+        proof.ranges.extend(batch.iter().cloned());
+        for (segment, range) in fresh.iter().zip(batch) {
+            journal_proof.ranges = vec![range];
+            self.append_journal(
+                JournalRecord {
+                    job,
+                    file,
+                    segment_number: segment.seg_number,
+                    offset: segment.offset,
+                    len: segment.len,
+                    crc32: segment.crc,
+                    file_size: segment.file_size,
+                },
+                serde_json::to_value(&journal_proof).ok(),
+            );
+            let reference = SegRef {
+                job,
+                file,
+                seg_number: segment.seg_number,
+            };
+            if let Some(state) = self.state.segment_mut(reference) {
+                state.state = SegmentState::Done {
+                    offset: segment.offset,
+                    len: segment.len,
+                    crc: segment.crc,
+                };
+            }
+            if segment.file_size > 0 {
+                self.file_sizes.insert(file, segment.file_size);
+            }
+            self.volumes.add(
+                segment.server,
+                u64::from(segment.len),
+                unix_now(),
+                self.tuning.quota_start_day,
+            );
+            self.attempts.remove(&reference);
+        }
+        if let Some(record) = self.state.job_mut(job) {
+            set_owner_param(&mut record.params, &key, serde_json::to_string(&proof).ok());
+            recompute_job_totals(record);
+        }
+        self.dirty = true;
+        self.after_file_change(job, file);
+    }
 
     fn on_scoped_writer(&mut self, job: JobId, file: FileId, generation: u64, fact: WriterFact) {
         if self.writer_epochs.get(&file) != Some(&generation)
@@ -6502,132 +6923,8 @@ impl Owner {
             return;
         }
         match fact {
-            WriterFact::Written {
-                seg_number,
-                offset,
-                len,
-                crc,
-                file_size,
-                server,
-                identity,
-            } => {
-                // W5a: the same file's write landed.
-                self.space_op_succeeded(&crate::space_probe::SpaceOp::Write { job, file });
-                let reference = SegRef {
-                    job,
-                    file,
-                    seg_number,
-                };
-                let Some(segment) = self.state.segment_mut(reference) else {
-                    return;
-                };
-                if let SegmentState::Done {
-                    offset: old,
-                    len: old_len,
-                    crc: old_crc,
-                } = segment.state
-                {
-                    if (old, old_len, old_crc) != (offset, len, crc) {
-                        self.fail_job_terminal(
-                            job,
-                            nzbd_types::FailureReason::Identity,
-                            None,
-                            "download_write",
-                            "writer acknowledgement contradicts completed logical segment",
-                        );
-                    }
-                    return;
-                }
-                let Some(allocation) = self.allocation_cache.get(&job) else {
-                    return;
-                };
-                let record = self.state.job(job).unwrap();
-                let key = format!("*File:proof:{}", file.0);
-                let file_generation = record
-                    .params
-                    .iter()
-                    .find(|(key, _)| key == &format!("*File:generation:{}", file.0))
-                    .map(|(_, value)| value.clone())
-                    .unwrap_or_default();
-                if file_generation != generation.to_string() {
-                    return;
-                }
-                let mut proof = record
-                    .params
-                    .iter()
-                    .find(|(candidate, _)| candidate == &key)
-                    .and_then(|(_, value)| serde_json::from_str::<DurableFileProof>(value).ok())
-                    .filter(|proof| {
-                        proof.protocol == WRITER_PROTOCOL
-                            && proof.generation == file_generation
-                            && proof.allocation_generation == allocation.generation
-                            && proof.installation == self.artifacts.installation
-                            && proof.identity.same_object(&identity)
-                    })
-                    .unwrap_or_else(|| DurableFileProof {
-                        protocol: WRITER_PROTOCOL,
-                        generation: file_generation.clone(),
-                        allocation_generation: allocation.generation.clone(),
-                        installation: self.artifacts.installation.clone(),
-                        identity: identity.clone(),
-                        ranges: vec![],
-                        publication_name: None,
-                    });
-                let range = ProvenRange {
-                    seg_number,
-                    offset,
-                    len,
-                    crc,
-                };
-                if proof
-                    .ranges
-                    .iter()
-                    .any(|prior| prior.seg_number == seg_number || prior.overlaps(&range))
-                {
-                    self.fail_job_terminal(
-                        job,
-                        nzbd_types::FailureReason::Identity,
-                        None,
-                        "download_write",
-                        "writer acknowledgement overlaps durable evidence",
-                    );
-                    return;
-                }
-                proof.identity = identity;
-                proof.ranges.push(range.clone());
-                let mut journal_proof = proof.clone();
-                journal_proof.ranges = vec![range];
-                self.append_journal(
-                    JournalRecord {
-                        job,
-                        file,
-                        segment_number: seg_number,
-                        offset,
-                        len,
-                        crc32: crc,
-                        file_size,
-                    },
-                    serde_json::to_value(&journal_proof).ok(),
-                );
-                if let Some(segment) = self.state.segment_mut(reference) {
-                    segment.state = SegmentState::Done { offset, len, crc };
-                }
-                if let Some(record) = self.state.job_mut(job) {
-                    set_owner_param(&mut record.params, &key, serde_json::to_string(&proof).ok());
-                    recompute_job_totals(record);
-                }
-                if file_size > 0 {
-                    self.file_sizes.insert(file, file_size);
-                }
-                self.volumes.add(
-                    server,
-                    u64::from(len),
-                    unix_now(),
-                    self.tuning.quota_start_day,
-                );
-                self.attempts.remove(&reference);
-                self.dirty = true;
-                self.after_file_change(job, file);
+            WriterFact::Written { segments, identity } => {
+                self.on_written_checkpoint(job, file, generation, segments, identity)
             }
             WriterFact::Finalized {
                 ok,
@@ -6952,24 +7249,28 @@ impl Owner {
         self.maybe_abort_unhealthy(r.job);
     }
 
-    /// NZBGet-style critical-health abort: once enough articles have
-    /// failed that the job can't be repaired even with every par2 block
-    /// (`health < critical_health`), stop wasting bandwidth. Pending
-    /// segments are failed outright; leased ones finish their in-flight
-    /// attempt honestly. The job then completes as Failed through the
-    /// normal path, and the PP health gate parks/deletes per policy.
+    /// End an unviable download through the durable failure path immediately.
+    /// Pending-only exhaustion leaves leased retries and paused PAR files alive.
     fn maybe_abort_unhealthy(&mut self, job_id: JobId) {
-        if !self.tuning.health_abort {
+        if !self.tuning.health_abort
+            || self.terminals_in_flight.contains(&job_id)
+            || self.deferred_terminals.contains_key(&job_id)
+        {
             return;
         }
         let Some(job) = self.state.job(job_id) else {
             return;
         };
-        // A held download still counts its late article failures.
         if !matches!(
             job.status,
             JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused | JobStatus::Held
-        ) {
+        ) || open_post_stage(job).is_some()
+            || job.control().is_some_and(|control| control.post_side())
+            || job
+                .params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+        {
             return;
         }
         let health = Health::calc(&job.totals);
@@ -6978,46 +7279,31 @@ impl Owner {
             return;
         }
         let name = job.name.clone();
-        let pending: Vec<(FileId, Vec<u32>)> = job
-            .files
-            .iter()
-            .filter(|f| !f.is_terminal())
-            .map(|f| {
-                (
-                    f.id,
-                    f.segments
-                        .iter()
-                        .filter(|s| matches!(s.state, SegmentState::Pending))
-                        .map(|s| s.number)
-                        .collect(),
-                )
-            })
-            .collect();
-        tracing::warn!(
-            job = job_id.0,
-            %name,
-            health = health.0,
-            critical = critical.0,
-            "aborting download: health below critical (unrepairable even with all par2)"
-        );
-        for (file, segs) in pending {
-            for seg_number in segs {
-                let r = SegRef {
-                    job: job_id,
-                    file,
-                    seg_number,
-                };
-                if let Some(seg) = self.state.segment_mut(r) {
-                    seg.state = SegmentState::Failed;
+        // Stop producers and fence their late acknowledgements before disposal.
+        self.retire_job_writers(job_id);
+        self.attempts.retain(|r, _| r.job != job_id);
+        self.fail_job_terminal_then(
+            job_id,
+            nzbd_types::FailureReason::Health,
+            None,
+            "health",
+            &format!(
+                "download health {} below critical health {}",
+                health.0, critical.0
+            ),
+            Box::new(move |owner, row| {
+                if row.is_some() {
+                    owner.emit(Event::JobFinished {
+                        job: job_id,
+                        name,
+                        status: JobStatus::Failed,
+                        health: health.0,
+                    });
                 }
-                self.attempts.remove(&r);
-            }
-            if let Some(j) = self.state.job_mut(job_id) {
-                recompute_job_totals(j);
-            }
-            self.after_file_change(job_id, file);
-        }
+            }),
+        );
         self.bump_epoch();
+        self.publish_now();
     }
 
     fn accept_file_metadata(&mut self, job: JobId, file: FileId, name: &str, size: u64) {
@@ -7217,8 +7503,14 @@ impl Owner {
                 attempts_made
             },
             next_retry_at_unix: timed.then(|| {
-                now.saturating_add(hold_retry_delay_with_jitter(job, attempts_made, now))
-                    .max(not_before.unwrap_or(0))
+                now.saturating_add(
+                    if cause.is_storage() || cause == nzbd_types::HoldCause::StorageUnavailable {
+                        hold_retry_delay_with_jitter(job, attempts_made, now).min(60)
+                    } else {
+                        hold_retry_delay_with_jitter(job, attempts_made, now)
+                    },
+                )
+                .max(not_before.unwrap_or(0))
             }),
             blocked_since_unix: episode.and_then(|c| c.blocked_since_unix).or(Some(now)),
             released_at_unix: None,
@@ -7332,6 +7624,7 @@ impl Owner {
         guard: &crate::hold_release::HoldReleaseGuard,
     ) -> Result<(), String> {
         if self.persistence_fenced
+            || self.job_disposing(job)
             || (by == RetryBy::Recovery && self.automatic_control_pending(job))
         {
             return Err("durable queue ownership is fenced".into());
@@ -7487,6 +7780,13 @@ impl Owner {
         let timed = control.hold_cause().policy().timed();
         if timed {
             let delay = hold_retry_delay_with_jitter(job, control.retry_attempt, unix_now());
+            let delay = if control.hold_cause().is_storage()
+                || control.hold_cause() == nzbd_types::HoldCause::StorageUnavailable
+            {
+                delay.min(60)
+            } else {
+                delay
+            };
             control.retry_attempt = control.retry_attempt.saturating_add(1);
             control.next_retry_at_unix = Some(unix_now().saturating_add(delay));
         }
@@ -8207,6 +8507,7 @@ impl Owner {
             return;
         };
         let inventory = self.artifacts.clone();
+        let consumer_admission = self.job_admission_binding(&record);
         let root = self.dest_dir.clone();
         let occupied = self
             .state
@@ -8261,6 +8562,11 @@ impl Owner {
                         keep,
                     )
                     .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                if let Some(binding) = consumer_admission.as_ref().filter(|_| allocation.owned) {
+                    inventory
+                        .bind_job_disposition_source(binding, &allocation)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
                 Ok((name, allocation))
             },
             move |owner, result| {
@@ -8368,6 +8674,7 @@ impl Owner {
         // segment. Own the descriptor only when scheduling an actual allocation.
         let record = record.clone();
         let inventory = self.artifacts.clone();
+        let consumer_admission = self.job_admission_binding(&record);
         let root = self.dest_dir.clone();
         let epoch = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         self.allocating_jobs.insert(job);
@@ -8391,7 +8698,7 @@ impl Owner {
                         .params
                         .iter()
                         .any(|(key, value)| key == "*Runner:KeepOnFailure" && value == "1");
-                    inventory
+                    let created = inventory
                         .allocate_for_delivery_with_keep(
                             record.id.0,
                             &plan.root,
@@ -8400,7 +8707,13 @@ impl Owner {
                             record.delivery_lifecycle,
                             keep,
                         )
-                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    if let Some(binding) = consumer_admission.as_ref().filter(|_| created.owned) {
+                        inventory
+                            .bind_job_disposition_source(binding, &created)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                    created
                 } else {
                     transitions::allocate_imported_payload(
                         &inventory, &record, &root, &plan, allocation,
@@ -8879,6 +9192,16 @@ impl Owner {
         delete_files: bool,
         callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
     ) {
+        self.delete_job_with_source_then(job, delete_files, None, callback);
+    }
+
+    fn delete_job_with_source_then(
+        &mut self,
+        job: JobId,
+        delete_files: bool,
+        disposition: Option<nzbd_state::artifacts::JobDispositionRecord>,
+        callback: impl FnOnce(&mut Owner, bool) + Send + 'static,
+    ) {
         if delete_files
             || self.state.job(job).is_none()
             || self.post_admissions.contains_key(&job)
@@ -8903,6 +9226,26 @@ impl Owner {
         let inventory = self.artifacts.clone();
         let retirement_record = self.state.job(job).cloned().unwrap();
         let retirements = self.url_resolutions.clone();
+        let native_disposition = disposition.is_some()
+            && crate::torrent_acquisitions::is_acquisition(&retirement_record);
+        let url_disposition = disposition.is_some()
+            && retirement_record
+                .params
+                .iter()
+                .any(|(key, _)| key == "*URL");
+        let descriptor_references = if native_disposition {
+            self.state
+                .jobs
+                .iter()
+                .filter_map(|row| {
+                    crate::torrent_acquisitions::descriptor_reference(row)
+                        .and_then(|reference| reference.source_identity(row).ok())
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
+        let pending_sources = self.pending_sources.clone();
 
         self.pending_control_commits.insert(job);
         let lane_root = self
@@ -8913,13 +9256,49 @@ impl Owner {
         self.payload_then(
             lane_root,
             move || {
-                let retiring = inventory
+                if let Some(disposition) = &disposition {
+                    if let Some(source) = &disposition.source {
+                        let files = disposition::disposition_writer_files(
+                            &retirement_record,
+                            source,
+                            &inventory.installation,
+                        );
+                        inventory
+                            .finish_job_disposition_source(source, &retirement_record, &files)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                } else if let Some(artifact) = inventory
                     .prepare_forget(job.0)
-                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
-                if let Some(artifact) = retiring {
+                    .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?
+                {
                     inventory
                         .finish(job.0, &artifact.path, &artifact.root, "retained")
                         .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
+                if native_disposition {
+                    for metadata in [false, true] {
+                        let origin =
+                            crate::torrent_acquisitions::blob_origin(&retirement_record, metadata)
+                                .map_err(|error| {
+                                    nzbd_state::StateError::Corrupt(error.to_string())
+                                })?;
+                        retirements
+                            .dispose_disposition_input(&origin, &descriptor_references)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
+                    pending_sources.remove(job)?;
+                }
+                if url_disposition {
+                    retirements
+                        .dispose_disposition_input(&retirement_record, &descriptor_references)
+                        .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                }
+                if let Some(disposition) = &disposition {
+                    if disposition.source.is_none() {
+                        inventory
+                            .record_unallocated_job_retirement(disposition, &retirement_record)
+                            .map_err(|error| nzbd_state::StateError::Corrupt(error.to_string()))?;
+                    }
                 }
                 retirements
                     .retire_job(&retirement_record)
@@ -8935,6 +9314,12 @@ impl Owner {
                 if !owner.remove_job_silent(job) {
                     callback(owner, false);
                     return;
+                }
+                if native_disposition {
+                    owner
+                        .state
+                        .pending_admissions
+                        .retain(|pending| pending.job_id != job);
                 }
                 owner.persist_then(move |owner, _snapshot_ok| {
                     // The exact cancellation tombstone is already fsync'd.
@@ -9021,19 +9406,22 @@ impl Owner {
             op,
             crate::space_probe::SpaceFailure {
                 path,
+                whence: whence.to_string(),
                 observed: self.enospc_observed,
                 volumes,
             },
         );
-        self.space_probe_after = Instant::now() + Duration::from_secs(30);
+        if !self.enospc_latched {
+            self.space_probe_after = Instant::now() + Duration::from_secs(30);
+        }
         self.enospc_where = Some(whence.to_string());
         if !self.enospc_latched {
             self.enospc_latched = true;
             tracing::error!(
                 whence,
                 observed = self.enospc_observed,
-                "out of space on a configured write volume — holding all downloads (observed from a \
-                 write, not from the free-space probe)"
+                "out of space — holding all downloads (reported by a write or a write's capacity \
+                 reservation, not by the free-space probe)"
             );
         }
         if !self.disk_low {
@@ -9041,6 +9429,41 @@ impl Owner {
             self.pause_incomplete_torrents_for_storage();
             self.publish_now();
         }
+    }
+
+    /// The latched failures as the operator reads them: what failed, where,
+    /// and which configured volume that is — resolved against the same
+    /// readings the storage panel shows, so the banner and the panel name
+    /// the volume the same way.
+    fn space_failure_snapshots(
+        &self,
+        reading: &DiskGuardReading,
+    ) -> Vec<crate::snapshot::SpaceFailureSnapshot> {
+        use crate::space_probe::SpaceOp;
+        self.enospc_failures
+            .iter()
+            .map(|(op, failure)| {
+                let path = failure.path.clone();
+                let volume = path
+                    .as_deref()
+                    .and_then(|path| crate::volumes::volume_containing(&reading.volumes, path));
+                crate::snapshot::SpaceFailureSnapshot {
+                    operation: match op {
+                        SpaceOp::Write { .. } => "download write",
+                        SpaceOp::Finalize { .. } => "publish",
+                        SpaceOp::Post { .. } => "post-processing",
+                        SpaceOp::Terminal => "terminal store",
+                        SpaceOp::Directory(_) => "write",
+                    }
+                    .to_owned(),
+                    detail: failure.whence.clone(),
+                    path: path.map(|path| path.to_string_lossy().into_owned()),
+                    volume: volume.map(|(volume, _)| volume.name()),
+                    volume_label: volume.map(|(volume, _)| volume.label.clone()),
+                    volume_path: volume.map(|(_, root)| root.to_string_lossy().into_owned()),
+                }
+            })
+            .collect()
     }
 
     /// Operator resume clears the latch: they have been told what
@@ -9109,7 +9532,7 @@ impl Owner {
     }
 
     /// W5a: while latched, gather evidence for each recorded failure on a
-    /// backoff (30 s doubling to 10 min), off the owner thread. Failures
+    /// backoff (30–60 s), off the owner thread. Failures
     /// whose operation no longer exists are dropped here; see
     /// [`Self::space_probe_plan`] for what each remaining one waits on.
     fn maybe_probe_space(&mut self) {
@@ -9296,10 +9719,16 @@ impl Owner {
                         }
                     }
                     SpaceOp::Post { job } => {
-                        if self.space_retry_runnable(op) {
+                        if self.post_admissions.contains_key(job) {
                             return None;
                         }
-                        job_dir(*job, failure)
+                        // A post report's path is already the directory the
+                        // write went into (`report_out_of_space_for`), not a
+                        // file whose parent is the job's directory.
+                        match &failure.path {
+                            Some(dir) => Target::Dirs(vec![(dir.clone(), failure.bound(dir))]),
+                            None => job_dir(*job, failure),
+                        }
                     }
                     SpaceOp::Directory(dir) if dir.as_os_str().is_empty() => {
                         Target::Dirs(failure.probe_roots())
@@ -9362,7 +9791,7 @@ impl Owner {
             self.space_probe_failures = self.space_probe_failures.saturating_add(1);
             let backoff = 30u64
                 .saturating_mul(1 << self.space_probe_failures.min(5))
-                .min(600);
+                .min(60);
             self.space_probe_after = Instant::now() + Duration::from_secs(backoff);
         }
         self.settle_space_latch();
@@ -9559,6 +9988,12 @@ impl Owner {
             self.replay_terminals();
         }
         self.convert_legacy_holds();
+        if self.tuning.health_abort {
+            let jobs = self.state.jobs.iter().map(|job| job.id).collect::<Vec<_>>();
+            for job in jobs {
+                self.maybe_abort_unhealthy(job);
+            }
+        }
         self.persist_post_rollbacks_then(|_| {});
         self.retry_payload_recoveries();
         self.start_verifications();
@@ -10568,6 +11003,7 @@ impl Owner {
                     }
                 }
                 if self.verification.contains_key(&j.id)
+                    || self.job_disposing(j.id)
                     || self.retiring_writers.contains_key(&j.id)
                     || self.pending_control_commits.contains(&j.id)
                 {
@@ -10649,6 +11085,12 @@ impl Owner {
         let snap = QueueSnapshot {
             up_since_unix: self.up_since_unix,
             queue_authority: self.persist,
+            job_disposition_fences: self
+                .disposition_fences
+                .iter()
+                .filter(|(job, _)| self.job_disposing(**job))
+                .map(|(job, (transfer, _))| (*job, transfer.clone()))
+                .collect(),
             pending_automatic_controls: self
                 .state
                 .jobs
@@ -10718,6 +11160,7 @@ impl Owner {
                 .collect(),
             enospc_observed: self.enospc_observed,
             enospc_where: self.enospc_where.clone(),
+            enospc_failures: self.space_failure_snapshots(disk_guard),
             blocked_servers,
             health_abort: self.tuning.health_abort,
             server_volumes: {
@@ -10961,7 +11404,27 @@ fn refresh_url_admission_custody(
     receipt: &mut UrlAdmissionReceipt,
     inventory: &nzbd_state::artifacts::Inventory,
 ) -> bool {
-    let pinned = pin_unpinned_failed_source(receipt, inventory);
+    let exact = if receipt.source_artifact_id.is_none()
+        && receipt.source_generation.is_none()
+        && receipt.runner_instance_id == inventory.installation
+    {
+        let binding = nzbd_state::artifacts::JobAdmissionBinding {
+            job_id: receipt.job_id,
+            transfer: receipt.request_token.clone(),
+            instance: receipt.runner_instance_id.clone(),
+            generation: receipt.generation.clone(),
+        };
+        if let Ok(Some(source)) = inventory.job_disposition_source(&binding) {
+            receipt.source_artifact_id = Some(source.artifact);
+            receipt.source_generation = Some(source.generation);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let pinned = exact || pin_unpinned_failed_source(receipt, inventory);
     refresh_pinned_url_admission_custody(receipt, inventory) || pinned
 }
 
@@ -11229,10 +11692,18 @@ pub(crate) fn rearmed_hold(
     if identity_wedge {
         control.next_retry_at_unix = Some(now);
     }
+    let storage_delay = (cause.is_storage() || cause == nzbd_types::HoldCause::StorageUnavailable)
+        && control
+            .next_retry_at_unix
+            .is_some_and(|at| at > now.saturating_add(60));
+    if storage_delay {
+        control.next_retry_at_unix = Some(now.saturating_add(60));
+    }
     if control.cause == cause.as_str()
         && control.retry_policy == policy.as_str()
         && !unscheduled
         && !identity_wedge
+        && !storage_delay
     {
         return None;
     }
@@ -11348,8 +11819,9 @@ fn url_submission_sha256(
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn url_admission_generation(job: JobId, token: &str, instance: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
+fn url_admission_generation(job: JobId, token: &str, instance: &str, nonce: &str) -> String {
+    let digest =
+        Sha256::digest(serde_json::to_vec(&(token, nonce)).expect("generation inputs serialize"));
     format!("{}-url-{}-{:x}", instance, job.0, digest)
 }
 

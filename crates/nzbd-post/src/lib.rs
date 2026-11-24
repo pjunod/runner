@@ -59,10 +59,76 @@ pub enum PostError {
     /// is salvageable from evidence that contradicts itself.
     #[error("identity: {0}")]
     Identity(String),
+    /// A filesystem call failed: `op` is the human verb, `path` what it was
+    /// applied to. Every fs call in this crate reports through
+    /// [`FsContext::at`] so an operator reading "No space left on device"
+    /// also reads which file, and the out-of-space hold can name the volume.
+    #[error("{op} {}: {source}", .path.display())]
+    Fs {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// An I/O-shaped failure with no filesystem path behind it (a pipe, a
+    /// cancelled wait, an invariant this crate raises itself). Built
+    /// explicitly: there is deliberately no `From<io::Error>`, because a
+    /// blanket conversion is how a write's path gets lost.
     #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
     #[error("artifact inventory: {0}")]
     Artifact(#[from] nzbd_state::artifacts::Error),
+}
+
+impl PostError {
+    /// The file or directory a filesystem failure was applied to, when the
+    /// error records one.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            PostError::Fs { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The refused capacity reservation behind this error, if that is what
+    /// it is: a forecast, not a failed write.
+    pub fn capacity_shortfall(&self) -> Option<&nzbd_state::capacity::CapacityShortfall> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(error) = current {
+            if let Some(shortfall) = error
+                .downcast_ref::<std::io::Error>()
+                .and_then(nzbd_state::capacity::CapacityShortfall::of)
+            {
+                return Some(shortfall);
+            }
+            current = error.source();
+        }
+        None
+    }
+
+    /// The underlying `io::Error`, for callers that match its kind.
+    pub fn io(&self) -> Option<&std::io::Error> {
+        match self {
+            PostError::Fs { source, .. } | PostError::Io(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Attach the operation and path to a `std::io` result (nzbd-state's
+/// `fsx` convention, for this crate's `PostError`).
+pub(crate) trait FsContext<T> {
+    fn at(self, op: &'static str, path: &std::path::Path) -> Result<T, PostError>;
+}
+
+impl<T> FsContext<T> for std::io::Result<T> {
+    fn at(self, op: &'static str, path: &std::path::Path) -> Result<T, PostError> {
+        self.map_err(|source| PostError::Fs {
+            op,
+            path: path.to_path_buf(),
+            source,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

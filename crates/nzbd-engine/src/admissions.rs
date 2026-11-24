@@ -5,6 +5,20 @@ use nzbd_types::Job;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
+/// Deliberately independent of job IDs, tokens and snapshot high-water marks.
+pub(crate) fn generation_nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut random = std::collections::hash_map::RandomState::new().build_hasher();
+    random.write_u32(std::process::id());
+    random.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    format!("{:016x}", random.finish())
+}
+
 pub(crate) fn identity(receipt: &UrlAdmissionReceipt) -> String {
     format!(
         "{:x}",

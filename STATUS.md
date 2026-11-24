@@ -1,5 +1,88 @@
 # nzbd — Project Status
 
+## Out-of-space hold says what and where — 2026-11-15 (0.9.8)
+
+**Status:** branch `claude/enospc-where` (from main 648112d), draft PR.
+Owner: Claude (Opus 5.5 session). Root cause reviewed by Fable
+(agree-with-changes; changes taken). Next: adversarial review of the diff →
+fixes → `make fast-check` once → merge → Paul deploys.
+
+Field report: "out of space on a configured write volume — downloads held
+(observed from a write: post-processing job 3586: io: No space left on
+device (os error 28))" with 152 GiB free on /processing and no volume or
+path named. Root causes: (1) `capacity::reserve` refused a *forecast* with a
+synthetic `ENOSPC` indistinguishable from the kernel's, so a reservation
+shortfall latched all downloads as an observed write failure; (2) extraction
+reserved the job's whole size on the output dir *and* on the scratch
+workspace even on one filesystem (2× job size + 1 GiB + every in-flight
+claim — four jobs in post-processing at once easily exceed 152 GiB);
+(3) `PostError::Io(#[from] io::Error)` dropped the path at ~90 sites and the
+manager reported with path `None`; (4) the banner asserted "a configured
+write volume" without knowing which. Fix: typed `CapacityShortfall` naming
+root and numbers; reserve once per filesystem; `PostError::Fs { op, path }`
+everywhere, path passed to the report; each latched failure resolved to the
+storage-panel volume in web and mobile.
+
+Follow-ups: `nzbd_state::artifacts::Error::Io(#[from])` still drops paths
+(reaches post as `Artifact`); the writer's per-file reservation shortfall
+latches through the directory probe, which a successful probe write can
+clear while the forecast still fails.
+
+## Download throughput — 2026-11-15 (0.9.7)
+
+**Status:** branch `claude/runner-download-throughput` (from main 51d4980),
+adversarial review addressed, `make fast-check` green on the merge candidate
+(1,091 passed, 0 failed, 0 skipped, `NZBD_REQUIRE_TOOLS=1`). Owner: Claude
+(Opus 5.5 session). PR #337, merged; deployed (0.9.7, now 0.9.8).
+**Accepted on nuc4:** a 73.4 GiB, ~107 k-article job sustained 100.0 MiB/s
+untraced on 2026-11-18 (from 41.0 MiB/s in §10), 92 % of the 109 MiB/s
+target — [speed plan §15](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md).
+
+Root causes (benchmarked, [speed plan §15](docs/DOWNLOAD_SPEED_ROOT_CAUSE_PLAN.md)):
+the owner re-parsed and re-serialized each file's whole proof (every range)
+per article — quadratic in the file's article count, so throughput fell as
+files grew (994 → 610 articles/s from 1.5 k to 12 k articles) — and the
+writer still synced about once per article on GlusterFS. Fix: the writer's
+durability checkpoint (32 MiB / full coverage / 1 s / control command) is
+the unit of acknowledgement, one owner proof update per checkpoint; indexed
+range checks. (A sliding pipeline window was measured and left out — §15.)
+Durability is unchanged: nothing is acknowledged before the sync covering
+it. Bench: 59.5 → 125.2 MiB/s on a 12 k-article file, now flat with size.
+
+## NZB fetch retry ladder + retry now — 2026-11-15 (0.9.6, app 1.1.9)
+
+**Status:** built; branch `claude/nzb-fetch-retry-ladder`, draft PR. Owner:
+Claude (Opus 5.5 session). Adversarial review done (5 findings, all fixed). Next:
+fast-check → CI → merge → deploy (Paul).
+
+Field report: items sat in **Fetching NZB** after an indexer 429 with the
+next retry ~12 h out and no way to move them. Root cause: the fetch ladder
+treated the provider's `Retry-After` as a lower bound (`max(Retry-After,
+30/60/120/300 s)`), and quota-exhausted indexers answer with 12–22 h values
+(same mechanism as the 2026-11-01 report). The job panel's **retry now**
+only covered holds and failed-source cleanup.
+
+Changes:
+- Ladder is now 1, 5, 10, then every 30 min (429/503, timeouts, transport
+  errors). A `Retry-After` up to 30 min is a floor for that step; a longer
+  one is not obeyed, and the job's last error says what the indexer asked
+  (`indexer asked to wait 12h`).
+- A restarted fetch clamps a persisted deadline to its step, so rows parked
+  under the old policy come back within 30 min of the deploy.
+- `POST /api/v1/jobs/{id}/retry` on a fetching job ends the current wait
+  (fetch ladder or URL dispatcher backoff) and requests the NZB now; a repeat
+  refusal continues up the ladder. A kick names the deadline it saw, so a
+  double click cannot skip a later wait; in flight, held, or without queue
+  authority it answers 409. Web UI detail panel and the app's
+  expanded Fetching card (1.1.9) show **retry now** while a retry is
+  scheduled.
+- Unchanged: the URL dispatcher's worker-exit backoff (30/60/120/300 s) and
+  storage/coordination retry lanes.
+
+Post-deploy check: a fetching row with a 429 shows `next` within 1 min of
+its first refusal; **retry now** on it sends a request immediately (runner
+log: `operator requested an immediate NZB fetch retry`).
+
 ## Park ENOENT (job 2710) — 2026-11-12 (0.9.4)
 
 **Status:** built; branch `claude/park-enoent` (from main 5e15dd3, pushed;

@@ -288,6 +288,7 @@ async fn engine_shutdown_drains_real_writer_acknowledgement_behind_full_result_c
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
         url_fetch_wakeup: Default::default(),
+        url_retry_kicks: Default::default(),
         post_scope: None,
         queue_changes: owner.epoch_tx.subscribe(),
         owner_heartbeat: owner.owner_heartbeat.clone(),
@@ -3535,6 +3536,7 @@ async fn operator_storage_release_runs_the_job_and_resets_the_probe() {
     pump(&mut owner, &mut messages).await;
     let mut c = owner.state.jobs[0].control().unwrap();
     c.manual_pause = true;
+    c.next_retry_at_unix = Some(unix_now() + 999);
     owner.state.jobs[0].set_control(&c);
     // A probe just ran: the recovery task must wait, a person need not.
     owner.state.jobs[0].params.extend([
@@ -4819,8 +4821,11 @@ async fn a_failure_whose_job_cannot_retry_is_probed() {
         "a post-side hold is never gated by the latch; only finalize is listed"
     );
     assert!(
-        owner.space_probe_plan().is_empty(),
-        "runnable jobs retry themselves"
+        owner
+            .space_probe_plan()
+            .iter()
+            .any(|planned| planned.op == post),
+        "post failures are probed without waiting on a lane toggle"
     );
 
     owner.state.job_mut(JobId(2)).unwrap().status = JobStatus::Paused;
@@ -5782,6 +5787,7 @@ async fn public_delete_cancels_pending_verification_and_retains_payload() {
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
         url_fetch_wakeup: Default::default(),
+        url_retry_kicks: Default::default(),
         post_scope: None,
         queue_changes: owner.epoch_tx.subscribe(),
         owner_heartbeat: owner.owner_heartbeat.clone(),
@@ -5885,6 +5891,7 @@ async fn automatic_hold_recovery_bounds_each_pass_and_rotates_all_due_jobs() {
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Arc::new(std::sync::Mutex::new(HashSet::new())),
         url_fetch_wakeup: Default::default(),
+        url_retry_kicks: Default::default(),
         post_scope: None,
         queue_changes: owner.epoch_tx.subscribe(),
         owner_heartbeat: owner.owner_heartbeat.clone(),
@@ -7841,9 +7848,10 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
     pump(&mut owner, &mut messages).await;
     let revision = owner.state.jobs[0].control().unwrap().revision;
     for attempt in 1..=12 {
-        owner.state.jobs[0]
-            .params
-            .retain(|(key, _)| key != "*Control:probe_after");
+        let mut control = owner.state.jobs[0].control().unwrap();
+        control.next_retry_at_unix = Some(unix_now());
+        control.retry_attempt = attempt;
+        owner.state.jobs[0].set_control(&control);
         let (reply, result) = oneshot::channel();
         owner.on_command(QueueCommand::BeginResourceProbe {
             job: JobId(1),
@@ -7858,6 +7866,9 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
             "resource retry {attempt} must remain admitted"
         );
     }
+    let mut control = owner.state.jobs[0].control().unwrap();
+    control.next_retry_at_unix = Some(unix_now() + 60);
+    owner.state.jobs[0].set_control(&control);
     let (reply, result) = oneshot::channel();
     owner.on_command(QueueCommand::BeginResourceProbe {
         job: JobId(1),
@@ -7884,15 +7895,59 @@ async fn resource_probes_continue_after_eight_failures_and_explicit_retry_bypass
         result.await.unwrap(),
         "explicit retry can probe immediately"
     );
-    let count = owner.state.jobs[0]
+    assert!(owner.state.jobs[0]
         .params
         .iter()
-        .find(|(key, _)| key == "*Control:attempts")
-        .unwrap()
-        .1
-        .parse::<u32>()
-        .unwrap();
-    assert_eq!(count, 13);
+        .all(|(key, _)| { key != "*Control:probe_after" && key != "*Control:attempts" }));
+}
+
+#[tokio::test]
+async fn migrated_resource_probe_uses_due_control_instead_of_legacy_clock() {
+    let (_tmp, mut owner, _adapter, mut messages) = control_test_owner();
+    owner.state.jobs.push(pending_job(1));
+    assert!(owner.hold_job(JobId(1), HoldCause::Capacity, "download_write", "disk full"));
+    pump(&mut owner, &mut messages).await;
+    let mut control = owner.state.jobs[0].control().unwrap();
+    control.next_retry_at_unix = Some(unix_now());
+    owner.state.jobs[0].set_control(&control);
+    owner.state.jobs[0].params.extend([
+        (
+            "*Control:probe_after".into(),
+            (unix_now() + 1920).to_string(),
+        ),
+        ("*Control:attempts".into(), "8".into()),
+    ]);
+    control.manual_pause = true;
+    owner.state.jobs[0].set_control(&control);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginResourceProbe {
+        job: JobId(1),
+        revision: control.revision.clone(),
+        by: RetryBy::Recovery,
+        guard: Default::default(),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(!result.await.unwrap(), "a due retry preserves manual pause");
+    control.manual_pause = false;
+    owner.state.jobs[0].set_control(&control);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::BeginResourceProbe {
+        job: JobId(1),
+        revision: control.revision,
+        by: RetryBy::Recovery,
+        guard: Default::default(),
+        reply,
+    });
+    pump(&mut owner, &mut messages).await;
+    assert!(
+        result.await.unwrap(),
+        "the due control owns the retry clock"
+    );
+    assert!(owner.state.jobs[0]
+        .params
+        .iter()
+        .all(|(key, _)| { key != "*Control:probe_after" && key != "*Control:attempts" }));
 }
 
 #[test]
@@ -8380,6 +8435,7 @@ fn url_dispatch_test_handle(
         budget_tracker: Arc::new(crate::pool::BudgetTracker::new(0)),
         url_fetches: Default::default(),
         url_fetch_wakeup: Default::default(),
+        url_retry_kicks: Default::default(),
         hold_probes: Default::default(),
         recovery_cursor: Default::default(),
         post_scope: None,
@@ -9436,7 +9492,12 @@ fn a_legacy_identity_hold_retries_now() {
     assert!(crate::owner::rearmed_hold(rearmed, 100).is_none());
     let mut other = control;
     other.message = "ENOTCONN".into();
-    assert!(crate::owner::rearmed_hold(other, 100).is_none());
+    assert_eq!(
+        crate::owner::rearmed_hold(other, 100)
+            .unwrap()
+            .next_retry_at_unix,
+        Some(160)
+    );
 }
 
 /// Where the simulated kill -9 lands.
@@ -9818,4 +9879,259 @@ async fn worker_expiry_freezes_due_revision_durably_and_refuses_stale_or_revoked
         frozen,
         "regrant cannot restart deadline or release episode"
     );
+}
+
+/// The out-of-space hold names the volume and path, resolved against the
+/// same readings the storage panel shows; a report with no path says the
+/// volume is unknown rather than guessing.
+#[tokio::test]
+async fn a_latched_failure_names_its_volume_and_path() {
+    use crate::space_probe::SpaceOp;
+    use crate::volumes::{StorageMemberReading, StorageVolumeReading};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(3));
+    owner.state.jobs.push(pending_job(4));
+    let processing = tmp.path().join("processing");
+    let reading = DiskGuardReading {
+        volumes: vec![StorageVolumeReading {
+            label: "intermediate · completed".into(),
+            path: processing.clone(),
+            available_bytes: Some(1),
+            total_bytes: Some(2),
+            device_id: None,
+            current: true,
+            roles: vec!["intermediate".into(), "completed".into()],
+            members: vec![StorageMemberReading {
+                path: processing.clone(),
+                parent_device_id: None,
+            }],
+        }],
+        ..Default::default()
+    };
+    let job_dir = processing.join("job-3");
+    owner.observe_space_failure(
+        "post-processing job 3: reserve space on …",
+        SpaceOp::Post { job: JobId(3) },
+        Some(job_dir.clone()),
+    );
+    owner.observe_space_failure(
+        "post-processing job 4: io: …",
+        SpaceOp::Post { job: JobId(4) },
+        None,
+    );
+    let mut failures = owner.space_failure_snapshots(&reading);
+    failures.sort_by(|a, b| a.detail.cmp(&b.detail));
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    let named = &failures[0];
+    assert_eq!(named.operation, "post-processing");
+    assert_eq!(
+        named.path.as_deref(),
+        Some(job_dir.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        named.volume_path.as_deref(),
+        Some(processing.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        named.volume.as_deref(),
+        Some(reading.volumes[0].name().as_str())
+    );
+    let unknown = &failures[1];
+    assert_eq!(unknown.path, None);
+    assert_eq!(unknown.volume, None, "no path means no volume, not a guess");
+}
+
+/// Review #338-1: a post report's path is the directory the write went
+/// into. When that directory is a configured root itself, the probe goes
+/// there — not to its parent, which is another filesystem.
+#[tokio::test]
+async fn a_post_failure_is_probed_in_its_own_directory() {
+    use crate::space_probe::{SpaceOp, Target};
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.jobs.push(pending_job(3));
+    owner.state.post_paused = true;
+    let root = tmp.path().join("dest");
+    owner.observe_space_failure("post", SpaceOp::Post { job: JobId(3) }, Some(root.clone()));
+    let plan = owner.space_probe_plan();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    match &plan[0].target {
+        Target::Dirs(dirs) => {
+            assert_eq!(dirs.iter().map(|(d, _)| d).collect::<Vec<_>>(), vec![&root])
+        }
+        other => panic!("unexpected target {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn unhealthy_restored_job_ends_with_leased_articles_and_paused_pars() {
+    let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning {
+        health_abort: true,
+        ..Tuning::default()
+    });
+    pump(&mut owner, &mut messages).await;
+    let mut job = pending_job(81);
+    job.status = JobStatus::Downloading;
+    job.files[0].segments[0].state = SegmentState::Failed;
+    let mut leased = job.files[0].segments[0].clone();
+    leased.number = 2;
+    leased.state = SegmentState::Leased {
+        server: ServerId(1),
+    };
+    job.files[0].segments.push(leased);
+    let mut par = job.files[0].clone();
+    par.id = FileId(811);
+    par.is_par2 = true;
+    par.paused = true;
+    par.segments.truncate(1);
+    par.segments[0].size = 1;
+    par.segments[0].state = SegmentState::Pending;
+    job.files.push(par);
+    recompute_job_totals(&mut job);
+    owner.state.jobs.push(job);
+    let (tx, _rx) = mpsc::channel(1);
+    let (_stopped, stopped) = watch::channel(false);
+    let cancel = CancellationToken::new();
+    owner.writers.insert(
+        FileId(810),
+        WriterHandle {
+            tx,
+            stopped,
+            stop: cancel.clone(),
+            generation: 1,
+        },
+    );
+    owner.maybe_abort_unhealthy(JobId(81));
+    assert!(
+        cancel.is_cancelled(),
+        "active article producer must be canceled"
+    );
+    pump(&mut owner, &mut messages).await;
+    assert_eq!(
+        owner.state.job(JobId(81)).unwrap().status,
+        JobStatus::Failed
+    );
+    assert_eq!(
+        owner.artifacts.terminal(81).unwrap().unwrap().reason,
+        Some(nzbd_types::FailureReason::Health)
+    );
+    assert!(
+        !owner.writer_epochs.contains_key(&FileId(810)),
+        "late writes are fenced"
+    );
+}
+
+#[tokio::test]
+async fn storage_retry_preserves_pause_flags_and_requires_probe_evidence() {
+    use crate::space_probe::SpaceOp;
+    let (tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning::default());
+    pump(&mut owner, &mut messages).await;
+    owner.state.download_paused = true;
+    owner.state.post_paused = true;
+    owner.observe_out_of_space_in("write", Some(tmp.path().join("dest")));
+    owner.space_probe_after = Instant::now() + Duration::from_secs(600);
+    let (reply, result) = oneshot::channel();
+    owner.on_command(QueueCommand::RetryStorage { reply });
+    result.await.unwrap();
+    assert!(owner.state.download_paused && owner.state.post_paused);
+    assert!(
+        owner.enospc_latched,
+        "request is not proof that space is free"
+    );
+    assert!(
+        owner.space_probe_inflight,
+        "button starts a probe immediately"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.space_probe_inflight {
+            owner.on_msg(messages.recv().await.unwrap());
+        }
+    })
+    .await
+    .expect("storage probe did not answer");
+    assert!(
+        !owner.enospc_latched,
+        "successful real write clears the latch"
+    );
+    assert!(!owner
+        .enospc_failures
+        .contains_key(&SpaceOp::Directory(tmp.path().join("dest"))));
+    assert!(owner.state.download_paused && owner.state.post_paused);
+}
+
+#[test]
+fn old_storage_backoff_is_shortened_without_unpausing() {
+    let mut control: nzbd_types::JobControl = serde_json::from_value(serde_json::json!({
+        "version": 1, "revision": "1", "lifecycle": "held", "cause": "storage_unavailable",
+        "stage": "post", "retry_policy": "scheduled_retry", "message": "disk full",
+        "instance": "test", "manual_pause": false, "retry_attempt": 10
+    }))
+    .unwrap();
+    control.next_retry_at_unix = Some(20_000);
+    control.manual_pause = true;
+    let rearmed = rearmed_hold(control, 100).unwrap();
+    assert_eq!(rearmed.next_retry_at_unix, Some(160));
+    assert!(rearmed.manual_pause);
+}
+
+#[tokio::test]
+async fn download_only_worker_reports_failure_without_local_terminal_history() {
+    for deferred in [false, true] {
+        let (_tmp, mut owner, _epoch, mut messages) = guard_test_owner(Tuning {
+            health_abort: true,
+            ..Default::default()
+        });
+        pump(&mut owner, &mut messages).await;
+        owner.history = None;
+        owner.persist = false;
+        owner.worker_mode = true;
+        let mut job = pending_job(82);
+        job.status = JobStatus::Downloading;
+        job.files[0].segments[0].state = SegmentState::Failed;
+        recompute_job_totals(&mut job);
+        job.params.push((
+            nzbd_state::artifacts::WORKER_CONTROL_CONTEXT_PARAM.into(),
+            serde_json::to_string(&nzbd_state::artifacts::WorkerControlContext {
+                lease_id: "download-82".into(),
+                job_incarnation: "job-82".into(),
+                job_revision: 1,
+                control_revision: 1,
+                epoch: 1,
+            })
+            .unwrap(),
+        ));
+        owner.state.jobs.push(job);
+        if deferred {
+            owner.pending_control_commits.insert(JobId(82));
+        }
+        owner.maybe_abort_unhealthy(JobId(82));
+        if deferred {
+            assert!(owner.deferred_terminals.contains_key(&JobId(82)));
+            owner.pending_control_commits.remove(&JobId(82));
+            owner.replay_terminals();
+        }
+        let row = owner.state.job(JobId(82)).unwrap();
+        assert_eq!(
+            row.status,
+            JobStatus::Failed,
+            "completion must reach the existing authority outbox"
+        );
+        assert!(!row.held(), "no PP history is not a storage fault");
+        assert!(
+            !row.params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM),
+            "worker cannot stamp the authoritative terminal"
+        );
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, value)| key == "Failure:Reason" && value == "health"));
+        assert!(row
+            .params
+            .iter()
+            .any(|(key, _)| key == crate::terminal::DOWNLOAD_FAILURE_PARAM));
+        assert!(owner.artifacts.terminal(82).unwrap().is_none());
+    }
 }

@@ -185,7 +185,10 @@ impl ScriptHost {
             }
             None => {
                 crate::attempt::kill_child(&mut child, group).await?;
-                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "script cancelled").into())
+                Err(PostError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "script cancelled",
+                )))
             }
         }
     }

@@ -5910,6 +5910,86 @@ fn expired_worker_parking_preserves_unknown_bytes_keep_and_legacy_enrollment() {
 }
 
 #[test]
+fn expired_worker_disposal_obeys_retention_and_exact_source_safeguards() {
+    for (owned, enrolled, keep, retain_failed, unknown, live_use) in [
+        (true, true, false, false, false, false),
+        (true, true, false, true, false, false),
+        (true, true, true, false, false, false),
+        (true, false, false, false, false, false),
+        (false, false, false, false, false, false),
+        (true, true, false, false, true, false),
+        (true, true, false, false, false, true),
+    ] {
+        let (_tmp, db, root) = fixture();
+        let db = Arc::new(db);
+        let path = root.join("stopped");
+        let mut artifact = if owned {
+            db.allocate_for_delivery(905, &root, &path, true, enrolled)
+                .unwrap()
+        } else {
+            std::fs::create_dir(&path).unwrap();
+            db.register_legacy_active(905, &root, &path).unwrap();
+            db.for_job(905).unwrap().unwrap()
+        };
+        std::fs::write(path.join("partial.rar"), b"uncertain recovery input").unwrap();
+        artifact.keep = keep;
+        artifact.automatic_cleanup_eligible = enrolled;
+        save_artifact(&db.db.lock().unwrap(), &artifact).unwrap();
+        let context = WorkerControlContext {
+            lease_id: "exact-grant".into(),
+            job_incarnation: "905".into(),
+            job_revision: 1,
+            control_revision: 1,
+            epoch: 1,
+        };
+        let request = WorkerStopRequest {
+            job: 905,
+            context,
+            owner_incarnation: "worker-boot".into(),
+            storage_instance_id: db.installation.clone(),
+            removal_revision: None,
+            authority_source_json: None,
+            start_ordered: true,
+        };
+        db.begin_worker_grant(&request).unwrap();
+        let ticket = db.prepare_worker_stop(&request).unwrap();
+        let receipt = db
+            .commit_worker_stopped(
+                &ticket,
+                &[SourceGeneration {
+                    artifact: artifact.id.clone(),
+                    generation: artifact.generation.clone(),
+                }],
+            )
+            .unwrap();
+        let names = vec!["partial.rar".into()];
+        if unknown {
+            std::fs::write(path.join("foreign.bin"), b"unrecorded bytes").unwrap();
+        }
+        let use_guard = live_use.then(|| db.acquire_attempt_use(905).unwrap().unwrap());
+        let result =
+            db.dispose_expired_worker_sources(&receipt, retain_failed, &names, "durable-expiry");
+        if unknown || live_use {
+            assert!(result.is_err());
+            assert!(path.join("partial.rar").exists());
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+            let deleted = owned && enrolled && !keep && !retain_failed;
+            assert_eq!(!path.exists(), deleted);
+            if deleted {
+                assert_eq!(db.get(&artifact.id).unwrap().state, "deleted");
+            }
+        }
+        drop(use_guard);
+        let mut wrong = receipt.clone();
+        wrong.sources[0].generation = "replacement".into();
+        assert!(db
+            .dispose_expired_worker_sources(&wrong, false, &names, "durable-expiry")
+            .is_err());
+    }
+}
+
+#[test]
 fn expiry_checkpoint_and_outbox_are_atomic_and_empty_reboot_stop_is_rejected() {
     let (tmp, db, root) = fixture();
     let path = root.join("expiry");
@@ -6058,7 +6138,7 @@ fn expiry_checkpoint_and_outbox_are_atomic_and_empty_reboot_stop_is_rejected() {
 }
 
 #[test]
-fn hold_expired_blocks_replay_of_old_failed_delete_without_deleting_bytes() {
+fn hold_expired_old_delete_still_requires_current_automatic_authorization() {
     let (_tmp, db, root) = fixture();
     let path = root.join("expired-delete");
     let mut source = db
@@ -6089,7 +6169,7 @@ fn hold_expired_blocks_replay_of_old_failed_delete_without_deleting_bytes() {
     save_operation(&db.db.lock().unwrap(), &op).unwrap();
     let cancelled = db.execute_delete(&op.id).unwrap();
     assert_eq!(cancelled.state, "cancelled");
-    assert!(cancelled.error.unwrap().contains("hold-expired"));
+    assert!(cancelled.error.unwrap().contains("authorization changed"));
     assert_eq!(
         std::fs::read(path.join("payload.bin")).unwrap(),
         b"uncertain bytes"

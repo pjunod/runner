@@ -2,6 +2,10 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+mod assembly;
+use assembly::AssemblyWorkspace;
+pub use assembly::WorkerAssemblyRetirement;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerStopRequest {
@@ -36,6 +40,8 @@ struct GrantJournal {
     never_started: bool,
     #[serde(default)]
     receipt: Option<WorkerStoppedReceipt>,
+    #[serde(default)]
+    assembly: Option<AssemblyWorkspace>,
 }
 #[derive(Clone, Debug)]
 pub struct WorkerStopTicket {
@@ -145,6 +151,38 @@ impl Inventory {
                 "owned copy identity/use changed; retain for review".into(),
             ));
         }
+        if artifact.terminal() {
+            // Recheck absence under the recorded mount and directory handle.
+            // A missing/rebound volume is an unresolved source observation.
+            if artifact.gone_reason.is_some() {
+                return Err(Error::Conflict(
+                    "source absence was not verified against its owned root".into(),
+                ));
+            }
+            let root = self.verify_root(&artifact)?;
+            let relative = artifact
+                .path
+                .strip_prefix(&artifact.root)
+                .map_err(|_| Error::Conflict("retired source escaped its owned root".into()))?;
+            let parent_path = relative
+                .parent()
+                .ok_or_else(|| Error::Conflict("retired source has no parent".into()))?;
+            let parent = if parent_path.as_os_str().is_empty() {
+                root
+            } else {
+                fs::open_relative(&root, &parent_path.to_string_lossy())?
+            };
+            let name = relative
+                .file_name()
+                .ok_or_else(|| Error::Conflict("retired source has no name".into()))?;
+            if fs::entry_missing_at(&parent, name)? {
+                fs::sync_directory(&parent)?;
+                return Ok(Vec::new());
+            }
+            return Err(Error::Conflict(
+                "retired source path was occupied again; retain for review".into(),
+            ));
+        }
         let directory = self.verify(&artifact)?;
         let observed = fs::manifest(&directory, 100_000)?;
         let recorded: std::collections::HashMap<_, _> = artifact
@@ -239,6 +277,14 @@ impl Inventory {
     /// This commit precedes private allocation/copy/import/writer creation.
     /// A removal fence and a late grant start serialize on the same guard.
     pub fn begin_worker_grant(&self, request: &WorkerStopRequest) -> Result<()> {
+        self.begin_worker_grant_with_assembly(request, None)
+    }
+
+    fn begin_worker_grant_with_assembly(
+        &self,
+        request: &WorkerStopRequest,
+        assembly: Option<AssemblyWorkspace>,
+    ) -> Result<()> {
         validate(request, &self.installation)?;
         if request.removal_revision.is_some() || !request.start_ordered {
             return Err(Error::Conflict(
@@ -270,6 +316,7 @@ impl Inventory {
                 phase: "started".into(),
                 never_started: false,
                 receipt: None,
+                assembly,
             },
         )
     }
@@ -316,6 +363,7 @@ impl Inventory {
             phase: "stopping".into(),
             never_started: true,
             receipt: None,
+            assembly: None,
         });
         if record.request.owner_incarnation != request.owner_incarnation
             || record.request.authority_source_json != request.authority_source_json
@@ -537,6 +585,137 @@ impl Inventory {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Settle a joined worker's exact source copies under the authority's
+    /// retention policy. Deletion uses the existing sealed cluster-copy journal.
+    pub fn dispose_expired_worker_sources(
+        &self,
+        receipt: &WorkerStoppedReceipt,
+        keep_failed_downloads: bool,
+        writer_paths: &[String],
+        terminal_receipt: &str,
+    ) -> Result<String> {
+        if keep_failed_downloads {
+            self.park_expired_worker_sources(receipt)?;
+            return Ok("stopped source copies retained by Keep failed downloads".into());
+        }
+        let sources = {
+            let _guard = self.mutation_guard()?;
+            let db = self.db.lock().unwrap();
+            let record = load(&db, &receipt.id)?.ok_or(Error::NotFound)?;
+            if record.phase != "stopped"
+                || record
+                    .receipt
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    != Some(serde_json::to_string(receipt)?)
+                || terminal_receipt.is_empty()
+            {
+                return Err(Error::Conflict(
+                    "exact joined source receipt unavailable".into(),
+                ));
+            }
+            let authority: Option<String> = db
+                .query_row(
+                    "SELECT data FROM worker_authority WHERE job=?1",
+                    [receipt.job],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if authority
+                .as_ref()
+                .map(|raw| serde_json::from_str::<WorkerControlContext>(raw))
+                .transpose()?
+                .is_some_and(|current| !same_worker_operation(&current, &receipt.context))
+            {
+                return Err(Error::Conflict(
+                    "a newer worker grant owns this source".into(),
+                ));
+            }
+            let mut sources = receipt.sources.clone();
+            for source in &receipt.sources {
+                let mut stmt = db.prepare("SELECT data FROM operations WHERE artifact=?1 AND json_extract(data,'$.kind') IN ('par_repair','extract')")?;
+                let rows = stmt.query_map([&source.artifact], |row| row.get::<_, String>(0))?;
+                for raw in rows {
+                    let operation: Operation = serde_json::from_str(&raw?)?;
+                    let workspace: super::transforms::Workspace =
+                        serde_json::from_str(&operation.request)?;
+                    if workspace.source.id == source.artifact
+                        && workspace.source.generation == source.generation
+                    {
+                        let child = SourceGeneration {
+                            artifact: workspace.scratch.id,
+                            generation: workspace.scratch.generation,
+                        };
+                        if !sources.contains(&child) {
+                            sources.push(child);
+                        }
+                    }
+                }
+            }
+            sources
+        };
+        let mut retained = 0;
+        for source in sources {
+            let artifact = self.get(&source.artifact)?;
+            if artifact.generation != source.generation {
+                return Err(Error::Conflict("stopped source generation changed".into()));
+            }
+            if artifact.terminal() {
+                continue;
+            }
+            if !artifact.owned
+                || !artifact.automatic_cleanup_eligible
+                || !artifact.delivery_lifecycle
+                || artifact.keep
+                || artifact.keep_on_failure
+            {
+                retained += 1;
+                continue;
+            }
+            // Only the transform workspace marker is an ended-attempt hold.
+            // All other holds/open moves and active users remain decisive.
+            if artifact.hold.as_deref() == Some("transform workspace") {
+                let _guard = self.mutation_guard()?;
+                let mut current = self.get(&source.artifact)?;
+                if current.generation != source.generation || self.source_in_use(&source) {
+                    return Err(Error::Conflict(
+                        "stopped transform source is still in use".into(),
+                    ));
+                }
+                current.hold = None;
+                current.revision += 1;
+                save_artifact(&self.db.lock().unwrap(), &current)?;
+            }
+            let copy = ClusterArtifactCopy {
+                storage_instance_id: self.installation.clone(),
+                publication: source.clone(),
+                source,
+                job_id: receipt.job,
+                selected: false,
+                raw_files: None,
+            };
+            let files = self.cluster_owned_copy_file_seal(&copy, writer_paths)?;
+            let result = self.retire_cluster_artifact_copy_with_failure_retention(
+                &copy,
+                nzbd_types::FailureReason::HoldExpired.history_status(),
+                FinalizationProof::Cluster {
+                    receipt: terminal_receipt.into(),
+                    accepted_at_ms: receipt.stopped_at_ms,
+                },
+                Some(&files),
+                terminal_receipt,
+                false,
+            )?;
+            if result.status != "removed" {
+                return Err(Error::Conflict(result.error.unwrap_or_else(|| {
+                    "failed source deletion remains pending".into()
+                })));
+            }
+        }
+        Ok(format!("stopped source deletion settled; {retained} copies retained by Keep or ownership safeguards"))
     }
 
     pub fn worker_expiry_outbox(&self, after: &str) -> Result<Vec<(String, String)>> {

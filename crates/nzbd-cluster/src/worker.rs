@@ -49,6 +49,9 @@ pub struct ActiveLeases {
     admissions: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
     operations: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
     retiring: Arc<Mutex<HashMap<String, LeaseKind>>>,
+    /// The completion lane can already be in a blocking seal when a worker
+    /// stop fence commits. Observing its result slot must wait for that join.
+    pub(crate) sealing: Arc<tokio::sync::Mutex<()>>,
 }
 impl std::ops::Deref for ActiveLeases {
     type Target = Mutex<HashMap<String, LeaseState>>;
@@ -615,6 +618,18 @@ async fn report_expired_holds(cfg: &ClusterConfig, engine: &EngineHandle, active
             fetched: nzbd_types::Fetched::of(&job),
             stop_request,
             stopped: None,
+            source_disposition: None,
+            writer_paths: job
+                .files
+                .iter()
+                .flat_map(|file| {
+                    let mut names = vec![format!(".runner-file-{}.part", file.id.0)];
+                    if file.filename_confirmed {
+                        names.push(file.filename.clone());
+                    }
+                    names
+                })
+                .collect(),
         };
         if let Ok(notice) = serde_json::to_string(&request) {
             let _ = engine
@@ -673,12 +688,29 @@ async fn drive_expiry_outbox(
     if !stopped.sources.contains(&request.source) {
         return Err("stopped receipt does not cover the selected source; custody retained".into());
     }
+    let keep_failed_downloads = reply
+        .get("keep_failed_downloads")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true); // Old authorities grant preservation only.
+                          // Persisted with the selected expiry so a lost final ACK can replay even
+                          // after local queue retirement. Historical requests can only use manifests.
+    let names = request.writer_paths.clone();
     let inventory = engine.artifacts();
     let proof = stopped.clone();
-    tokio::task::spawn_blocking(move || inventory.park_expired_worker_sources(&proof))
+    let terminal_receipt = request.receipt_id();
+    request.source_disposition = Some(
+        tokio::task::spawn_blocking(move || {
+            inventory.dispose_expired_worker_sources(
+                &proof,
+                keep_failed_downloads,
+                &names,
+                &terminal_receipt,
+            )
+        })
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?,
+    );
     engine
         .retire_worker_job(request.job, request.context.clone())
         .await
@@ -693,7 +725,7 @@ async fn drive_expiry_outbox(
     }
     let inventory = engine.artifacts();
     let key = key.to_string();
-    tokio::task::spawn_blocking(move||inventory.finish_worker_expiry_outbox(&key,"hold_expired terminal recorded; stopped sources parked/preserved; salvage assessment abandoned with explicit error")).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
+    tokio::task::spawn_blocking(move||inventory.finish_worker_expiry_outbox(&key,"hold_expired terminal recorded; source-owner retention policy settled; salvage assessment abandoned with explicit error")).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
     active.forget_joined(&request.context.lease_id);
     active
         .retiring
@@ -1033,44 +1065,59 @@ async fn report_completions(
             }
             continue;
         }
-        let sealed = match seal_generation(cfg, dest_dir, &job, &lease, engine.artifacts()).await {
-            Ok(sealed) => sealed,
-            Err(error) => {
-                tracing::warn!(job = job_id.0, %error, "completion generation could not be sealed");
+        let req = {
+            let _seal = active.sealing.lock().await;
+            if !lease_authority(active, &lease_id, &lease)()
+                || !matches!(
+                    engine
+                        .artifacts()
+                        .worker_grant_is_stopped(job_id.0, &lease.context),
+                    Ok(false)
+                )
+            {
                 continue;
             }
+            let sealed = match seal_generation(cfg, dest_dir, &job, &lease, engine.artifacts())
+                .await
+            {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    tracing::warn!(job = job_id.0, %error, "completion generation could not be sealed");
+                    continue;
+                }
+            };
+            let job = match std::fs::read(sealed.path.join("job.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            {
+                Some(job) => job,
+                None => continue,
+            };
+            let receipt_id = format!(
+                "complete:{}:{}:{}",
+                lease.token.resource, lease.token.fence, sealed.result_id
+            );
+            let req = CompleteRequest {
+                lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
+                node: cfg.node_name.clone(),
+                lease_id: lease_id.clone(),
+                token: lease.token.clone(),
+                expected_job_revision: lease.job_revision,
+                result_id: sealed.result_id,
+                result_ref: sealed.path.to_string_lossy().into_owned(),
+                receipt_id,
+                job,
+            };
+            if let Err(error) = persist_completion(cfg, lease.kind, &req) {
+                tracing::warn!(job=job_id.0,%error,"completion outbox commit failed");
+                continue;
+            }
+            std::fs::read(completion_path(cfg, &req))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<PendingCompletion>(&bytes).ok())
+                .map(|pending| pending.request)
+                .unwrap_or(req)
         };
-        let job = match std::fs::read(sealed.path.join("job.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        {
-            Some(job) => job,
-            None => continue,
-        };
-        let receipt_id = format!(
-            "complete:{}:{}:{}",
-            lease.token.resource, lease.token.fence, sealed.result_id
-        );
-        let req = CompleteRequest {
-            lifecycle_protocol: crate::proto::LIFECYCLE_PROTOCOL,
-            node: cfg.node_name.clone(),
-            lease_id: lease_id.clone(),
-            token: lease.token.clone(),
-            expected_job_revision: lease.job_revision,
-            result_id: sealed.result_id,
-            result_ref: sealed.path.to_string_lossy().into_owned(),
-            receipt_id,
-            job,
-        };
-        if let Err(error) = persist_completion(cfg, lease.kind, &req) {
-            tracing::warn!(job=job_id.0,%error,"completion outbox commit failed");
-            continue;
-        }
-        let req = std::fs::read(completion_path(cfg, &req))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PendingCompletion>(&bytes).ok())
-            .map(|pending| pending.request)
-            .unwrap_or(req);
         if submit_completion(
             cfg,
             engine,
@@ -1470,11 +1517,15 @@ async fn submit_completion(
     if decision.receipt_id != req.receipt_id {
         return false;
     }
-    if let Some(setup) = pp {
-        let mut retired = req.job.clone();
-        retired
+    if let Some(setup) = pp.as_ref().filter(|_| {
+        // Preserve a terminal previously emitted by the PP lane. This
+        // receipt decides source custody after rejection, not that outcome.
+        !req.job
             .params
-            .retain(|(key, _)| key != nzbd_types::PP_DONE_PARAM);
+            .iter()
+            .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+    }) {
+        let mut retired = req.job.clone();
         retired
             .params
             .push((nzbd_types::PP_DONE_PARAM.into(), "CANCELLED".into()));
@@ -1767,7 +1818,11 @@ async fn poll_for_work(
                 registered = true;
             }
             let inventory=engine.artifacts();
-            if let Err(error)=tokio::task::spawn_blocking(move||inventory.begin_worker_grant(&request)).await.map_err(|error|error.to_string()).and_then(|result|result.map_err(|error|error.to_string())) {
+            let assembly_root = (grant.kind == LeaseKind::Assemble).then(|| dest_dir.to_path_buf());
+            if let Err(error)=tokio::task::spawn_blocking(move || match assembly_root {
+                Some(root) => inventory.begin_worker_assembly_grant(&request, &root),
+                None => inventory.begin_worker_grant(&request),
+            }).await.map_err(|error|error.to_string()).and_then(|result|result.map_err(|error|error.to_string())) {
                 tracing::warn!(job=job_id.0,%error,"durable grant start refused");reject_remote_grant(cfg,client,leader_url,&grant.lease_id,&grant.token).await;return;
             }
             if grant.kind == LeaseKind::Download
@@ -1779,8 +1834,9 @@ async fn poll_for_work(
             {
                 let inventory = engine.artifacts();
                 let incoming = grant.job.clone();
+                let retry_context = context.clone();
                 match tokio::task::spawn_blocking(move || {
-                    inventory.adopt_worker_retry_for_job(&incoming, &context)
+                    inventory.adopt_worker_retry_for_job(&incoming, &retry_context)
                 })
                 .await
                 {
@@ -1857,7 +1913,7 @@ async fn poll_for_work(
                 let Ok(scope) = serde_json::from_value::<crate::range::AssembleScope>(grant.scope) else { return; };
                 if !authority() { return; }
                 admitted = true;
-                run_assembly(grant.job, scope, dest_dir.to_path_buf(), grant.token.fence, active.clone(), grant.lease_id, tracker);
+                run_assembly(grant.job, scope, dest_dir.to_path_buf(), engine.artifacts(), context, active.clone(), tracker);
             }
         }
         }.await;
@@ -2261,16 +2317,17 @@ fn run_assembly(
     job: nzbd_types::Job,
     scope: crate::range::AssembleScope,
     dest_dir: PathBuf,
-    fence: u64,
+    inventory: Arc<nzbd_state::artifacts::Inventory>,
+    context: nzbd_state::artifacts::WorkerControlContext,
     active: ActiveLeases,
-    lease_id: String,
     tracker: &TaskTracker,
 ) {
+    let lease_id = context.lease_id.clone();
     active
         .clone()
         .spawn_operation(tracker, lease_id.clone(), async move {
             let result = tokio::task::spawn_blocking(move || {
-                crate::range::assemble(job, &scope, &dest_dir, fence)
+                crate::range::assemble(job, &scope, &dest_dir, &inventory, &context)
             })
             .await;
             match result {
@@ -2439,6 +2496,16 @@ fn resolve_post_seal_source(
     ))
 }
 
+pub(crate) fn generation_slot(shared: &Path, job: u32, resource: &str, fence: u64) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let resource_key = format!("{:x}", Sha256::digest(resource.as_bytes()));
+    shared
+        .join(".nzbd-cluster/generations")
+        .join(format!("job-{job}"))
+        .join(format!("work-{}", &resource_key[..16]))
+        .join(format!("fence-{fence}"))
+}
+
 async fn seal_generation(
     cfg: &ClusterConfig,
     dest_dir: &std::path::Path,
@@ -2452,13 +2519,16 @@ async fn seal_generation(
     let lease = lease.clone();
     tokio::task::spawn_blocking(move || {
         use sha2::{Digest, Sha256};
-        let resource_key = format!("{:x}", Sha256::digest(lease.token.resource.as_bytes()));
-        let root = cfg
-            .shared_dir
-            .join(".nzbd-cluster/generations")
-            .join(format!("job-{}", job.id.0))
-            .join(format!("work-{}", &resource_key[..16]));
-        let final_dir = root.join(format!("fence-{}", lease.token.fence));
+        let final_dir = generation_slot(
+            &cfg.shared_dir,
+            job.id.0,
+            &lease.token.resource,
+            lease.token.fence,
+        );
+        let root = final_dir
+            .parent()
+            .expect("generation slot has a parent")
+            .to_owned();
         let manifest_path = final_dir.join("manifest.json");
         if manifest_path.exists() {
             let manifest: GenerationManifest =
@@ -3466,6 +3536,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let client = ClusterClient::new("secret".into());
         for _ in 0..8 {
@@ -3907,6 +3978,7 @@ mod tests {
             disk_guard_roots: Vec::new(),
             torrent_payload_roots: Vec::new(),
             workspace_dir: None,
+            keep_failed_downloads: false,
         };
         let client = ClusterClient::new("secret".into());
         let active: ActiveLeases = Default::default();

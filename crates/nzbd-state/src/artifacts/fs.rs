@@ -278,6 +278,15 @@ mod unix {
         }
         Ok(unsafe { File::from_raw_fd(fd) })
     }
+    pub(crate) fn create_dir_exclusive_at(parent: &File, path: &Path) -> Result<()> {
+        let n = name(path)?;
+        // SAFETY: the parent descriptor is live and owns this child name.
+        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), n.as_ptr(), 0o700) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
     pub fn create_file_exclusive_at(parent: &File, path: &Path) -> Result<File> {
         let n = name(path)?;
         let flags =
@@ -754,6 +763,15 @@ pub use unix::{
     create_file_exclusive_at, entry_missing_at, names, open_at, open_dir, remove_tree_contents,
     unlink,
 };
+
+#[cfg(unix)]
+pub(crate) use unix::create_dir_exclusive_at;
+#[cfg(not(unix))]
+pub(crate) fn create_dir_exclusive_at(_: &File, _: &Path) -> Result<()> {
+    Err(Error::Conflict(
+        "descriptor-relative directory creation unavailable".into(),
+    ))
+}
 
 // Windows retains ordinary queue/PP operation and cached inspection. Checked
 // destructive ownership remains unavailable until a handle-relative unlink

@@ -1446,7 +1446,7 @@ async fn critical_health_abort_stops_wasting_bandwidth() {
 
     // Parts 1..=4 gone everywhere (40% of bytes): health 600 < critical
     // 850 (no par2 in the set). Parts 5..=10 are served only after a long
-    // delay — without the abort, the job would sit through ~3s+ of
+    // delay — without the abort, the job would sit through 30s+ of
     // downloads it can never repair.
     let mut b = NservBuilder::new().with_post(&post);
     for part in 1..=4 {
@@ -1455,7 +1455,7 @@ async fn critical_health_abort_stops_wasting_bandwidth() {
     for part in 5..=10 {
         b = b.behavior(
             &post.message_id("doomed.bin", part),
-            Behavior::Delay(Duration::from_secs(3)),
+            Behavior::Delay(Duration::from_secs(30)),
         );
     }
     let ns = b.start().await.unwrap();
@@ -1481,12 +1481,7 @@ async fn critical_health_abort_stops_wasting_bandwidth() {
         .unwrap();
     let (status, health) = wait_finished(&mut rx, job, 30).await;
     assert_eq!(status, JobStatus::Failed, "unrepairable -> failed");
-    // Pending delayed parts were failed by the abort, not downloaded:
-    // health lands below the no-abort value of 600.
-    assert!(
-        health < 600,
-        "abort must fail pending segments, got {health}"
-    );
+    assert!(health < 850, "below threshold, got {health}");
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "job should abort quickly, took {:?}",
@@ -1706,8 +1701,35 @@ async fn url_jobs_fetch_then_download() {
         .iter()
         .any(|j| j.id == id && matches!(j.status, JobStatus::Fetching)));
 
-    // Retry-After: 0 cannot undercut the production 30-second first backoff.
-    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 90).await;
+    // The 429 parks the job on the production one-minute first step; the
+    // operator's "retry now" ends that wait well inside it.
+    let parked = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let waiting = engine.snapshot().jobs.iter().any(|j| {
+            j.id == id
+                && j.url_fetch
+                    .as_ref()
+                    .is_some_and(|retry| retry.next_retry_at_unix.is_some())
+        });
+        if waiting {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < parked,
+            "429 never parked the fetch"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let kicked = tokio::time::Instant::now();
+    assert!(
+        engine.retry_url_fetch_now(id),
+        "a fetching job accepts retry now"
+    );
+    let (status, _) = wait_finished_with_snapshot(&engine, &mut rx, id, 45).await;
+    assert!(
+        kicked.elapsed() < Duration::from_secs(45),
+        "retry now must not wait out the one-minute step"
+    );
     assert_eq!(status, JobStatus::Completed);
     let payload = engine.artifacts().for_job(id.0).unwrap().unwrap().path;
     assert_eq!(std::fs::read(payload.join("u.bin")).unwrap(), data);

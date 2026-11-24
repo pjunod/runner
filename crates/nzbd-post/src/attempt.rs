@@ -88,10 +88,10 @@ impl AttemptControl {
                         waiting = true;
                     }
                     tokio::select! {
-                        _ = cancel.cancelled() => return Err(std::io::Error::new(
+                        _ = cancel.cancelled() => return Err(PostError::Io(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
                             "processing attempt cancelled while waiting for file workers",
-                        ).into()),
+                        ))),
                         _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
                     }
                 }
@@ -136,7 +136,7 @@ impl AttemptControl {
     pub async fn finish_filesystem_work(&self) -> Result<(), PostError> {
         self.workers.close();
         self.workers.wait().await;
-        self.checkpoint()?;
+        self.checkpoint().map_err(PostError::Io)?;
         Ok(())
     }
     pub fn checkpoint(&self) -> std::io::Result<()> {
@@ -202,7 +202,7 @@ impl AttemptControl {
         T: Send + 'static,
         F: FnOnce(&Arc<Self>) -> Result<T, PostError> + Send + 'static,
     {
-        self.checkpoint()?;
+        self.checkpoint().map_err(PostError::Io)?;
         let control = self.clone();
         let use_guard = self.use_guard.lock().unwrap().clone();
         let mut task = self.workers.spawn_blocking(move || {
@@ -215,9 +215,9 @@ impl AttemptControl {
                 }
             }
             let _restore = Restore(previous);
-            control.checkpoint()?;
+            control.checkpoint().map_err(PostError::Io)?;
             let result = action(&control);
-            control.checkpoint()?;
+            control.checkpoint().map_err(PostError::Io)?;
             result
         });
         let mut latest = self.latest.subscribe();
@@ -345,7 +345,7 @@ mod tests {
                 .blocking(move |control| {
                     let _ = started.send(());
                     wait.recv().unwrap();
-                    control.checkpoint()?;
+                    control.checkpoint().map_err(PostError::Io)?;
                     Ok(())
                 })
                 .await

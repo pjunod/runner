@@ -27,6 +27,10 @@ use nzbd_types::{
 };
 
 /// The param that keeps a failed source (the job's own keep-on-failure flag).
+/// Provisional failed download carried by a worker's sealed completion outbox.
+/// Only the accepted post result may acquire PP_DONE and shared history.
+pub const DOWNLOAD_FAILURE_PARAM: &str = "*Cluster:DownloadFailure";
+
 pub const KEEP_ON_FAILURE_PARAM: &str = "*Runner:KeepOnFailure";
 /// Stamped with the terminal: when the failure was recorded.
 pub const FAILURE_AT_PARAM: &str = "*PP:failure-at";

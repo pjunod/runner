@@ -9,7 +9,7 @@
 use crate::rename::{naming_candidates, par_rename_owned_with_candidates, rar_rename_owned};
 use crate::script::{discover, ScriptHost};
 use crate::tools::{archive_input_set, detect_archives, Extractors, Par2Tool};
-use crate::{par2, DownloadEvidence, PostError, RepairResult, VerifyResult};
+use crate::{par2, DownloadEvidence, FsContext, PostError, RepairResult, VerifyResult};
 use nzbd_engine::{EngineHandle, Event};
 use nzbd_state::artifacts::{Artifact, DeliveryFileOutcome, FileEntry};
 use nzbd_state::history::HistoryDb;
@@ -1022,13 +1022,8 @@ async fn fail_and_follow_up(
     failure_followup(engine, cfg, dest_dir, gate, job, true).await
 }
 
-/// Cluster worker, after the leader accepted a failed post-processing result
-/// (so the job's terminal is durable there, contract §2.1): dispose of this
-/// node's own attempt copy by the same rule as single-node disposal —
-/// Keep retains, park-always reasons retain in place, a source assessed `recoverable`
-/// (or not assessed) is retained, anything else follows `failure_action`.
-/// The cluster cleanup ledger then finds the copy already settled. Before
-/// v2 this ran inside the attempt, ahead of the stamp.
+/// Dispose a cluster worker's failed attempt after its terminal is durable.
+/// Honor per-download Keep, then the configured retention policy.
 pub async fn dispose_remote_failure(
     engine: &EngineHandle,
     cfg: &PostConfig,
@@ -1044,27 +1039,8 @@ pub async fn dispose_remote_failure(
     if !param(PP_DONE_PARAM).is_some_and(|status| !status.starts_with("SUCCESS")) {
         return true;
     }
-    let reason = param("Failure:Reason").and_then(nzbd_types::FailureReason::parse);
     let inventory = engine.artifacts();
-    let assessed = inventory
-        .for_job(job.id.0)
-        .ok()
-        .flatten()
-        .and_then(|artifact| artifact.failure_assessment)
-        .map(|assessment| assessment.disposition);
     let action = if nzbd_engine::terminal::keeps_failed_source(job) {
-        FailureAction::None
-    } else if reason == Some(nzbd_types::FailureReason::HoldExpired) {
-        FailureAction::Park
-    } else if nzbd_types::transfer_of(&job.params).is_some() {
-        // W3: a curator-admitted failure follows `failure_action`.
-        cfg.failure_action
-    } else if reason.is_some_and(|reason| reason.park_always()) {
-        // Contract §2.2 park-always: the copy stays under runner custody
-        // where it is; the cluster ledger retains it (`artifacts::cluster`).
-        FailureAction::None
-    } else if assessed.as_deref() != Some("unusable") {
-        // `recoverable` holds payload; no assessment proves nothing.
         FailureAction::None
     } else {
         cfg.failure_action
@@ -1295,9 +1271,8 @@ async fn assess_and_publish_salvage(
 }
 
 /// Contract §2.6: dispose of a failed source once its salvage obligation has
-/// settled. The job's own keep-on-failure retains it; `publish`, `io`,
-/// `identity` and `hold_expired` always park; otherwise `[post]
-/// failure_action` means what it says. Returns true once the disposal is
+/// settled. The job's own keep-on-failure retains it; otherwise the
+/// configured failure policy applies to every failure reason. Returns true once the disposal is
 /// recorded on the terminal row.
 async fn dispose_failed_source(
     engine: &EngineHandle,
@@ -1369,27 +1344,6 @@ async fn dispose_failed_source(
             Err(_) => false,
         };
     }
-    // Review #280-7 (the pre-v2 "recoverable/unknown → retain" rule): only a
-    // source positively assessed `unusable` may be deleted; a recoverable
-    // or unassessed one is parked for recovery instead.
-    let assessed_unusable = {
-        let inventory = inventory.clone();
-        tokio::task::spawn_blocking(move || inventory.job_source(job.0))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
-            .and_then(|source| source.failure_assessment)
-            .is_some_and(|assessment| assessment.disposition == "unusable")
-    };
-    // A curator-admitted failure's salvage already took whatever verified
-    // payload it held; the assessment gate is for jobs nobody re-grabs.
-    let action =
-        if action == FailureAction::Delete && !assessed_unusable && terminal.transfer.is_none() {
-            FailureAction::Park
-        } else {
-            action
-        };
     let mut failure_cfg = cfg.clone();
     failure_cfg.failure_action = action;
     if gate.as_ref().is_some_and(|claim| !claim(job)) {
@@ -1574,30 +1528,13 @@ async fn dispose_failed_source(
     record(disposition.note).await
 }
 
-/// Contract §2.6 precedence: the job's keep-on-failure; then, for a
-/// curator-admitted job, `[post] failure_action` as configured (its salvage
-/// has settled, curator has re-grabbed — Paul, 2026-11-11, W3); for any
-/// other job the park-always reasons, then `failure_action`.
+/// Per-download Keep takes precedence; otherwise use the operator's policy.
 fn disposal_action(
     cfg: &PostConfig,
     terminal: &nzbd_state::artifacts::JobTerminal,
 ) -> FailureAction {
     if terminal.keep_on_failure {
         FailureAction::None
-    } else if terminal.reason == Some(nzbd_types::FailureReason::HoldExpired)
-        && (terminal.salvage != nzbd_state::artifacts::SalvageState::Published
-            || terminal.salvage_error.is_some()
-            || terminal
-                .entry
-                .params
-                .iter()
-                .any(|(key, _)| key == "Failure:ExpiredWorkerHold"))
-    {
-        FailureAction::Park
-    } else if terminal.transfer.is_some() {
-        cfg.failure_action
-    } else if terminal.reason.is_some_and(|reason| reason.park_always()) {
-        FailureAction::Park
     } else {
         cfg.failure_action
     }
@@ -1704,7 +1641,7 @@ async fn repair_failed_health_par_sets(
             Err(error) => return Err(error),
         };
         for file in &set.files {
-            let relative = crate::namespace::relative(&file.name)?;
+            let relative = crate::namespace::relative(&file.name).map_err(PostError::Io)?;
             let source_relative = set
                 .root
                 .join(relative)
@@ -1777,10 +1714,11 @@ async fn extract_complete_failed_archives(
         if inventory.extraction_published(&workspace)? {
             continue;
         }
-        let _capacity = nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
+        let _capacity = nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)
+            .at("reserve space on", &workspace.scratch.path)?;
         let attempt = inventory.begin_workspace_attempt(&mut workspace)?;
         let staging = attempt.join("output");
-        std::fs::create_dir_all(&staging)?;
+        std::fs::create_dir_all(&staging).at("create directory", &staging)?;
         let result = extractors
             .extract(&archive, kind, &staging, password)
             .await?;
@@ -1788,10 +1726,14 @@ async fn extract_complete_failed_archives(
             inventory.abandon_workspace(&workspace)?;
             // The extractor reported a full volume: a capacity wait, not a
             // verdict on the bytes (the obligation stays pending).
-            return Err(PostError::Io(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                "archive salvage needs free capacity; retry extraction when space is available",
-            )));
+            return Err(PostError::Fs {
+                op: "extract into",
+                path: staging.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "archive salvage needs free capacity; retry extraction when space is available",
+                ),
+            });
         }
         if result.password_error {
             assessment.password_required.extend(paths);
@@ -1824,12 +1766,12 @@ async fn extract_complete_failed_archives(
         let gate_for_commit = gate.clone();
         let id = job.id;
         terminal_worker(inventory.clone(), id, move |inventory, _, checkpoint| {
-            checkpoint()?;
+            checkpoint().map_err(PostError::Io)?;
             if gate_for_commit.as_ref().is_some_and(|claim| !claim(id)) {
                 return Err(PostError::Io(std::io::ErrorKind::Interrupted.into()));
             }
             commit_staging(&output, &source_path)?;
-            checkpoint()?;
+            checkpoint().map_err(PostError::Io)?;
             inventory.finish_extraction(&workspace, &output)?;
             Ok(())
         })
@@ -1899,7 +1841,7 @@ fn salvage_failed_delivery(
     if selected.is_empty() {
         return Ok(None);
     }
-    std::fs::create_dir_all(completed_root)?;
+    std::fs::create_dir_all(completed_root).at("create directory", completed_root)?;
     let name = nzbd_engine::queue::sanitize_name(&job.name);
     let target = completed_root.join(format!(
         "{name}.job-{}.runner-{}",
@@ -2013,7 +1955,7 @@ where
 {
     for attempt in 0..3 {
         if let Some(control) = crate::attempt::current() {
-            control.checkpoint()?;
+            control.checkpoint().map_err(PostError::Io)?;
         }
         match read().await {
             Ok(job) => return Ok(job),
@@ -2535,12 +2477,18 @@ fn spawn_job(
                     // PP writes as much as the downloader does — unpack,
                     // move, script output. An ENOSPC here is the same ground
                     // truth about the volume and must stop intake too, not
-                    // just fail this job.
-                    if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
+                    // just fail this job. A refused reservation is not: it
+                    // is a forecast from statvfs, which the free-space guard
+                    // already owns for intake, so it holds this job on
+                    // capacity (its verdict above) and nothing else.
+                    if let Some(shortfall) = e.capacity_shortfall() {
+                        tracing::warn!(job = job.0, %shortfall,
+                            "post-processing waits for capacity; downloads are not held for a forecast");
+                    } else if nzbd_engine::out_of_space(storage_hold_cause(&e).as_ref()) {
                         engine.report_out_of_space_for(
                             job,
                             format!("post-processing job {}: {e}", job.0),
-                            None,
+                            e.path(),
                         );
                     }
                     tracing::error!(job = job.0, error = %e, "post-processing crashed");
@@ -2848,7 +2796,9 @@ mod post_pause_tests {
                 .expect("cancellation releases a parked stage")
                 .unwrap_err();
         assert!(
-            matches!(&error, PostError::Io(e) if e.kind() == std::io::ErrorKind::Interrupted),
+            error
+                .io()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted),
             "{error:?}"
         );
         let row = engine.export_job(JobId(41)).await.unwrap().unwrap();
@@ -2944,10 +2894,10 @@ mod admission_tests {
             failure_action: FailureAction::Delete,
             ..Default::default()
         };
-        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Park);
+        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Delete);
         terminal.salvage = nzbd_state::artifacts::SalvageState::Published;
         terminal.salvage_error = Some("deadline-abandoned assessment".into());
-        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Park);
+        assert_eq!(disposal_action(&cfg, &terminal), FailureAction::Delete);
         terminal.salvage_error = None;
         assert_eq!(
             disposal_action(&cfg, &terminal),
@@ -2960,8 +2910,8 @@ mod admission_tests {
         ));
         assert_eq!(
             disposal_action(&cfg, &terminal),
-            FailureAction::Park,
-            "unresolved expiry custody cannot borrow another publication as proof"
+            FailureAction::Delete,
+            "failure policy applies after salvage and custody obligations settle"
         );
         engine.shutdown().await;
     }
@@ -3965,6 +3915,33 @@ async fn process_job_ctx_from_inner(
     ctx: &PpCtx,
     from: RestartPoint,
 ) -> Result<PpFinal, PostError> {
+    let download_failure = engine
+        .export_job(job_id)
+        .await
+        .map_err(|source| PostError::Engine {
+            operation: "read download failure",
+            source,
+        })?
+        .filter(|row| {
+            row.params
+                .iter()
+                .any(|(key, _)| key == nzbd_engine::terminal::DOWNLOAD_FAILURE_PARAM)
+        })
+        .map(|row| {
+            let param = |key: &str| {
+                row.params
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            };
+            let (reason, _) = unstamped_failure(&row);
+            (
+                reason,
+                param("Failure:Stage").unwrap_or_else(|| "download".into()),
+                param("Failure:Message")
+                    .unwrap_or_else(|| "download failed before post-processing".into()),
+            )
+        });
     if !engine
         .set_job_status(job_id, JobStatus::PostQueued)
         .await
@@ -4189,9 +4166,17 @@ async fn process_job_ctx_from_inner(
                     consumed_archive_paths.extend(workspace.input_paths.iter().cloned());
                     continue;
                 }
-                let _capacity = nzbd_state::capacity::reserve(&dir, job.totals.size)?;
-                let _workspace_capacity =
-                    nzbd_state::capacity::reserve(&workspace.scratch.path, job.totals.size)?;
+                // Output lands in the workspace and is renamed into `dir`:
+                // one filesystem needs the space once, two need it on each.
+                let _capacity = nzbd_state::capacity::reserve_each(
+                    &[&dir, &workspace.scratch.path],
+                    job.totals.size,
+                )
+                .map_err(|(root, source)| PostError::Fs {
+                    op: "reserve space on",
+                    path: root.to_path_buf(),
+                    source,
+                })?;
                 let attempt = engine
                     .artifacts()
                     .begin_workspace_attempt(&mut workspace)
@@ -4200,7 +4185,7 @@ async fn process_job_ctx_from_inner(
                 // Extraction is fenced: everything lands in the lease's
                 // staging dir and is renamed into place only on success
                 // with the lease still live (double-unpack can't happen).
-                std::fs::create_dir_all(&staging)?;
+                std::fs::create_dir_all(&staging).at("create directory", &staging)?;
                 let mut r = ex.extract(archive, *kind, &staging, password).await?;
                 staging = r.output_dir.clone();
                 if r.disk_space_error {
@@ -4642,7 +4627,9 @@ async fn process_job_ctx_from_inner(
     }
 
     // ---- finalize ----------------------------------------------------------
-    let mut outcome = if !par_ok {
+    let mut outcome = if download_failure.is_some() {
+        PpFinal::HealthFailure
+    } else if !par_ok {
         PpFinal::ParFailure
     } else if !unpack_ok {
         PpFinal::UnpackFailure
@@ -4749,7 +4736,7 @@ async fn process_job_ctx_from_inner(
                 let diagnostics = crate::attempt::current()
                     .expect("processing control")
                     .blocking(move |control| {
-                        control.checkpoint()?;
+                        control.checkpoint().map_err(PostError::Io)?;
                         assess_file_inputs(&assessment_job, &assessment_source, &complete_paths)
                     })
                     .await?;
@@ -4782,7 +4769,12 @@ async fn process_job_ctx_from_inner(
             .ok_or_else(|| PostError::Subprocess("job vanished before its terminal".into()))?;
         record_deobfuscation(&mut fin.params, &deobfuscated);
         fin.params.extend(script_receipts);
-        let (reason, stage, message) = pp_failure(outcome, unusable_source_reason.as_deref());
+        let (default_reason, default_stage, default_message) =
+            pp_failure(outcome, unusable_source_reason.as_deref());
+        let (reason, stage, message) = download_failure
+            .as_ref()
+            .map(|(reason, stage, message)| (*reason, stage.as_str(), message.clone()))
+            .unwrap_or((default_reason, default_stage, default_message));
         // Review #280-7: the failed source's assessment (`recoverable` /
         // `unusable`) is what the file lifecycle (Keep-off disposal), the
         // cluster's raw-copy cleanup and disposal below read to decide
@@ -5091,7 +5083,7 @@ async fn process_job_ctx_from_inner(
                     }
                     let output =
                         final_inventory.observe_external_output(&final_root, &final_path)?;
-                    control.checkpoint()?;
+                    control.checkpoint().map_err(PostError::Io)?;
                     // Preserve the operator's Keep choice. Retained sources do
                     // not expire automatically; adding Keep would also prevent
                     // retirement of independently verified private scratch.
@@ -6033,6 +6025,7 @@ pub fn pp_verdict(error: &PostError, stage: Option<PostStage>) -> PpVerdict {
     }
     match error {
         PostError::Io(_)
+        | PostError::Fs { .. }
         | PostError::Artifact(
             nzbd_state::artifacts::Error::Io(_) | nzbd_state::artifacts::Error::Sql(_),
         ) => PpVerdict::Fail(FailureReason::Io),
@@ -6333,10 +6326,11 @@ fn assess_file_inputs(
                     .iter()
                     .find(|entry| !entry.identity.directory && entry.path == path),
             ) {
-                let mut input = nzbd_state::io_meter::Metered::new(std::fs::File::open(
-                    source.path.join(&path),
-                )?);
-                let before = input.metadata()?;
+                let full = source.path.join(&path);
+                let mut input = nzbd_state::io_meter::Metered::new(
+                    std::fs::File::open(&full).at("open", &full)?,
+                );
+                let before = input.metadata().at("stat", &full)?;
                 if !diagnostic_metadata_matches(&before, entry) {
                     return Err(PostError::Io(std::io::Error::other(format!(
                         "{path} changed identity during integrity assessment"
@@ -6345,14 +6339,14 @@ fn assess_file_inputs(
                 let mut crc = crc32fast::Hasher::new();
                 let mut buffer = [0u8; 64 * 1024];
                 loop {
-                    crate::attempt::checkpoint()?;
-                    let read = input.read(&mut buffer)?;
+                    crate::attempt::checkpoint().map_err(PostError::Io)?;
+                    let read = input.read(&mut buffer).at("read", &full)?;
                     if read == 0 {
                         break;
                     }
                     crc.update(&buffer[..read]);
                 }
-                let after = input.metadata()?;
+                let after = input.metadata().at("stat", &full)?;
                 if !diagnostic_metadata_unchanged(&before, &after) {
                     return Err(PostError::Io(std::io::Error::other(format!(
                         "{path} changed during integrity assessment"
@@ -6483,7 +6477,7 @@ fn par_repairable_evidence_with_partials(
         );
     }
     for set in sets {
-        checkpoint()?;
+        checkpoint().map_err(PostError::Io)?;
         if set.slice_size == 0 || set.main_path.is_none() {
             continue;
         }
@@ -6492,8 +6486,8 @@ fn par_repairable_evidence_with_partials(
         let mut members = Vec::new();
         let mut assessable = true;
         for descriptor in &set.files {
-            checkpoint()?;
-            let relative = crate::namespace::relative(&descriptor.name)?;
+            checkpoint().map_err(PostError::Io)?;
+            let relative = crate::namespace::relative(&descriptor.name).map_err(PostError::Io)?;
             let absolute = set.root.join(relative);
             let Ok(source_relative) = absolute.strip_prefix(root) else {
                 return Err(PostError::Subprocess(
@@ -6530,9 +6524,15 @@ fn par_repairable_evidence_with_partials(
             };
             let mut input = match std::fs::File::open(&absolute) {
                 Ok(input) => nzbd_state::io_meter::Metered::new(input),
-                Err(error) => return Err(PostError::Io(error)),
+                Err(error) => {
+                    return Err(PostError::Fs {
+                        op: "open",
+                        path: absolute.clone(),
+                        source: error,
+                    })
+                }
             };
-            let before = input.metadata()?;
+            let before = input.metadata().at("stat", &absolute)?;
             if !diagnostic_metadata_matches(&before, entry) {
                 return Err(PostError::Io(std::io::Error::other(format!(
                     "{} changed identity during PAR assessment",
@@ -6550,9 +6550,9 @@ fn par_repairable_evidence_with_partials(
                 let mut crc = crc32fast::Hasher::new();
                 let mut short = false;
                 while remaining > 0 {
-                    checkpoint()?;
+                    checkpoint().map_err(PostError::Io)?;
                     let amount = remaining.min(buffer.len() as u64) as usize;
-                    let read = input.read(&mut buffer[..amount])?;
+                    let read = input.read(&mut buffer[..amount]).at("read", &absolute)?;
                     if read == 0 {
                         short = true;
                         break;
@@ -6571,7 +6571,7 @@ fn par_repairable_evidence_with_partials(
                         .min(set.slice_size);
                 let zeroes = [0u8; 64 * 1024];
                 while padding > 0 {
-                    checkpoint()?;
+                    checkpoint().map_err(PostError::Io)?;
                     let amount = padding.min(zeroes.len() as u64) as usize;
                     crc.update(&zeroes[..amount]);
                     padding -= amount as u64;
@@ -6580,7 +6580,7 @@ fn par_repairable_evidence_with_partials(
                     file_damaged += 1;
                 }
             }
-            let after = input.metadata()?;
+            let after = input.metadata().at("stat", &absolute)?;
             if !diagnostic_metadata_unchanged(&before, &after) {
                 return Err(PostError::Io(std::io::Error::other(format!(
                     "{} changed during PAR assessment",
@@ -6622,7 +6622,7 @@ fn bounded_file_diagnostics(
     root: &Path,
     entries: &[FileEntry],
     complete_paths: &std::collections::HashSet<String>,
-) -> std::io::Result<std::collections::HashMap<String, FileAssessment>> {
+) -> Result<std::collections::HashMap<String, FileAssessment>, PostError> {
     bounded_file_diagnostics_with_limit(root, entries, complete_paths, 100_000)
 }
 
@@ -6631,31 +6631,31 @@ fn bounded_file_diagnostics_with_limit(
     entries: &[FileEntry],
     complete_paths: &std::collections::HashSet<String>,
     max_entries: usize,
-) -> std::io::Result<std::collections::HashMap<String, FileAssessment>> {
+) -> Result<std::collections::HashMap<String, FileAssessment>, PostError> {
     const PREFIX_BYTES: usize = 4 * 1024;
     let mut results = std::collections::HashMap::new();
     if entries.len() > max_entries {
-        return Err(std::io::Error::other(format!(
+        return Err(PostError::Io(std::io::Error::other(format!(
             "source has more than {max_entries} entries; inspect source inventory before cleanup"
+        ))));
+    }
+    if !std::fs::symlink_metadata(root).at("stat", root)?.is_dir() {
+        return Err(PostError::Io(std::io::Error::other(
+            "source root is not an accessible directory",
         )));
     }
-    if !std::fs::symlink_metadata(root)?.is_dir() {
-        return Err(std::io::Error::other(
-            "source root is not an accessible directory",
-        ));
-    }
     for entry in entries {
-        crate::attempt::checkpoint()?;
+        crate::attempt::checkpoint().map_err(PostError::Io)?;
         if entry.identity.directory {
             continue;
         }
         let path = Path::new(&entry.path);
-        let metadata = std::fs::symlink_metadata(root.join(path))?;
+        let metadata = std::fs::symlink_metadata(root.join(path)).at("stat", &root.join(path))?;
         if !metadata.is_file() || !diagnostic_metadata_matches(&metadata, entry) {
-            return Err(std::io::Error::other(format!(
+            return Err(PostError::Io(std::io::Error::other(format!(
                 "{} no longer matches the owned source inventory; refresh it before cleanup",
                 entry.path
-            )));
+            ))));
         }
         let extension = path
             .extension()
@@ -6668,23 +6668,24 @@ fn bounded_file_diagnostics_with_limit(
         {
             continue;
         }
-        let mut file = std::fs::File::open(root.join(path))?;
-        let before = file.metadata()?;
+        let full = root.join(path);
+        let mut file = std::fs::File::open(&full).at("open", &full)?;
+        let before = file.metadata().at("stat", &full)?;
         if !diagnostic_metadata_matches(&before, entry) {
-            return Err(std::io::Error::other(format!(
+            return Err(PostError::Io(std::io::Error::other(format!(
                 "{} changed identity during assessment; refresh source inventory before cleanup",
                 entry.path
-            )));
+            ))));
         }
         let mut prefix = vec![0u8; PREFIX_BYTES];
-        let read = file.read(&mut prefix)?;
+        let read = file.read(&mut prefix).at("read", &full)?;
         prefix.truncate(read);
-        let after = file.metadata()?;
+        let after = file.metadata().at("stat", &full)?;
         if !diagnostic_metadata_unchanged(&before, &after) {
-            return Err(std::io::Error::other(format!(
+            return Err(PostError::Io(std::io::Error::other(format!(
                 "{} changed during assessment; refresh source inventory before cleanup",
                 entry.path
-            )));
+            ))));
         }
         let evidence = if prefix.starts_with(b"\x1a\x45\xdf\xa3") {
             Some(
@@ -6832,8 +6833,9 @@ fn verified_direct_payload_paths_excluding(
             continue;
         };
         let path = source.path.join(actual_relative);
-        let mut input = nzbd_state::io_meter::Metered::new(std::fs::File::open(&path)?);
-        let before = input.metadata()?;
+        let mut input =
+            nzbd_state::io_meter::Metered::new(std::fs::File::open(&path).at("open", &path)?);
+        let before = input.metadata().at("stat", &path)?;
         if !diagnostic_metadata_matches(&before, entry) {
             return Err(PostError::Io(std::io::Error::other(format!(
                 "{} changed identity before CRC verification",
@@ -6843,14 +6845,14 @@ fn verified_direct_payload_paths_excluding(
         let mut crc = crc32fast::Hasher::new();
         let mut buffer = [0u8; 64 * 1024];
         loop {
-            checkpoint()?;
-            let count = input.read(&mut buffer)?;
+            checkpoint().map_err(PostError::Io)?;
+            let count = input.read(&mut buffer).at("read", &path)?;
             if count == 0 {
                 break;
             }
             crc.update(&buffer[..count]);
         }
-        let after = input.metadata()?;
+        let after = input.metadata().at("stat", &path)?;
         if !diagnostic_metadata_unchanged(&before, &after) {
             return Err(PostError::Io(std::io::Error::other(format!(
                 "{} changed during CRC verification",
@@ -7267,7 +7269,7 @@ async fn repair_isolated_loop(
     let mut needed = 1;
     let mut last_reason = "no additional recovery files remain".to_string();
     for round in 0..8 {
-        control.checkpoint()?;
+        control.checkpoint().map_err(PostError::Io)?;
         stages.enter(PostStage::ParRepair).await?;
         control
             .round(round, session.set.recovery_blocks, Some(needed))
@@ -7505,7 +7507,7 @@ async fn dispose_failed(
     }
     if cfg.failure_action == FailureAction::Delete {
         let result = terminal_worker(inventory, job, move |inventory, guard, checkpoint| {
-            checkpoint()?;
+            checkpoint().map_err(PostError::Io)?;
             inventory
                 .delete_failed_payload(guard, job.0, checkpoint)
                 .map_err(PostError::from)
@@ -7673,25 +7675,40 @@ fn remove_stale_staging(_dir: &Path, _own: &Path) {
 /// Publish staged extraction output: rename each entry into the job dir,
 /// replacing existing targets (identical content by construction — same
 /// archive, same extractor).
-fn commit_staging(staging: &Path, dir: &Path) -> std::io::Result<()> {
-    fn publish(source: &Path, target: &Path) -> std::io::Result<()> {
-        crate::attempt::checkpoint()?;
-        let meta = std::fs::symlink_metadata(source)?;
+fn commit_staging(staging: &Path, dir: &Path) -> Result<(), PostError> {
+    fn publish(source: &Path, target: &Path) -> Result<(), PostError> {
+        crate::attempt::checkpoint().map_err(PostError::Io)?;
+        let meta = std::fs::symlink_metadata(source).at("stat", source)?;
         if meta.file_type().is_symlink() {
-            return Err(std::io::Error::other("symlink extraction output"));
+            return Err(PostError::Io(std::io::Error::other(
+                "symlink extraction output",
+            )));
         }
         if meta.is_dir() {
             match std::fs::create_dir(target) {
                 Ok(()) => (),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !std::fs::symlink_metadata(target)?.is_dir() {
-                        return Err(e);
+                    if !std::fs::symlink_metadata(target)
+                        .at("stat", target)?
+                        .is_dir()
+                    {
+                        return Err(PostError::Fs {
+                            op: "create directory",
+                            path: target.to_path_buf(),
+                            source: e,
+                        });
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return Err(PostError::Fs {
+                        op: "create directory",
+                        path: target.to_path_buf(),
+                        source: e,
+                    })
+                }
             }
-            for entry in std::fs::read_dir(source)? {
-                let entry = entry?;
+            for entry in std::fs::read_dir(source).at("read directory", source)? {
+                let entry = entry.at("read directory", source)?;
                 publish(&entry.path(), &target.join(entry.file_name()))?;
             }
         } else if meta.is_file() {
@@ -7707,32 +7724,44 @@ fn commit_staging(staging: &Path, dir: &Path) -> std::io::Result<()> {
                 other => std::io::Error::other(other),
             }) {
                 Ok(()) => {
-                    std::fs::File::open(source)?.sync_all()?;
+                    std::fs::File::open(source)
+                        .at("open", source)?
+                        .sync_all()
+                        .at("fsync", source)?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let target_meta = std::fs::symlink_metadata(target)?;
+                    let target_meta = std::fs::symlink_metadata(target).at("stat", target)?;
                     if !target_meta.is_file()
                         || target_meta.file_type().is_symlink()
-                        || !crate::namespace::equal_files(source, target)?
+                        || !crate::namespace::equal_files(source, target).at("read", target)?
                     {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "extraction output conflict; review required",
-                        ));
+                        return Err(PostError::Fs {
+                            op: "publish",
+                            path: target.to_path_buf(),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                "extraction output conflict; review required",
+                            ),
+                        });
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(e).at("copy", target),
             }
         } else {
-            return Err(std::io::Error::other("unsupported extraction output"));
+            return Err(PostError::Io(std::io::Error::other(
+                "unsupported extraction output",
+            )));
         }
         Ok(())
     }
-    for entry in std::fs::read_dir(staging)? {
-        let entry = entry?;
+    for entry in std::fs::read_dir(staging).at("read directory", staging)? {
+        let entry = entry.at("read directory", staging)?;
         publish(&entry.path(), &dir.join(entry.file_name()))?;
     }
-    std::fs::File::open(dir)?.sync_all()?;
+    std::fs::File::open(dir)
+        .at("open", dir)?
+        .sync_all()
+        .at("fsync", dir)?;
     Ok(())
 }
 
@@ -7832,6 +7861,105 @@ fn script_env(
 /// the pipeline's outcome, not on these decisions.
 #[cfg(test)]
 mod decision_tests {
+    #[tokio::test]
+    async fn failed_download_handoff_preserves_the_original_terminal_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let downloads = temp.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let engine = nzbd_engine::Engine::spawn(nzbd_engine::EngineConfig::single_node(
+            Vec::new(),
+            temp.path().join("queue"),
+            downloads.clone(),
+            nzbd_engine::Tuning::default(),
+            None,
+        ))
+        .await
+        .unwrap();
+        let history = Arc::new(
+            HistoryDb::open(&temp.path().join("history.sqlite"), Some(temp.path())).unwrap(),
+        );
+        let mut request = job(
+            vec![],
+            vec![
+                (
+                    nzbd_engine::terminal::DOWNLOAD_FAILURE_PARAM.into(),
+                    "1".into(),
+                ),
+                ("Failure:Reason".into(), "health".into()),
+                ("Failure:Stage".into(), "health".into()),
+                (
+                    "Failure:Message".into(),
+                    "below critical health on download-only worker".into(),
+                ),
+            ],
+        );
+        request.delivery_lifecycle = true;
+        request.status = JobStatus::Failed;
+        let source = downloads.join(nzbd_engine::queue::job_dir_name(&request));
+        let inventory = engine.artifacts();
+        inventory
+            .allocate_for_delivery(41, &downloads, &source, true, true)
+            .unwrap();
+        std::fs::write(source.join("readme.txt"), b"junk").unwrap();
+        inventory.finish(41, &source, &downloads, "active").unwrap();
+        engine
+            .import_fixture_job(request, false, false)
+            .await
+            .unwrap();
+        let cfg = PostConfig {
+            unpack: false,
+            cleanup: false,
+            deobfuscate_final: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            process_job_ctx(
+                &engine,
+                &cfg,
+                &history,
+                &downloads,
+                JobId(41),
+                &PpCtx::default()
+            )
+            .await
+            .unwrap(),
+            PpFinal::HealthFailure
+        );
+        let terminal = inventory.terminal(41).unwrap().unwrap();
+        assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Health));
+        assert_eq!(terminal.stage.as_deref(), Some("health"));
+        assert_eq!(
+            terminal.message.as_deref(),
+            Some("below critical health on download-only worker")
+        );
+        assert!(terminal.emitted);
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn failed_payload_policy_has_no_implicit_retention_by_reason() {
+        for reason in nzbd_types::FailureReason::ALL {
+            let request = job(vec![], vec![]);
+            let mut terminal =
+                nzbd_engine::terminal::failed_terminal(&request, reason, None, "test", "failed");
+            assert_eq!(
+                disposal_action(&PostConfig::default(), &terminal),
+                FailureAction::Delete,
+                "{reason:?}"
+            );
+            let keep = PostConfig {
+                failure_action: FailureAction::Park,
+                ..Default::default()
+            };
+            assert_eq!(disposal_action(&keep, &terminal), FailureAction::Park);
+            terminal.keep_on_failure = true;
+            assert_eq!(
+                disposal_action(&PostConfig::default(), &terminal),
+                FailureAction::None
+            );
+        }
+    }
+
     use super::*;
     use nzbd_types::{DupeInfo, FileEntry, FileId, JobKind, JobTotals, Segment, SegmentState};
     use std::os::unix::fs::PermissionsExt;
@@ -9769,6 +9897,72 @@ mod decision_tests {
         );
     }
 
+    /// A refused capacity forecast and a real ENOSPC both hold the job on
+    /// capacity and both reach the out-of-space report with the path they
+    /// were for; the forecast says so instead of impersonating the kernel.
+    #[test]
+    fn out_of_space_errors_keep_their_path_through_classification() {
+        let shortfall = PostError::Fs {
+            op: "reserve space on",
+            path: PathBuf::from("/processing/job-7"),
+            source: nzbd_state::capacity::CapacityShortfall {
+                root: PathBuf::from("/processing/job-7"),
+                needed: 80 << 30,
+                claimed: 90 << 30,
+                headroom: 1 << 30,
+                free: 152 << 30,
+            }
+            .into(),
+        };
+        let write = PostError::Fs {
+            op: "write",
+            path: PathBuf::from("/processing/job-8/a.mkv"),
+            source: std::io::Error::from_raw_os_error(libc::ENOSPC),
+        };
+        for (error, path) in [
+            (&shortfall, "/processing/job-7"),
+            (&write, "/processing/job-8/a.mkv"),
+        ] {
+            assert!(nzbd_engine::out_of_space(
+                storage_hold_cause(error).as_ref()
+            ));
+            assert_eq!(
+                pp_verdict(error, Some(PostStage::Unpack)),
+                PpVerdict::Hold(HoldCause::Capacity)
+            );
+            assert_eq!(error.path(), Some(std::path::Path::new(path)));
+            assert!(error.to_string().contains(path), "{error}");
+        }
+        assert!(
+            shortfall
+                .to_string()
+                .contains("not enough free space forecast"),
+            "{shortfall}"
+        );
+        assert!(
+            !shortfall.to_string().contains("os error 28"),
+            "{shortfall}"
+        );
+        // The forecast holds its job only; the real ENOSPC also stops intake.
+        assert!(shortfall.capacity_shortfall().is_some());
+        assert!(write.capacity_shortfall().is_none());
+        let wrapped = PostError::Artifact(nzbd_state::artifacts::Error::Io(
+            nzbd_state::capacity::CapacityShortfall {
+                root: PathBuf::from("/completed"),
+                needed: 1,
+                claimed: 0,
+                headroom: 1,
+                free: 0,
+            }
+            .into(),
+        ));
+        assert_eq!(
+            wrapped.capacity_shortfall().map(|s| s.root.as_path()),
+            Some(std::path::Path::new("/completed")),
+            "a relocation's refused reservation is found through the inventory error"
+        );
+    }
+
     /// Contract §2.2: a non-environmental post-processing error is the
     /// job's terminal failure, typed by the stage it stopped in; a release
     /// title never steers the verdict.
@@ -11443,7 +11637,7 @@ mod decision_tests {
         engine.shutdown().await;
     }
     #[tokio::test]
-    async fn completed_junk_only_attempt_is_a_parked_publish_failure() {
+    async fn completed_junk_only_attempt_is_deleted_after_publish_failure() {
         let temp = tempfile::tempdir().unwrap();
         let downloads = temp.path().join("downloads");
         std::fs::create_dir(&downloads).unwrap();
@@ -11493,7 +11687,7 @@ mod decision_tests {
             PpFinal::UnpackFailure
         );
         // Contract §2.2: nothing publishable is `failed/publish`, recorded
-        // before anything touches the bytes, and always parked.
+        // before anything touches the bytes.
         let terminal = inventory.terminal(41).unwrap().unwrap();
         assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Publish));
         assert!(!terminal.blames_release);
@@ -11509,17 +11703,17 @@ mod decision_tests {
         assert!(entry.params.iter().any(
             |(key, value)| key == "Failure:Message" && value.contains("no publishable payload")
         ));
-        // `failure_action` is delete; publish parks anyway.
+        // Publication failures follow the same deletion policy as other failures.
         assert!(failure_followup(&engine, &cfg, &downloads, &None, JobId(41), true,).await);
         let disposal = inventory.terminal(41).unwrap().unwrap().disposal.unwrap();
         assert!(!source.exists(), "{disposal}");
-        assert!(disposal.starts_with("parked at "), "{disposal}");
+        assert_eq!(disposal, "deleted");
         engine.shutdown().await;
     }
     #[tokio::test]
     async fn held_rows_keep_the_owner_schedule_on_import_and_restart() {
-        // M6: the owner's hold ladder is the only clock a held PP job runs
-        // on; importing a row re-derives its policy without moving it.
+        // Storage holds from old builds rearm within a minute; unrelated
+        // holds keep their existing schedule. Restart preserves both.
         let temp = tempfile::tempdir().unwrap();
         let config = || {
             nzbd_engine::EngineConfig::single_node(
@@ -11573,11 +11767,13 @@ mod decision_tests {
                 .unwrap();
             assert_eq!(scheduled.cause, *cause);
             assert_eq!(scheduled.revision, "2");
-            assert_eq!(
-                scheduled.next_retry_at_unix,
-                Some(deadline),
-                "an existing deadline cannot be shortened"
-            );
+            if *cause == "missing_tool" {
+                assert_eq!(scheduled.next_retry_at_unix, Some(deadline));
+            } else {
+                assert!(scheduled
+                    .next_retry_at_unix
+                    .is_some_and(|at| at <= now() + 60 && at > now()));
+            }
             assert_eq!(scheduled.blocked_since_unix, Some(first_block));
             assert_eq!(
                 scheduled.retry_policy,

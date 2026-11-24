@@ -53,7 +53,7 @@ use nzbd_nntp::transport::{tls_client_config, TlsClientConfig};
 use nzbd_types::{Job, JobId, ServerDef, TlsMode};
 use owner::{EngineMsg, Owner, QueueCommand};
 use rate::{RateLimiter, SpeedMeter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -277,7 +277,12 @@ pub fn stderr_hold_cause(stderr: &str) -> Option<nzbd_types::HoldCause> {
     if lower.contains("disk quota exceeded") {
         return Some(nzbd_types::HoldCause::Quota);
     }
-    if lower.contains("no space left on device") || lower.contains("no storage space") {
+    // `capacity::CapacityShortfall`'s own wording, for when a refused
+    // reservation reaches here already rendered to text.
+    if lower.contains("no space left on device")
+        || lower.contains("no storage space")
+        || lower.contains("not enough free space forecast on ")
+    {
         return Some(nzbd_types::HoldCause::Capacity);
     }
     // Only the std suffix names an errno; free text (payload names,
@@ -439,11 +444,8 @@ pub struct Tuning {
     pub monthly_quota_bytes: u64,
     /// Day of month the monthly quota window starts (1–28).
     pub quota_start_day: u32,
-    /// Abort a download the moment its health falls below critical health
-    /// (unrepairable even with all par2): remaining segments are failed
-    /// instead of downloaded, and the job finishes as Failed — the PP
-    /// health gate then parks/deletes per `[post] health_action`. Wired
-    /// from `health_action != "none"`.
+    /// End a below-critical download immediately, canceling active writers.
+    /// Failed payload retention is a separate operator setting.
     pub health_abort: bool,
     /// Contract §2.3: how long an environmental hold may last before the
     /// hold-recovery task ends it `failed/hold_expired` (`[post]
@@ -810,6 +812,7 @@ impl Engine {
             budget_tracker,
             url_fetches: Arc::new(Mutex::new(HashSet::new())),
             url_fetch_wakeup: Arc::new(tokio::sync::Notify::new()),
+            url_retry_kicks: Default::default(),
             hold_probes: Arc::new(Mutex::new(HashSet::new())),
             recovery_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             post_scope: None,
@@ -927,6 +930,7 @@ pub struct EngineHandle {
     budget_tracker: Arc<pool::BudgetTracker>,
     url_fetches: Arc<Mutex<HashSet<JobId>>>,
     url_fetch_wakeup: Arc<tokio::sync::Notify>,
+    url_retry_kicks: Arc<UrlRetryKicks>,
     hold_probes: Arc<Mutex<HashSet<JobId>>>,
     recovery_cursor: Arc<std::sync::atomic::AtomicUsize>,
     post_scope: Option<PostAdmission>,
@@ -935,7 +939,63 @@ pub struct EngineHandle {
     shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Operator "retry now" for URL jobs waiting on the NZB fetch ladder. A
+/// worker parked in a backoff wait registers its kick in `waiting`; a row
+/// whose worker exited and sits in the dispatcher's own backoff is named in
+/// `dispatch`, which the dispatcher drains on its next pass.
+#[derive(Default)]
+pub(crate) struct UrlRetryKicks {
+    waiting: Mutex<HashMap<JobId, Arc<crate::fetch::FetchKick>>>,
+    dispatch: Mutex<HashSet<JobId>>,
+}
+
+impl UrlRetryKicks {
+    fn register(&self, job: JobId) -> Arc<crate::fetch::FetchKick> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(job)
+            .or_default()
+            .clone()
+    }
+
+    fn release(&self, job: JobId) {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&job);
+    }
+
+    /// Ends a ladder wait on the published `deadline`, if a worker is in it.
+    fn kick_fetch(&self, job: JobId, deadline: i64) -> bool {
+        let kick = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&job)
+            .cloned();
+        kick.is_some_and(|kick| kick.kick(deadline))
+    }
+
+    fn kick_dispatch(&self, job: JobId) {
+        self.dispatch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job);
+    }
+
+    pub(crate) fn take_dispatch(&self) -> HashSet<JobId> {
+        std::mem::take(
+            &mut *self
+                .dispatch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
 struct UrlFetchGuard {
+    kicks: Arc<UrlRetryKicks>,
     jobs: Arc<Mutex<HashSet<JobId>>>,
     job: JobId,
     wakeup: Arc<tokio::sync::Notify>,
@@ -947,6 +1007,7 @@ struct UrlFetchGuard {
 
 impl Drop for UrlFetchGuard {
     fn drop(&mut self) {
+        self.kicks.release(self.job);
         match self.jobs.lock() {
             Ok(mut jobs) => {
                 jobs.remove(&self.job);
@@ -1344,13 +1405,14 @@ impl EngineHandle {
             tracing::error!(job = id.0, "URL executor set poisoned during acquisition");
             poisoned.into_inner()
         });
-        if !jobs.insert(id) {
+        if self.shared.load().job_disposition_fences.contains_key(&id) || !jobs.insert(id) {
             return false;
         }
         drop(jobs);
         let handle = self.clone();
         self.tracker.spawn(async move {
             let mut fetch_guard = UrlFetchGuard {
+                kicks: handle.url_retry_kicks.clone(),
                 jobs: handle.url_fetches.clone(), job: id,
                 wakeup: handle.url_fetch_wakeup.clone(), phase: "initial owner lookup",
                 identity: None, shared: handle.shared.clone(), cancel: handle.cancel.clone(),
@@ -1394,7 +1456,11 @@ impl EngineHandle {
             if let Ok(Ok(Some(retry))) = tokio::task::spawn_blocking(move || retry_store.retry(&retry_id)).await {
                 let seconds = retry.next_retry_at.saturating_sub(url_retry_now()).max(0) as u64;
                 storage_retry = retry;
-                tokio::select! { _ = handle.cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_secs(seconds)) => {} }
+                tokio::select! {
+                    _ = handle.cancel.cancelled() => return,
+                    _ = handle.wait_disposition_fence(id) => return,
+                    _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                }
             }
             let mut failure = None;
             // Contract §2.2: the fetcher types its own failure. A local
@@ -1414,8 +1480,10 @@ impl EngineHandle {
             if received.is_none() && failure.is_none() {
                 fetch_guard.phase = "HTTP acquisition";
                 let mut events = handle.subscribe();
+                let kick = handle.url_retry_kicks.register(id);
                 let fetched = tokio::select! {
                     _ = handle.cancel.cancelled() => return,
+                    _ = handle.wait_disposition_fence(id) => return,
                     _ = async {
                         loop { match events.recv().await {
                             Ok(Event::JobDeleted { job }) if job == id => break,
@@ -1446,7 +1514,7 @@ impl EngineHandle {
                                 }
                             }
                         }
-                    }) => result,
+                    }, kick) => result,
                 };
                 match fetched {
                     Ok(bytes) => received = Some(bytes),
@@ -1546,6 +1614,15 @@ impl EngineHandle {
         true
     }
 
+    async fn wait_disposition_fence(&self, job: JobId) {
+        let mut changes = self.queue_changes.clone();
+        while !self.shared.load().job_disposition_fences.contains_key(&job) {
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     async fn wait_url_coordination_retry(
         &self,
         job: JobId,
@@ -1557,6 +1634,7 @@ impl EngineHandle {
             "URL coordination interrupted; retrying without a storage failure");
         tokio::select! {
             _ = self.cancel.cancelled() => false,
+            _ = self.wait_disposition_fence(job) => false,
             _ = tokio::time::sleep(delay) => true,
         }
     }
@@ -1632,7 +1710,11 @@ impl EngineHandle {
             return false;
         }
         let seconds = retry.next_retry_at.saturating_sub(url_retry_now()).max(0) as u64;
-        tokio::select! { _ = self.cancel.cancelled() => false, _ = tokio::time::sleep(Duration::from_secs(seconds)) => true }
+        tokio::select! {
+            _ = self.cancel.cancelled() => false,
+            _ = self.wait_disposition_fence(origin.id) => false,
+            _ = tokio::time::sleep(Duration::from_secs(seconds)) => true,
+        }
     }
 
     async fn prepare_url_resolution(
@@ -1777,6 +1859,61 @@ impl EngineHandle {
         // The dispatcher reads the local snapshot without owner round trips.
         self.url_fetch_wakeup.notify_one();
         Ok(())
+    }
+
+    /// Operator "retry now" for a URL job still fetching its NZB: ends the
+    /// current backoff wait (fetch ladder or dispatcher) so the request goes
+    /// out at once. A repeat refusal continues up the ladder. `false` when
+    /// nothing would happen: not a fetching URL job, held (its retry is the
+    /// hold release), a request already in flight, or no queue authority on
+    /// this node.
+    pub fn retry_url_fetch_now(&self, job: JobId) -> bool {
+        let snapshot = self.shared.load();
+        let Some(row) = snapshot.jobs.iter().find(|row| {
+            row.id == job
+                && row.kind == nzbd_types::JobKind::Url
+                && row.status == nzbd_types::JobStatus::Fetching
+        }) else {
+            return false;
+        };
+        let held = row
+            .control
+            .as_ref()
+            .is_some_and(|control| control.lifecycle == "held" || control.version != 1);
+        // The dispatcher's own authority test: without it nothing fetches.
+        let authority = !self.url_outbox_external
+            || (snapshot.queue_authority
+                && self
+                    .owner_persist_guard
+                    .as_ref()
+                    .is_none_or(|guard| guard()));
+        if held || !authority {
+            return false;
+        }
+        let deadline = row
+            .url_fetch
+            .as_ref()
+            .and_then(|retry| retry.next_retry_at_unix);
+        let has_worker = self
+            .url_fetches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&job);
+        let retried = if has_worker {
+            deadline.is_some_and(|deadline| self.url_retry_kicks.kick_fetch(job, deadline))
+        } else {
+            // No worker: the row is in (or about to enter) the dispatcher's
+            // backoff, which the dispatcher clears on its next pass.
+            self.url_retry_kicks.kick_dispatch(job);
+            self.url_fetch_wakeup.notify_one();
+            true
+        };
+        tracing::info!(
+            job = job.0,
+            retried,
+            "operator requested an immediate NZB fetch retry"
+        );
+        retried
     }
 
     async fn fail_url_fetch(&self, job: JobId, error: String) -> Result<(), EngineError> {
@@ -2290,7 +2427,35 @@ impl EngineHandle {
         .await
     }
 
+    pub async fn advance_job_disposition(
+        &self,
+        job: JobId,
+        request: nzbd_state::artifacts::JobDispositionRequest,
+        native_joined: bool,
+    ) -> Result<nzbd_state::artifacts::JobDisposition, EngineError> {
+        let url_joined = !self
+            .url_fetches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&job);
+        let (reply, result) = oneshot::channel();
+        self.send(QueueCommand::AdvanceJobDisposition {
+            job,
+            request,
+            native_joined,
+            url_joined,
+            reply,
+        })
+        .await?;
+        owner_reply(result).await?
+    }
+
     pub async fn delete_job(&self, job: JobId, delete_files: bool) -> Result<bool, EngineError> {
+        if self.shared.load().job_disposition_fences.contains_key(&job) {
+            return Err(EngineError::Lifecycle(
+                "exact job disposition already owns this source".into(),
+            ));
+        }
         let torrent = self
             .snapshot()
             .jobs
@@ -2470,6 +2635,44 @@ impl EngineHandle {
         let source = source.to_string();
         self.roundtrip_unit(|reply| QueueCommand::PauseAll { source, reply })
             .await
+    }
+
+    /// Recheck disk-full failures without changing either lane's pause state.
+    pub async fn retry_storage(&self) -> Result<(), EngineError> {
+        self.roundtrip_unit(|reply| QueueCommand::RetryStorage { reply })
+            .await?;
+        let snapshot = self.snapshot();
+        let mut retries = tokio::task::JoinSet::new();
+        for job in snapshot
+            .jobs
+            .iter()
+            .filter(|job| job.assigned_node.is_none())
+        {
+            let Some(control) = job.control.as_ref().filter(|control| {
+                control.lifecycle == "held"
+                    && !control.manual_pause
+                    && (control.hold_cause().is_storage()
+                        || control.hold_cause() == nzbd_types::HoldCause::StorageUnavailable)
+            }) else {
+                continue;
+            };
+            let handle = self.clone();
+            let (id, revision) = (job.id, control.revision.clone());
+            retries
+                .spawn(async move { handle.release_hold(id, revision, RetryBy::Operator).await });
+            if retries.len() >= 8 {
+                break;
+            }
+        }
+        while let Some(result) = retries.join_next().await {
+            match result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(reason))) => tracing::info!(%reason, "storage retry remains held"),
+                Ok(Err(error)) => return Err(error),
+                Err(error) => tracing::warn!(%error, "storage retry task stopped"),
+            }
+        }
+        Ok(())
     }
 
     pub async fn resume_all(&self, source: &str) -> Result<(), EngineError> {
@@ -3488,6 +3691,18 @@ mod out_of_space_tests {
         assert_eq!(
             stderr_hold_cause("io: No space left on device"),
             Some(HoldCause::Capacity)
+        );
+        let shortfall = nzbd_state::capacity::CapacityShortfall {
+            root: "/processing".into(),
+            needed: 1,
+            claimed: 2,
+            headroom: 3,
+            free: 4,
+        };
+        assert_eq!(
+            stderr_hold_cause(&format!("relocate: {shortfall}")),
+            Some(HoldCause::Capacity),
+            "a reservation shortfall rendered to text is still a capacity hold"
         );
         assert_eq!(
             stderr_hold_cause("Disk quota exceeded (os error 122)"),

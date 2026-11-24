@@ -515,6 +515,10 @@ pub struct StatusDto {
     pub enospc_observed: u64,
     /// Operation and path of the last one.
     pub enospc_where: Option<String>,
+    /// Every out-of-space failure currently holding intake: what failed,
+    /// the path, and the configured volume that path is on (named as the
+    /// `storage` rows name it). Empty when no write-observed hold is set.
+    pub enospc_failures: Vec<nzbd_engine::snapshot::SpaceFailureSnapshot>,
     pub quota_reached: bool,
     pub blocked_servers: Vec<u32>,
     /// Critical-health abort armed (`[post] health_action` park/delete)?
@@ -672,7 +676,11 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
     let count =
         |pred: &dyn Fn(&JobSummary) -> bool| snap.jobs.iter().filter(|j| pred(j)).count() as u32;
     StatusDto {
-        capabilities: vec!["deliveries-v1", "request-token-idempotency-v1"],
+        capabilities: vec![
+            "deliveries-v1",
+            "request-token-idempotency-v1",
+            "job-disposition-v1",
+        ],
         version: version::full(),
         built: version::BUILT,
         up_since_unix: snap.up_since_unix,
@@ -689,6 +697,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         disk_guard_all_roots_known: snap.disk_guard_all_roots_known,
         enospc_observed: snap.enospc_observed,
         enospc_where: snap.enospc_where.clone(),
+        enospc_failures: snap.enospc_failures.clone(),
         quota_reached: snap.quota_reached,
         blocked_servers: snap.blocked_servers.clone(),
         health_abort: snap.health_abort,
@@ -1183,6 +1192,23 @@ async fn set_keep_on_failure(
 }
 
 async fn retry_job_now(State(st): State<ApiState>, Path(id): Path<u32>) -> Response {
+    // A URL job waiting out its NZB fetch backoff (an indexer 429/503, a
+    // timeout) retries the request now.
+    if st.engine.retry_url_fetch_now(JobId(id)) {
+        return Json(json!({"ok": true, "retrying": true, "fetch": true})).into_response();
+    }
+    let fetching_url = st.engine.snapshot().jobs.iter().any(|job| {
+        job.id == JobId(id)
+            && job.kind == nzbd_types::JobKind::Url
+            && job.status == nzbd_types::JobStatus::Fetching
+            && !job.control.as_ref().is_some_and(|c| c.lifecycle == "held")
+    });
+    if fetching_url {
+        return error(
+            StatusCode::CONFLICT,
+            "the NZB fetch has no wait to cut short (already requesting, or not on this node)",
+        );
+    }
     if let Ok(Some(row)) = st.engine.export_job(JobId(id)).await {
         if nzbd_engine::torrent_acquisitions::is_acquisition(&row) {
             if let Some(control) = row.control().filter(|control| {
@@ -1629,10 +1655,11 @@ async fn queue_action(
         "resume" => engine.resume_all(&source).await,
         "pause-post" => engine.pause_post(&source).await,
         "resume-post" => engine.resume_post(&source).await,
+        "retry-storage" => engine.retry_storage().await,
         _ => {
             return error(
                 StatusCode::BAD_REQUEST,
-                "unknown action (pause|resume|pause-post|resume-post)",
+                "unknown action (pause|resume|pause-post|resume-post|retry-storage)",
             )
         }
     };
@@ -2619,8 +2646,9 @@ async fn openapi() -> Response {
                           ] }
             },
             "/api/v1/jobs/{id}": { "get": { "summary": "Job detail" } },
+            "/api/v1/jobs/{id}/disposition": { "post": { "summary": "Persist or poll an identity-bound delete request for a consumer admission" } },
             "/api/v1/jobs/{id}/priority": { "put": { "summary": "Set scheduler priority; higher values run first and 900 is force" } },
-            "/api/v1/jobs/{id}/retry": { "post": { "summary": "Retry the same job's held post-processing or failed-source cleanup" } },
+            "/api/v1/jobs/{id}/retry": { "post": { "summary": "Retry the same job's NZB fetch, held post-processing or failed-source cleanup now" } },
             "/api/v1/jobs/{id}/torrent/seed-policy": { "put": { "summary": "Set stop_on_complete, positive ratio_limit/time_limit_secs (null = unlimited), or use_defaults; never starts a stopped torrent" } },
             "/api/v1/jobs/{id}/actions/{action}": { "post": { "summary": "pause|resume|delete|delete-files|move-*|post-restart-*; delete answers {ok, parked}" } },
             "/api/v1/queue/actions/{action}": { "post": { "summary": "pause|resume (downloads) · pause-post|resume-post (post-processing)" } },
@@ -3793,6 +3821,7 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
+    use std::time::Duration;
     use tower::util::ServiceExt;
 
     async fn test_engine(tmp: &tempfile::TempDir) -> EngineHandle {
@@ -3805,6 +3834,100 @@ mod tests {
         ))
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn disposition_checks_identity_and_replays_after_restart_without_rewriting_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/disposition.nzb", listener.local_addr().unwrap());
+        let token = "disposition-fixture";
+        let id = engine
+            .add_url(
+                "delete this acquisition",
+                &url,
+                nzbd_engine::AddOpts {
+                    params: vec![("monarr-transfer".into(), token.into())],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let admission = engine.url_admission(token).await.unwrap().unwrap();
+        let request = json!({
+            "requestId": "confirmed-delete",
+            "action": "delete",
+            "transfer": token,
+            "runnerInstanceId": admission.runner_instance_id,
+            "generation": admission.generation,
+        });
+        async fn send(engine: &EngineHandle, id: JobId, request: &serde_json::Value) -> Response {
+            router(engine.clone())
+                .oneshot(
+                    axum::http::Request::post(format!("/api/v1/jobs/{}/disposition", id.0))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+
+        for (field, value) in [
+            ("runnerInstanceId", "restored-installation"),
+            ("generation", "older-admission"),
+            ("transfer", "different-transfer"),
+        ] {
+            let mut stale = request.clone();
+            stale[field] = json!(value);
+            assert_eq!(
+                send(&engine, id, &stale).await.status(),
+                StatusCode::CONFLICT
+            );
+        }
+        let first = send(&engine, id, &request).await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        assert_eq!(body_json(first).await["state"], "pending");
+        assert!(engine.shutdown().await);
+        drop(engine);
+
+        let engine = test_engine(&tmp).await;
+        let settled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = send(&engine, id, &request).await;
+                if response.status() == StatusCode::OK {
+                    break body_json(response).await;
+                }
+                assert!(matches!(
+                    response.status(),
+                    StatusCode::ACCEPTED
+                        | StatusCode::TOO_MANY_REQUESTS
+                        | StatusCode::SERVICE_UNAVAILABLE
+                ));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(settled["state"], "verified");
+        assert_eq!(settled["jobId"], id.0.to_string());
+        let terminal = engine.artifacts().terminal(id.0).unwrap().unwrap();
+        assert_eq!(terminal.transfer.as_deref(), Some(token));
+        assert_eq!(terminal.outcome, nzbd_types::TerminalOutcome::Cancelled);
+        assert!(terminal.finished());
+        let again = send(&engine, id, &request).await;
+        assert_eq!(body_json(again).await, settled);
+        let after = engine.artifacts().terminal(id.0).unwrap().unwrap();
+        assert_eq!(after.history_seq, terminal.history_seq);
+        let mut changed = request;
+        changed["sourceArtifactId"] = json!("different-artifact");
+        changed["sourceGeneration"] = json!("different-generation");
+        assert_eq!(
+            send(&engine, id, &changed).await.status(),
+            StatusCode::CONFLICT
+        );
+        assert!(engine.shutdown().await);
     }
 
     #[tokio::test]

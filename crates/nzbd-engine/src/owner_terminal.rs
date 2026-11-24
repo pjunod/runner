@@ -52,9 +52,10 @@ impl Owner {
         let settled = self.terminals_in_flight.contains(&job)
             || self.deferred_terminals.contains_key(&job)
             || self.state.job(job).is_none_or(|row| {
-                row.params
-                    .iter()
-                    .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
+                row.params.iter().any(|(key, _)| {
+                    key == nzbd_types::PP_DONE_PARAM
+                        || (self.worker_mode && key == terminal::DOWNLOAD_FAILURE_PARAM)
+                })
             });
         if settled {
             callback(self, None);
@@ -113,6 +114,40 @@ impl Owner {
                 .entry(job)
                 .or_insert((terminal, history));
             callback(self, None);
+            return;
+        }
+        if self.worker_mode
+            && !self.persist
+            && history.is_none()
+            && terminal.outcome == nzbd_types::TerminalOutcome::Failed
+            && self
+                .state
+                .job(job)
+                .and_then(nzbd_state::artifacts::WorkerControlContext::for_job)
+                .is_some()
+        {
+            // A download executor reports failure, it does not own the global
+            // terminal. Its fenced, sealed completion outbox hands the typed
+            // failure to the authority for a normal post-processing lease.
+            self.retire_job_writers(job);
+            if let Some(row) = self.state.job_mut(job) {
+                for (key, value) in &terminal.markers {
+                    if key != nzbd_types::PP_DONE_PARAM {
+                        set_owner_param(&mut row.params, key, Some(value.clone()));
+                    }
+                }
+                set_owner_param(
+                    &mut row.params,
+                    terminal::DOWNLOAD_FAILURE_PARAM,
+                    Some("1".into()),
+                );
+                row.status = JobStatus::Failed;
+            }
+            self.pending_finalize.retain(|(id, _)| *id != job);
+            self.dirty = true;
+            self.publish_now();
+            self.bump_epoch();
+            callback(self, Some(terminal));
             return;
         }
         if !self.terminals_in_flight.insert(job) {
@@ -205,7 +240,11 @@ impl Owner {
     /// latches out-of-space, so downloads stop filling it.
     pub(super) fn terminal_store_fault(&mut self, whence: &str, fault: &StoreFault) {
         if crate::out_of_space(fault.cause.as_ref()) {
-            self.observe_space_failure(whence, crate::space_probe::SpaceOp::Terminal, None);
+            self.observe_space_failure(
+                whence,
+                crate::space_probe::SpaceOp::Terminal,
+                Some(self.terminal_store_dir.clone()),
+            );
         }
     }
 
@@ -224,7 +263,7 @@ impl Owner {
             self.observe_space_failure(
                 "terminal record",
                 crate::space_probe::SpaceOp::Terminal,
-                None,
+                Some(self.terminal_store_dir.clone()),
             );
         }
         if self.state.job(job).is_some() {
@@ -396,10 +435,13 @@ impl Owner {
     /// Runs at boot before hold recovery and the post manager, then on the
     /// tick.
     pub(super) fn replay_terminals(&mut self) {
-        if self.persistence_fenced || !self.persist {
+        if self.persistence_fenced {
             return;
         }
         self.retry_deferred_terminals();
+        if !self.persist {
+            return;
+        }
         let inventory = self.artifacts.clone();
         self.io_then(
             move || {

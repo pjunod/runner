@@ -848,9 +848,8 @@ impl FailureReason {
             FailureReason::HoldExpired => "FAILURE/HOLD_EXPIRED",
         }
     }
-    /// Contract §2.2: the bytes are intact or uncertain and the policy or the
-    /// environment failed, so the source is parked whatever
-    /// `[post] failure_action` says.
+    /// Legacy environmental-failure classification. Kept for API compatibility;
+    /// it no longer overrides the operator's failed-download retention policy.
     pub fn park_always(self) -> bool {
         matches!(
             self,

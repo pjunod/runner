@@ -1139,6 +1139,7 @@ try {
   </div>
 
   <div id="hold"></div>
+  <button id="retry-storage" hidden>retry storage now</button>
 
   <div class="controls">
     <button id="btn-pause" class="lane-toggle" aria-pressed="false"><span class="lane-glyph" aria-hidden="true"></span>Downloads</button>
@@ -2908,9 +2909,11 @@ function detailModel(j, nowMs) {
     recoverMax,
     lifecycleHidden: (torrent && !controlPendingText(j)) || (!lifecycleStatus && !(j.lifecycleEligible && j.status === "failed")),
     lifecycleStatus: lifecycleStatus || (j.lifecycleEligible && j.status === "failed" ? "Failed source cleanup is ready for an immediate retry." : ""),
-    // Every hold answers "retry now"; cleanup retries stay lifecycle-only.
-    lifecycleRetryHidden: torrent || !(heldControl || (j.lifecycleEligible && cleanupRetry)),
-    lifecycleRetryDisabled: !!(j.urlFetch && j.urlFetch.nextRetryAtUnix && j.status === "fetching"),
+    // Every hold answers "retry now", and so does an NZB fetch waiting on
+    // its backoff; cleanup retries stay lifecycle-only. While the fetch is
+    // in flight (no next retry time) there is nothing to cut short.
+    lifecycleRetryHidden: torrent || !(heldControl || (j.lifecycleEligible && cleanupRetry) || (urlRetry && j.status === "fetching")),
+    lifecycleRetryDisabled: !!(urlRetry && j.status === "fetching" && !(urlRetry.nextRetryAtUnix && urlRetry.nextRetryAtUnix * 1000 > nowMs)),
     meta: bits.join("  ·  "),
     metaHidden: false,
     metaClient: "", metaElapsed: "", metaPar: "", metaSource: "",
@@ -3416,6 +3419,27 @@ function applyStorageRow(row, m, d) {
 }
 KINDS.storage = { build: buildStorageRow, apply: applyStorageRow };
 
+// A write-observed out-of-space hold names the volume and path that
+// failed, as the storage panel names the volume. A failure whose writer
+// recorded no path says the volume is unknown rather than implying it was
+// one of the configured ones.
+function enospcHoldText(s) {
+  const failures = Array.isArray(s.enospc_failures) ? s.enospc_failures : [];
+  if (!failures.length) {
+    return `out of space — downloads held${s.enospc_where ? " (" + s.enospc_where + ")" : ""}; checking automatically every 30–60 seconds; clear space or retry now`;
+  }
+  const one = f => {
+    const where = f.volume
+      ? `${f.volume.toUpperCase()} ${f.volume_path}`
+      : f.path ? `${f.path} (not under any configured storage root)`
+      : "an unknown volume (the failing write recorded no path)";
+    const detail = f.detail || f.operation;
+    const path = f.path && !detail.includes(f.path) ? ` [${f.path}]` : "";
+    return `${where} — ${detail}${path}`;
+  };
+  return `out of space on ${failures.map(one).join("; ")} — downloads held; checking automatically every 30–60 seconds; clear space or retry now`;
+}
+
 function renderStorage(s) {
   const overview = $("overview"), panel = $("storage-panel"), list = $("storage-list");
   if (!panel || !list) return;
@@ -3722,7 +3746,7 @@ function renderStatus() {
       : !s.disk_guard_write_latched && s.disk_guard_free_bytes == null
       ? "checking configured storage before downloads begin"
       : s.disk_guard_write_latched
-      ? `out of space on a configured write volume — downloads held (observed from a write${s.enospc_where ? ": " + s.enospc_where : ""}); resume the queue once space is free`
+      ? enospcHoldText(s)
       : `low disk space on ${limitingRoot}${limitingFree} — downloads held until space is freed`);
   }
   if (s.quota_reached) holds.push("download quota reached — normal jobs held (force-priority still runs)");
@@ -3732,6 +3756,7 @@ function renderStatus() {
   const hold = $("hold");
   setText(hold, holds.length ? "⚠ " + holds.join(" · ") : "");
   setClass(hold, holds.length ? "show" : "");
+  setProp($("retry-storage"), "hidden", !s.disk_low);
   if (s.speed_limit_bps && !$("limit").matches(":focus"))
     $("limit").value = Math.round(s.speed_limit_bps / 1024);
   // Unlike the limit this always has a value, so it is written on every
@@ -4776,9 +4801,10 @@ document.addEventListener("click", (ev) => {
       jobAction(id, "resume").then(() => refreshAll(true));
       return;
     }
+    const fetching = job && job.status === "fetching";
     post("/api/v1/jobs/" + id + "/retry").then(result => {
       if (!result.ok) toast({ text: "Retry failed — " + result.error, kind: "error" });
-      else toast({ text: "Retrying lifecycle work for “" + name + "”" });
+      else toast({ text: (fetching ? "Retrying NZB fetch for “" : "Retrying lifecycle work for “") + name + "”" });
       refreshAll(true);
     });
     return;
@@ -4908,6 +4934,18 @@ async function laneAction(lane) {
 }
 $("btn-pause").onclick = () => laneAction("download");
 $("btn-pause-post").onclick = () => laneAction("post");
+$("retry-storage").onclick = async () => {
+  const button = $("retry-storage");
+  button.disabled = true;
+  try {
+    const res = await post("/api/v1/queue/actions/retry-storage");
+    if (!res.ok) toast({ text: "storage retry failed — " + res.error, kind: "error", ttlMs: 10000 });
+    else toast({ text: "Checking storage. Work resumes when writes succeed; manual pauses stay in place." });
+  } finally {
+    button.disabled = false;
+    refreshAll();
+  }
+};
 $("btn-limit").onclick = async () => {
   const kib = parseInt($("limit").value || "0", 10);
   const res = await post("/api/v1/queue/speed-limit", {
@@ -6537,12 +6575,8 @@ const SETTINGS_SECTIONS = [
     ["post.cleanup", "delete archives after unpack", "check"],
     ["post.deobfuscate_final", "deobfuscate file names", "check"],
     ["post.strategy", "strategy", "select", SEL(["sequential", "balanced", "aggressive", "rocket"])],
-    ["post.failure_action", "files from failed downloads",
-      "select",
-      [["none", "none — keep failed files in place"],
-       ["park", "park — move failed files to the failed directory"],
-       ["delete", "delete — remove failed files (default)"]],
-      "Applies when a download fails, including repair, unpack and health failures. Failed jobs remain in history; requeue downloads them again."],
+    ["post.keep_failed_downloads", "keep failed downloads", "check", null,
+      "Off by default: delete failed download files after recovery finishes. Enable to move them to the failed directory. Failed jobs stay in history and can be downloaded again. A download’s individual Keep setting still takes precedence."],
     ["post.scripts_dir", "extension scripts dir (optional)", "text?"],
     ["post.par2_cmd", "par2 command", "text"],
     ["post.unrar_cmd", "unrar command", "text"],

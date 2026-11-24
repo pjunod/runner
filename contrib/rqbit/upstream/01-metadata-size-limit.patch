@@ -135,7 +135,7 @@ index 94fcb878..48a16e1e 100644
 +    }
 +}
 diff --git a/crates/librqbit/src/session.rs b/crates/librqbit/src/session.rs
-index 5e024154..0bcf7ce8 100644
+index 7580248d..752d954d 100644
 --- a/crates/librqbit/src/session.rs
 +++ b/crates/librqbit/src/session.rs
 @@ -1048,6 +1048,7 @@ impl Session {
