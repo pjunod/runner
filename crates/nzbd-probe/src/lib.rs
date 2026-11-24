@@ -23,12 +23,14 @@ use rar::Volume;
 /// this; anything larger is a download, not a peek.
 pub const MAX_BYTES: usize = 16 << 20;
 
-/// How many candidate files a probe may open looking for the media (an
-/// obfuscated RAR set has to be searched for its first volume).
-const MAX_CANDIDATES: usize = 16;
+/// How many candidate files a probe may open looking for the media. An
+/// obfuscated RAR set has to be searched for its first volume, one article
+/// per volume, so this covers a typical 50-volume remux set whole.
+const MAX_CANDIDATES: usize = 64;
 
-/// Total article budget for one probe, across all candidates.
-const MAX_ARTICLES: usize = 96;
+/// Total article budget for one probe, across all candidates: the search
+/// above plus the head itself (a 16 MiB head is about 22 articles).
+const MAX_ARTICLES: usize = 112;
 
 /// How far to read when RAR headers do not fit in the first article.
 const RAR_SLACK: usize = 64 << 10;
@@ -115,6 +117,12 @@ async fn probe_files(
         // One article first: enough to tell media from archive from junk.
         r.fill(fetcher, 1, &mut budget).await;
         if r.buf.is_empty() {
+            if r.unreachable {
+                return unavailable(
+                    Reason::Unreadable,
+                    "no news server answered (connection, login or timeout)",
+                );
+            }
             if r.missing > 0 && !skipped_later_volume {
                 return unavailable(
                     Reason::MissingArticles,
@@ -177,9 +185,21 @@ async fn probe_files(
                     .map(<[u8]>::to_vec)
                     .unwrap_or_default();
                 if bytes.is_empty() {
+                    if r.unreachable {
+                        return unavailable(
+                            Reason::Unreadable,
+                            "no news server answered (connection, login or timeout)",
+                        );
+                    }
                     return unavailable(
                         Reason::MissingArticles,
                         "the archive's data starts past the articles that remain",
+                    );
+                }
+                if !looks_like_media(&bytes) {
+                    return unavailable(
+                        Reason::NoMedia,
+                        format!("the archive's first file, {name}, does not start like media"),
                     );
                 }
                 return Outcome::Head(Head {
@@ -243,6 +263,9 @@ struct Reader<'a> {
     articles: usize,
     missing: usize,
     stopped: bool,
+    /// Every server failed during this read; the head stops, and a hole
+    /// here says nothing about the release.
+    unreachable: bool,
     name: String,
     size: u64,
 }
@@ -256,6 +279,7 @@ impl<'a> Reader<'a> {
             articles: 0,
             missing: 0,
             stopped: false,
+            unreachable: false,
             name: String::new(),
             size: 0,
         }
@@ -302,6 +326,11 @@ impl<'a> Reader<'a> {
                 }
                 Article::Missing | Article::Corrupt => {
                     self.missing += 1;
+                    self.stopped = true;
+                }
+                Article::Unreachable => {
+                    self.articles -= 1;
+                    self.unreachable = true;
                     self.stopped = true;
                 }
             }

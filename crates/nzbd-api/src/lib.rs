@@ -3735,7 +3735,11 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/api/v1/status", get(get_status))
         // Pre-flight release probes for Curator (ADR 0031 there): the head
         // of the main file, never a queued job.
-        .route("/api/v1/probe", post(probe::probe_release))
+        .route(
+            "/api/v1/probe",
+            post(probe::probe_release)
+                .layer(axum::extract::DefaultBodyLimit::max(upload_body_limit)),
+        )
         .route("/api/v1/probes", get(probe::list_probes))
         .route(
             "/api/v1/request-admissions/{token}",

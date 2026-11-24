@@ -839,20 +839,33 @@ file, so Curator asks nzbd for those bytes before it grabs:
 POST /api/v1/probe?url=<the release's NZB URL>&bytes=4194304
 ```
 
-nzbd fetches the NZB exactly as an add would, picks the main file (the first
+nzbd fetches the NZB once (no retry schedule: a rate-limited indexer is an
+answer, and Curator falls back to the name), picks the main file (the first
 volume of the largest RAR set, or the largest media file; an obfuscated set is
-searched for its first volume), fetches only the articles covering the head,
-decodes the yEnc, and unwraps a store-mode RAR. It answers with the bytes
-(base64) and how it reached them, or `"status":"unavailable"` with a reason:
-`encrypted`, `compressed`, `missing_articles`, `no_media` or `unreadable`.
+searched up to 64 volumes deep for its first volume), fetches only the
+articles covering the head, decodes the yEnc, and unwraps a store-mode RAR,
+stepping over an NFO, a sample or subtitles stored ahead of the feature. It
+answers with the bytes (base64) and how it reached them, or
+`"status":"unavailable"` with a reason: `encrypted`, `compressed`,
+`missing_articles` (a server answered that the articles are gone),
+`no_media`, or `unreadable` (anything else, including no server answering —
+that says nothing about the release). An NZB larger than the upload limit
+can be passed by `?url=` instead of the body.
 
 **Bytes, not opinions.** nzbd never parses the media: Curator measures the
 head with the same prober it runs on imported files, so a pre-flight answer
 and a post-import answer cannot disagree. Nothing is queued and nothing is
-written; the probe opens its own connection per server, in tier order, and
-closes it when done. The capability is advertised as `release-probe-v1` in
-`/api/v1/status`, and the UI's Probes tab lists recent probes (without their
-URLs, which carry indexer API keys).
+written.
+
+**Bounded.** One deadline (90 s) covers the NZB fetch, waiting for a slot and
+the article reads. At most two probes run at once, each with one connection
+per server in tier order, so a burst of search results adds at most two
+connections per server beside the download pool. A server that fails to
+connect, log in or answer is skipped for the rest of that probe, so a dead
+primary costs one connection timeout and never a refused login per article.
+The capability is advertised as `release-probe-v1` in `/api/v1/status`, and
+the UI's Probes tab lists recent probes (without their URLs, which carry
+indexer API keys; names are clipped to 300 characters).
 
 ## 10. NZBGet compat shim — the other consumers
 

@@ -156,6 +156,37 @@ pub async fn http_get(url: &str) -> Result<Vec<u8>, FetchError> {
     .await
 }
 
+/// GET a URL once: redirects are followed, but nothing is retried and each
+/// hop has the usual timeout. For callers that would rather fall back than
+/// wait out the job retry schedule (the release probe).
+pub async fn http_get_once(url: &str) -> Result<Vec<u8>, FetchError> {
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        match tokio::time::timeout(HOP_TIMEOUT, get_once(&current)).await {
+            Err(_) => return Err(FetchError::Timeout),
+            Ok(Ok(Hop::Body(bytes))) => return Ok(bytes),
+            Ok(Ok(Hop::Redirect(next))) => current = resolve_redirect(&current, next)?,
+            Ok(Err(e)) => return Err(e),
+        }
+    }
+    Err(FetchError::TooManyRedirects)
+}
+
+/// Resolve a redirect target against the URL that answered with it.
+fn resolve_redirect(current: &str, next: String) -> Result<String, FetchError> {
+    if next.starts_with("http://") || next.starts_with("https://") {
+        return Ok(next);
+    }
+    // Relative redirect: resolve against the current origin.
+    let u = parse_url(current)?;
+    let scheme = if u.https { "https" } else { "http" };
+    Ok(if next.starts_with('/') {
+        format!("{scheme}://{}:{}{next}", u.host, u.port)
+    } else {
+        format!("{scheme}://{}:{}/{next}", u.host, u.port)
+    })
+}
+
 /// Retry transient acquisition failures while persisting the absolute retry
 /// deadline and elapsed-wait origin through `on_retry`. A restart can pass
 /// the saved state back in, preserving the same token-scoped attempt and its
@@ -241,18 +272,7 @@ where
                     return Err(FetchError::TooManyRedirects);
                 }
                 redirects += 1;
-                current = if next.starts_with("http://") || next.starts_with("https://") {
-                    next
-                } else {
-                    // Relative redirect: resolve against the current origin.
-                    let u = parse_url(&current)?;
-                    let scheme = if u.https { "https" } else { "http" };
-                    if next.starts_with('/') {
-                        format!("{scheme}://{}:{}{next}", u.host, u.port)
-                    } else {
-                        format!("{scheme}://{}:{}/{next}", u.host, u.port)
-                    }
-                };
+                current = resolve_redirect(&current, next)?;
             }
             Ok(Err(e)) => {
                 let retry_after = match &e {
@@ -597,6 +617,30 @@ mod tests {
             requests
         });
         (url, server)
+    }
+
+    #[tokio::test]
+    async fn a_single_attempt_follows_redirects_and_never_retries() {
+        let (url, server) = serve_responses(vec![
+            "HTTP/1.1 302 Found\r\nLocation: /nzb\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n<nzb />".into(),
+        ])
+        .await;
+        assert_eq!(http_get_once(&url).await.unwrap(), b"<nzb />");
+        assert_eq!(server.await.unwrap().len(), 2);
+
+        // A rate limit is an answer, not a wait: the probe falls back at once.
+        let (url, server) = serve_responses(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ])
+        .await;
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            http_get_once(&url).await,
+            Err(FetchError::HttpStatus { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(server.await.unwrap().len(), 1);
     }
 
     #[tokio::test]

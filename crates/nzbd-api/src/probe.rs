@@ -26,8 +26,18 @@ use crate::{error, unix_now, ApiState};
 pub const CAPABILITY: &str = "release-probe-v1";
 
 /// A probe that has not answered in this long is abandoned: the caller is
-/// ranking search results and would rather fall back to the name.
+/// ranking search results and would rather fall back to the name. The
+/// deadline covers everything: the NZB fetch, waiting for a probe slot and
+/// the article reads.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Probes running at once. Each opens one connection per news server beside
+/// the download pool's, so this bounds the extra connections a burst of
+/// search results can put on the provider account (and on running jobs).
+const MAX_CONCURRENT: usize = 2;
+
+/// Longest string a probe record keeps: names come from strangers' NZBs.
+const FIELD_MAX: usize = 300;
 
 /// Default head size: enough for container headers and the first frame.
 const DEFAULT_BYTES: usize = 4 << 20;
@@ -54,10 +64,47 @@ pub struct ProbeRecord {
     pub millis: u64,
 }
 
-/// Recent probes, newest first, plus running totals since start.
-#[derive(Default)]
+impl ProbeRecord {
+    /// A probe that ended before any article was read.
+    fn failed(result: &str, detail: String, started: std::time::Instant) -> Self {
+        ProbeRecord {
+            at: unix_now(),
+            release: String::new(),
+            file: String::new(),
+            file_size: 0,
+            path: Vec::new(),
+            articles: 0,
+            articles_missing: 0,
+            bytes: 0,
+            result: result.into(),
+            detail,
+            millis: started.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+/// Recent probes, newest first, plus running totals since start, and the
+/// gate that bounds concurrent probes.
 pub struct ProbeLog {
     inner: Mutex<LogInner>,
+    gate: tokio::sync::Semaphore,
+}
+
+impl Default for ProbeLog {
+    fn default() -> Self {
+        ProbeLog {
+            inner: Mutex::default(),
+            gate: tokio::sync::Semaphore::new(MAX_CONCURRENT),
+        }
+    }
+}
+
+/// Cut a string to `FIELD_MAX` characters for the log.
+fn clip(s: &str) -> String {
+    match s.char_indices().nth(FIELD_MAX) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_owned(),
+    }
 }
 
 #[derive(Default)]
@@ -69,7 +116,10 @@ struct LogInner {
 }
 
 impl ProbeLog {
-    fn record(&self, r: ProbeRecord) {
+    fn record(&self, mut r: ProbeRecord) {
+        r.release = clip(&r.release);
+        r.file = clip(&r.file);
+        r.detail = clip(&r.detail);
         let mut g = self.inner.lock().unwrap();
         if r.result == "ok" {
             g.served += 1;
@@ -96,16 +146,27 @@ pub(crate) async fn probe_release(
     body: Bytes,
 ) -> Response {
     let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
     let nzb = match (&q.url, body.is_empty()) {
-        (Some(url), _) => match nzbd_engine::fetch::http_get(url).await {
-            Ok(b) => b,
-            Err(e) => {
-                return error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    &format!("could not fetch the NZB: {e}"),
-                )
+        // One attempt, inside the deadline: the job retry schedule waits
+        // up to half an hour on a rate-limited indexer.
+        (Some(url), _) => {
+            let failed =
+                match tokio::time::timeout_at(deadline, nzbd_engine::fetch::http_get_once(url))
+                    .await
+                {
+                    Ok(Ok(b)) => Ok(b),
+                    Ok(Err(e)) => Err(format!("could not fetch the NZB: {e}")),
+                    Err(_) => Err("the NZB did not arrive in time".to_owned()),
+                };
+            match failed {
+                Ok(b) => b,
+                Err(detail) => {
+                    log.record(ProbeRecord::failed("nzb_fetch", detail.clone(), started));
+                    return error(StatusCode::UNPROCESSABLE_ENTITY, &detail);
+                }
             }
-        },
+        }
         (None, false) => body.to_vec(),
         (None, true) => {
             return error(
@@ -127,14 +188,19 @@ pub(crate) async fn probe_release(
     }
     let want = q.bytes.unwrap_or(DEFAULT_BYTES);
     let title = nzbd_nzb::parse(&nzb).ok().and_then(|p| p.meta.title);
-    let outcome =
-        match tokio::time::timeout(PROBE_TIMEOUT, nzbd_probe::probe(&nzb, servers, want)).await {
-            Ok(o) => o,
-            Err(_) => nzbd_probe::Outcome::Unavailable {
-                reason: nzbd_probe::Reason::Unreadable,
-                detail: "the news servers did not answer in time".into(),
-            },
-        };
+    let late = |detail: &str| nzbd_probe::Outcome::Unavailable {
+        reason: nzbd_probe::Reason::Unreadable,
+        detail: detail.into(),
+    };
+    let outcome = match tokio::time::timeout_at(deadline, log.gate.acquire()).await {
+        Ok(Ok(_permit)) => {
+            match tokio::time::timeout_at(deadline, nzbd_probe::probe(&nzb, servers, want)).await {
+                Ok(o) => o,
+                Err(_) => late("the news servers did not answer in time"),
+            }
+        }
+        Ok(Err(_)) | Err(_) => late("other probes held every slot until the deadline"),
+    };
     let millis = started.elapsed().as_millis() as u64;
     match outcome {
         nzbd_probe::Outcome::Head(h) => {

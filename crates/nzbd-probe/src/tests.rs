@@ -204,3 +204,59 @@ async fn an_obfuscated_set_is_searched_for_its_first_volume() {
     assert_eq!(h.file, "Title.mkv");
     assert_eq!(h.bytes, media[..30_000]);
 }
+
+/// A port that accepts connections, counts them and hangs up before the
+/// greeting: a server that is up but refuses this client.
+async fn refusing_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    (port, accepted)
+}
+
+#[tokio::test]
+async fn a_server_that_will_not_talk_is_not_called_missing_articles() {
+    let post = build_post("Title", &[("Title.mkv", mkv(60_000))], 20_000);
+    let (port, accepted) = refusing_server().await;
+    match probe(post.nzb.as_bytes(), vec![server(port)], 50_000).await {
+        Outcome::Unavailable { reason, detail } => {
+            assert_eq!(reason, Reason::Unreadable);
+            assert!(detail.contains("no news server answered"), "{detail}");
+        }
+        Outcome::Head(h) => panic!("head of {}", h.file),
+    }
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_dead_main_server_is_tried_once_and_the_backup_serves_the_head() {
+    let media = mkv(60_000);
+    let post = build_post("Title", &[("Title.mkv", media.clone())], 20_000);
+    let (port, accepted) = refusing_server().await;
+    let backup = NservBuilder::new().with_post(&post).start().await.unwrap();
+    let mut b = server(backup.port());
+    b.tier = 1;
+    let h = head(probe(post.nzb.as_bytes(), vec![server(port), b], 50_000).await);
+    assert_eq!(h.bytes, media[..50_000]);
+    // Three articles, one connection attempt on the dead server.
+    assert_eq!(h.articles, 3);
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_stored_member_that_is_not_media_is_not_returned() {
+    let volume = rar5_volume("Title.2021.mkv", &prng_bytes(9, 40_000), 0, 0, false);
+    let post = build_post("Title", &[("Title.part1.rar", volume)], 20_000);
+    let ns = NservBuilder::new().with_post(&post).start().await.unwrap();
+    assert_eq!(
+        reason(probe(post.nzb.as_bytes(), vec![server(ns.port())], 10_000).await),
+        Reason::NoMedia
+    );
+}

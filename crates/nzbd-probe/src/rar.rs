@@ -71,6 +71,11 @@ const R4_METHOD_STORE: u8 = 0x30;
 fn rar4(b: &[u8]) -> Volume {
     let mut at = RAR4_SIG.len();
     for _ in 0..64 {
+        // Every offset below is `at` plus a few bytes: keeping `at` inside
+        // the buffer keeps that arithmetic from overflowing on a hostile size.
+        if at >= b.len() {
+            return Volume::Unreadable("RAR4 header runs past the bytes read");
+        }
         // HEAD_CRC(2) HEAD_TYPE(1) HEAD_FLAGS(2) HEAD_SIZE(2) [ADD_SIZE(4)]
         let (Some(&kind), Some(flags), Some(size)) =
             (b.get(at + 2), u16le(b, at + 3), u16le(b, at + 5))
@@ -117,8 +122,21 @@ fn rar4(b: &[u8]) -> Volume {
                     unpacked |= hu << 32;
                     name_at += 8;
                 }
-                if flags & R4_FILE_DIRECTORY == R4_FILE_DIRECTORY {
-                    at += size as usize + add as usize;
+                let name = b
+                    .get(name_at..name_at + name_len as usize)
+                    .map(|n| {
+                        String::from_utf8_lossy(n.split(|&c| c == 0).next().unwrap_or(n))
+                            .into_owned()
+                    })
+                    .unwrap_or_default();
+                if flags & R4_FILE_DIRECTORY == R4_FILE_DIRECTORY || !could_be_media(&name) {
+                    at = match at
+                        .checked_add(size as usize)
+                        .and_then(|n| n.checked_add(add as usize))
+                    {
+                        Some(n) => n,
+                        None => return Volume::Unreadable("RAR4 block size overflows"),
+                    };
                     continue;
                 }
                 if flags & R4_FILE_SPLIT_BEFORE != 0 {
@@ -130,13 +148,6 @@ fn rar4(b: &[u8]) -> Volume {
                 if method != R4_METHOD_STORE {
                     return Volume::Compressed;
                 }
-                let name = b
-                    .get(name_at..name_at + name_len as usize)
-                    .map(|n| {
-                        String::from_utf8_lossy(n.split(|&c| c == 0).next().unwrap_or(n))
-                            .into_owned()
-                    })
-                    .unwrap_or_default();
                 return Volume::Stored {
                     name,
                     unpacked,
@@ -189,6 +200,10 @@ fn rar5(b: &[u8]) -> Volume {
     let mut at = RAR5_SIG.len();
     for _ in 0..64 {
         // CRC32(4) HEADER_SIZE(vint) then HEADER_SIZE bytes, then the data.
+        // `at` stays inside the buffer, so `at + 4` cannot overflow.
+        if at >= b.len() {
+            return Volume::Unreadable("RAR5 header runs past the bytes read");
+        }
         let mut p = at + 4;
         let Some(header_size) = vint(b, &mut p) else {
             return Volume::Unreadable("RAR5 header runs past the bytes read");
@@ -242,7 +257,7 @@ fn rar5(b: &[u8]) -> Volume {
                     .get(p..p.saturating_add(name_len as usize))
                     .map(|n| String::from_utf8_lossy(n).into_owned())
                     .unwrap_or_default();
-                if file_flags & R5_FILE_DIRECTORY != 0 {
+                if file_flags & R5_FILE_DIRECTORY != 0 || !could_be_media(&name) {
                     at = match header_end.checked_add(data as usize) {
                         Some(n) => n,
                         None => return Volume::Unreadable("RAR5 data size overflows"),
@@ -280,6 +295,46 @@ fn rar5(b: &[u8]) -> Volume {
         };
     }
     Volume::Unreadable("RAR5: no file header in the first 64 headers")
+}
+
+/// Whether an archive member may be the release's media. A scene archive
+/// can hold an NFO, a sample or subtitles beside the feature; those are
+/// stepped over so the probe never measures a sample as the release. Names
+/// with no known extension stay candidates (inner names can be obfuscated
+/// too): the caller still checks the bytes for a container signature.
+pub(crate) fn could_be_media(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let mut parts = lower.split(['/', '\\']).rev();
+    let file = parts.next().unwrap_or("");
+    if parts.any(|dir| dir == "sample" || dir == "samples") {
+        return false;
+    }
+    let (stem, ext) = file.rsplit_once('.').unwrap_or((file, ""));
+    if stem == "sample" || stem.ends_with("-sample") || stem.ends_with(".sample") {
+        return false;
+    }
+    !matches!(
+        ext,
+        "nfo"
+            | "txt"
+            | "sfv"
+            | "md5"
+            | "nzb"
+            | "par2"
+            | "url"
+            | "exe"
+            | "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "srt"
+            | "sub"
+            | "idx"
+            | "ass"
+            | "ssa"
+            | "sup"
+            | "vtt"
+    )
 }
 
 /// Walk a RAR5 extra area for a file-encryption record.
@@ -506,6 +561,85 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(inspect(b"\x1a\x45\xdf\xa3"), Volume::NotRar);
+    }
+
+    /// One RAR5 file member: its header and its data.
+    fn rar5_member(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_vint(&mut body, 0); // file flags
+        put_vint(&mut body, data.len() as u64);
+        put_vint(&mut body, 0x20);
+        put_vint(&mut body, 0); // store
+        put_vint(&mut body, 0);
+        put_vint(&mut body, name.len() as u64);
+        body.extend_from_slice(name.as_bytes());
+        let mut v = rar5_header(R5_FILE, 0, &body, &[], data.len() as u64);
+        v.extend_from_slice(data);
+        v
+    }
+
+    /// Sizes near usize::MAX used to overflow `at + 4` (debug panic, release
+    /// wrap-around into the signature).
+    #[test]
+    fn hostile_sizes_end_the_walk_instead_of_overflowing() {
+        let mut v = RAR5_SIG.to_vec();
+        v.extend(rar5_header(
+            R5_MAIN,
+            0,
+            &[0x01],
+            &[],
+            (usize::MAX - 26) as u64,
+        ));
+        assert!(matches!(inspect(&v), Volume::Unreadable(_)));
+
+        let mut v = RAR4_SIG.to_vec();
+        // a directory file header whose ADD_SIZE points past everything
+        v.extend_from_slice(&[0, 0, R4_FILE]);
+        v.extend_from_slice(&(0x8000u16 | R4_FILE_DIRECTORY as u16).to_le_bytes());
+        v.extend_from_slice(&33u16.to_le_bytes());
+        v.extend_from_slice(&u32::MAX.to_le_bytes());
+        v.extend_from_slice(&[0; 22]);
+        assert!(matches!(inspect(&v), Volume::Unreadable(_)));
+    }
+
+    #[test]
+    fn an_nfo_or_a_sample_ahead_of_the_feature_is_stepped_over() {
+        let mut v = RAR5_SIG.to_vec();
+        v.extend(rar5_header(R5_MAIN, 0, &[0x01], &[], 0));
+        v.extend(rar5_member("Title.2021.nfo", b"greetings"));
+        v.extend(rar5_member("Sample/title-sample.mkv", b"sample bytes"));
+        v.extend(rar5_member("Title.2021.mkv", b"the feature"));
+        match inspect(&v) {
+            Volume::Stored {
+                name, data_offset, ..
+            } => {
+                assert_eq!(name, "Title.2021.mkv");
+                assert_eq!(&v[data_offset as usize..], b"the feature");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn media_names_are_told_from_companions() {
+        for yes in [
+            "Title.mkv",
+            "a8f3c1e9d04b",
+            "Title.2021.m2ts",
+            "Sampler.Movie.mkv",
+        ] {
+            assert!(could_be_media(yes), "{yes}");
+        }
+        for no in [
+            "release.nfo",
+            "Sample/title.mkv",
+            "title-sample.mkv",
+            "sample.mkv",
+            "Subs\\English.srt",
+            "cover.jpg",
+        ] {
+            assert!(!could_be_media(no), "{no}");
+        }
     }
 
     /// What the fuzz target holds: a stored member's data starts inside the

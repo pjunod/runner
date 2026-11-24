@@ -36,13 +36,20 @@ pub enum Article {
     Missing,
     /// The article arrived and did not decode (bad CRC, broken yEnc).
     Corrupt,
+    /// No server could be asked: every one failed to connect, log in or
+    /// answer during this probe. Says nothing about the release.
+    Unreachable,
 }
 
 /// Fetches articles from the configured servers in tier order, keeping one
-/// lazily-opened connection per server.
+/// lazily-opened connection per server. A server that fails to connect, log
+/// in or answer is dead for the rest of the probe: reconnecting per article
+/// would spend the probe's deadline on one blackholed host and re-send a
+/// refused AUTHINFO until the provider bans the account.
 pub struct Fetcher {
     servers: Vec<ServerDef>,
     conns: Vec<Option<NntpConnection>>,
+    dead: Vec<bool>,
 }
 
 impl Fetcher {
@@ -50,7 +57,12 @@ impl Fetcher {
         servers.retain(|s| s.active);
         servers.sort_by_key(|s| s.tier);
         let conns = servers.iter().map(|_| None).collect();
-        Fetcher { servers, conns }
+        let dead = vec![false; servers.len()];
+        Fetcher {
+            servers,
+            conns,
+            dead,
+        }
     }
 
     pub fn has_servers(&self) -> bool {
@@ -59,22 +71,31 @@ impl Fetcher {
 
     /// Fetch one article: each server in turn until one serves it.
     pub async fn article(&mut self, message_id: &str) -> Article {
-        let mut corrupt = false;
+        let (mut corrupt, mut answered) = (false, false);
         for i in 0..self.servers.len() {
+            if self.dead[i] {
+                continue;
+            }
             match self.try_server(i, message_id).await {
                 Ok(Some(d)) => return Article::Decoded(d),
-                Ok(None) => {} // missing here; the next tier may have it
-                Err(Failure::Corrupt) => corrupt = true,
+                Ok(None) => answered = true, // missing here; the next tier may have it
+                Err(Failure::Corrupt) => {
+                    answered = true;
+                    corrupt = true;
+                }
                 Err(Failure::Connection(e)) => {
-                    tracing::debug!(server = %self.servers[i].name, error = %e, "probe: connection failed");
+                    tracing::debug!(server = %self.servers[i].name, error = %e, "probe: server dead for this probe");
                     self.conns[i] = None;
+                    self.dead[i] = true;
                 }
             }
         }
         if corrupt {
             Article::Corrupt
-        } else {
+        } else if answered {
             Article::Missing
+        } else {
+            Article::Unreachable
         }
     }
 
