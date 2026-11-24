@@ -1157,6 +1157,7 @@ try {
     <button data-tab="queue" class="active">Queue</button>
     <button data-tab="history">History</button>
     <button data-tab="files">Files</button>
+    <button data-tab="probes">Probes</button>
     <button data-tab="logs">Logs</button>
     <button data-tab="settings">Settings</button>
   </nav>
@@ -1289,6 +1290,17 @@ try {
         </select>
       </label>
     </div>
+  </section>
+
+  <section id="tab-probes" hidden>
+    <p class="muted" style="margin: 12px 0 6px">Head reads for Curator: the first bytes of a release's main file,
+      read without queueing it, so Curator can measure Dolby Vision and HDR before grabbing. Runner returns
+      bytes, never an opinion about them; a release it cannot read comes back with the reason.</p>
+    <div id="probes-summary" class="muted"></div>
+    <table>
+      <thead><tr><th>Release</th><th>Inner file</th><th>Path</th><th class="num">Read</th><th>Result</th></tr></thead>
+      <tbody id="probes-body"><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+    </table>
   </section>
 
   <section id="tab-logs" hidden>
@@ -4178,6 +4190,32 @@ async function refreshClients() {
 /// round trip, measured at 11 ms, which is cheaper than the waste it
 /// replaces. Live tailing is unaffected: the SSE stream still carries
 /// every scope and `logMatches` still filters it in the browser.
+// ---- probes ---------------------------------------------------------------
+// Head reads for Curator's pre-flight measurement (GET /api/v1/probes).
+const PROBE_RESULT = {
+  ok: "Bytes returned", encrypted: "Encrypted archive", compressed: "Compressed archive",
+  missing_articles: "Articles missing", no_media: "No media file", unreadable: "Could not read",
+};
+async function refreshProbes() {
+  const r = await jfetch("/api/v1/probes");
+  if (!r.ok) throw new Error("probes " + r.status);
+  const p = await r.json();
+  $("probes-summary").textContent =
+    `served ${p.served} · couldn't read ${p.unavailable} · read ${fmtBytes(p.bytes)} since start`;
+  const rows = (p.recent || []).map(x => {
+    const ok = x.result === "ok";
+    let result = PROBE_RESULT[x.result] || x.result;
+    if (ok && x.articles_missing) result = "Partial · articles missing";
+    const path = (x.path || []).map(s => s === "rar-store" ? "RAR store" : s === "yenc" ? "yEnc" : s).join(" › ");
+    const file = x.file ? `${esc(x.file)}${x.file_size ? " · " + fmtBytes(x.file_size) : ""}` : "—";
+    const read = ok ? `${fmtBytes(x.bytes)} · ${x.articles} art.` : "—";
+    return `<tr><td>${esc(x.release || "—")}</td><td>${file}</td><td>${esc(path || "—")}</td>` +
+      `<td class="num">${read}</td><td class="${ok && !x.articles_missing ? "" : "muted"}" title="${esc(x.detail || "")}">${esc(result)}</td></tr>`;
+  });
+  $("probes-body").innerHTML = rows.length ? rows.join("")
+    : `<tr><td colspan="5" class="empty">No probes yet. Curator asks for them when a profile ranks Dolby Vision or HDR.</td></tr>`;
+}
+
 async function refreshLogs() {
   const scopes = logScopes();
   if (!scopes.length) { store.logs = []; renderLogs(); return; }
@@ -4784,7 +4822,7 @@ let activeTab = "queue";
 document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
   activeTab = b.dataset.tab;
   document.querySelectorAll("nav.tabs button").forEach(x => x.classList.toggle("active", x === b));
-  for (const t of ["queue", "history", "files", "logs", "settings"]) $("tab-" + t).hidden = t !== activeTab;
+  for (const t of ["queue", "history", "files", "probes", "logs", "settings"]) $("tab-" + t).hidden = t !== activeTab;
   refreshAll();
 });
 
@@ -4793,6 +4831,7 @@ function refreshTab(forceHistory = false) {
   if (activeTab === "queue") refreshQueue().catch(() => {});
   if (activeTab === "history") refreshHistory(forceHistory).catch(() => {});
   if (activeTab === "files") refreshFiles().catch(() => {});
+  if (activeTab === "probes") refreshProbes().catch(() => {});
   // Logs are a live tail now. Re-polling over a healthy stream would
   // replace the ring every 5 s — discarding the lines the stream just
   // delivered along with any "N skipped" markers, and re-downloading 300

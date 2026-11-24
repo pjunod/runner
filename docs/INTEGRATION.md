@@ -415,6 +415,32 @@ never that the files were used.
 
 ---
 
+## 6a. Release probe — "what is inside this, before I grab it?"
+
+Curator ranks Dolby Vision and HDR releases by what they measure, not by
+what their names claim (Curator ADR 0026). The facts that matter (DV
+profile, FEL or MEL, CM version, HDR10+) live in the first frame of the main
+file, so Curator asks nzbd for those bytes before it grabs:
+
+```
+POST /api/v1/probe?url=<the release's NZB URL>&bytes=4194304
+```
+
+nzbd fetches the NZB exactly as an add would, picks the main file (the first
+volume of the largest RAR set, or the largest media file; an obfuscated set is
+searched for its first volume), fetches only the articles covering the head,
+decodes the yEnc, and unwraps a store-mode RAR. It answers with the bytes
+(base64) and how it reached them, or `"status":"unavailable"` with a reason:
+`encrypted`, `compressed`, `missing_articles`, `no_media` or `unreadable`.
+
+**Bytes, not opinions.** nzbd never parses the media: Curator measures the
+head with the same prober it runs on imported files, so a pre-flight answer
+and a post-import answer cannot disagree. Nothing is queued and nothing is
+written; the probe opens its own connection per server, in tier order, and
+closes it when done. The capability is advertised as `release-probe-v1` in
+`/api/v1/status`, and the UI's Probes tab lists recent probes (without their
+URLs, which carry indexer API keys).
+
 ## 7. NZBGet compat shim — the other consumers
 
 **What it does.** Sonarr, Radarr and Lidarr connect to nzbd as an "NZBGet"
