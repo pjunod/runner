@@ -91,7 +91,11 @@ fi
 if [[ "$sync" == true ]]; then
   # Start from the product lock so every shared package keeps its reviewed
   # identity; cargo then drops product-only packages and adds the fuzz-only
-  # ones. Registry tooling is pinned to the reviewed versions above.
+  # ones. Registry tooling is pinned to the reviewed versions above. If cargo
+  # fails part-way (for example offline), put the committed lock back.
+  backup="$(mktemp)"
+  cp fuzz/Cargo.lock "$backup"
+  trap 'cp "$backup" fuzz/Cargo.lock; rm -f "$backup"' EXIT
   cp Cargo.lock fuzz/Cargo.lock
   cargo metadata \
     --manifest-path fuzz/Cargo.toml \
@@ -104,6 +108,8 @@ if [[ "$sync" == true ]]; then
         --precise "$version"
     fi
   done <<<"$expected_fuzz_only"
+  trap - EXIT
+  rm -f "$backup"
 fi
 
 cargo metadata \
@@ -112,7 +118,7 @@ cargo metadata \
   --format-version 1 >/dev/null
 
 actual_fuzz_only="$(
-  comm -13 \
+  LC_ALL=C comm -13 \
     <(lock_identities Cargo.lock) \
     <(lock_identities fuzz/Cargo.lock)
 )"

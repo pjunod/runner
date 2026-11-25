@@ -1,5 +1,9 @@
 version: 2
 updates:
+  # fuzz/Cargo.lock is derived from Cargo.lock and Dependabot does not manage
+  # it. The required supply-chain check fails until the PR also carries the
+  # regenerated fuzz lock: check out the PR branch, run `make fuzz-lock`, and
+  # push the result (Dependabot stops rebasing a PR once others commit to it).
   - package-ecosystem: cargo
     directory: /
     schedule:
