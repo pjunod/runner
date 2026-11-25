@@ -824,11 +824,21 @@ mod tests {
                 }
                 other => panic!("{code}: expected IndexerRefused, got {other:?}"),
             }
-            assert!(error.to_string().contains("asked to wait 23h 42m"), "{error}");
+            assert!(
+                error.to_string().contains("asked to wait 23h 42m"),
+                "{error}"
+            );
             assert_eq!(cause_of(&error), nzbd_types::FetchCause::IndexerUnavailable);
             assert!(!nzbd_types::FailureReason::Fetch.blames_release(Some(cause_of(&error))));
-            assert!(delays.lock().unwrap().is_empty(), "a locked account was waited on");
-            assert_eq!(server.await.unwrap().len(), 1, "a locked account was asked twice");
+            assert!(
+                delays.lock().unwrap().is_empty(),
+                "a locked account was waited on"
+            );
+            assert_eq!(
+                server.await.unwrap().len(),
+                1,
+                "a locked account was asked twice"
+            );
         }
     }
 
@@ -888,10 +898,12 @@ mod tests {
     /// Serves 429 (with no Retry-After: the ladder's own wait) `refusals`
     /// times, then the NZB.
     async fn refuse_then_serve(refusals: usize) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        let mut responses = vec![
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
-            refusals
-        ];
+        let mut responses =
+            vec![
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string();
+                refusals
+            ];
         responses.push(
             "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n<nzb />".into(),
         );
