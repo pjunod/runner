@@ -361,6 +361,18 @@ pub fn cause_of(error: &FetchError) -> nzbd_types::FetchCause {
     }
 }
 
+/// Contract §2.2: when an `indexer_unavailable` fetch may be tried again,
+/// as Unix seconds — `now` plus the Retry-After that ended it. Only a quota
+/// refusal ([`FetchError::IndexerRefused`]) names one; a ladder that ran out
+/// on transport failures or short rate limits carries none.
+pub fn retry_at_of(error: &FetchError, now: SystemTime) -> Option<u64> {
+    let FetchError::IndexerRefused { retry_after, .. } = error else {
+        return None;
+    };
+    let since_epoch = now.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    Some(since_epoch.saturating_add(*retry_after).as_secs())
+}
+
 fn retry_delay(error: &FetchError, retries: u32) -> Option<Duration> {
     match error {
         FetchError::HttpStatus {
@@ -830,6 +842,8 @@ mod tests {
             );
             assert_eq!(cause_of(&error), nzbd_types::FetchCause::IndexerUnavailable);
             assert!(!nzbd_types::FailureReason::Fetch.blames_release(Some(cause_of(&error))));
+            let failed_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_764_000_000);
+            assert_eq!(retry_at_of(&error, failed_at), Some(1_764_085_296));
             assert!(
                 delays.lock().unwrap().is_empty(),
                 "a locked account was waited on"
@@ -870,6 +884,10 @@ mod tests {
             None,
             "invalid URL submissions stop immediately"
         );
+        // Only a quota refusal names when to try again.
+        let now = SystemTime::now();
+        assert_eq!(retry_at_of(&error, now), None);
+        assert_eq!(retry_at_of(&FetchError::Timeout, now), None);
     }
 
     #[test]

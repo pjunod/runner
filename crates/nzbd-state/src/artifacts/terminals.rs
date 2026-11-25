@@ -95,6 +95,10 @@ pub struct JobTerminal {
     pub outcome: TerminalOutcome,
     pub reason: Option<FailureReason>,
     pub fetch_cause: Option<FetchCause>,
+    /// `fetch{indexer_unavailable}` only, when the indexer's Retry-After
+    /// ended the fetch: when it may be asked again (Unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_unix: Option<u64>,
     pub stage: Option<String>,
     pub message: Option<String>,
     pub blames_release: bool,
@@ -148,7 +152,7 @@ impl JobTerminal {
     }
 }
 
-const COLUMNS: &str = "job,transfer,outcome,reason,fetch_cause,stage,message,blames_release,salvage,keep_on_failure,fetched,publication,markers,entry,history_seq,history_incarnation,markers_stamped,emitted,disposal,salvage_error,created_at,updated_at";
+const COLUMNS: &str = "job,transfer,outcome,reason,fetch_cause,stage,message,blames_release,salvage,keep_on_failure,fetched,publication,markers,entry,history_seq,history_incarnation,markers_stamped,emitted,disposal,salvage_error,created_at,updated_at,retry_at_unix";
 
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTerminal> {
     Ok(RawTerminal {
@@ -174,6 +178,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTerminal> {
         salvage_error: row.get(19)?,
         created_at: row.get(20)?,
         updated_at: row.get(21)?,
+        retry_at_unix: row.get(22)?,
     })
 }
 
@@ -200,6 +205,7 @@ struct RawTerminal {
     salvage_error: Option<String>,
     created_at: i64,
     updated_at: i64,
+    retry_at_unix: Option<i64>,
 }
 
 impl RawTerminal {
@@ -216,6 +222,10 @@ impl RawTerminal {
             fetch_cause: self
                 .fetch_cause
                 .map(|c| FetchCause::parse(&c).ok_or_else(|| corrupt("fetch_cause")))
+                .transpose()?,
+            retry_at_unix: self
+                .retry_at_unix
+                .map(|at| u64::try_from(at).map_err(|_| corrupt("retry_at_unix")))
                 .transpose()?,
             stage: self.stage,
             message: self.message,
@@ -364,8 +374,11 @@ impl Inventory {
                 row.salvage = SalvageState::None;
             }
         }
+        let retry_at_unix = row
+            .retry_at_unix
+            .map(|at| i64::try_from(at).unwrap_or(i64::MAX));
         tx.execute(
-            &format!("INSERT INTO job_terminals({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,0,0,NULL,?16,?15,?15)"),
+            &format!("INSERT INTO job_terminals({COLUMNS}) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,NULL,0,0,NULL,?16,?15,?15,?17)"),
             rusqlite::params![
                 row.job,
                 row.transfer,
@@ -383,6 +396,7 @@ impl Inventory {
                 serde_json::to_string(&row.entry)?,
                 at,
                 row.salvage_error,
+                retry_at_unix,
             ],
         )?;
         tx.commit()?;
@@ -943,6 +957,7 @@ pub(crate) mod tests {
             outcome: TerminalOutcome::Failed,
             reason: Some(FailureReason::Unpack),
             fetch_cause: None,
+            retry_at_unix: None,
             stage: Some("unpack".into()),
             message: Some("bad archive".into()),
             blames_release: true,
@@ -1042,6 +1057,38 @@ pub(crate) mod tests {
         assert_eq!(inventory.pending_disposal().unwrap().len(), 1);
         inventory.record_disposal(7, "parked at /x").unwrap();
         assert!(inventory.pending_disposal().unwrap().is_empty());
+    }
+
+    /// Contract §2.2: the indexer's retry time survives the row, and a store
+    /// written before the column existed opens with it absent.
+    #[test]
+    fn retry_at_round_trips_and_older_rows_read_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = Inventory::open(dir.path()).unwrap();
+        let mut refused = failed(5, SalvageState::None);
+        refused.reason = Some(FailureReason::Fetch);
+        refused.fetch_cause = Some(FetchCause::IndexerUnavailable);
+        refused.retry_at_unix = Some(1_764_085_296);
+        inventory.record_terminal(&refused).unwrap();
+        inventory
+            .record_terminal(&failed(6, SalvageState::None))
+            .unwrap();
+        let stored = inventory.terminal(5).unwrap().unwrap();
+        assert_eq!(stored.retry_at_unix, Some(1_764_085_296));
+        let plain = inventory.terminal(6).unwrap().unwrap();
+        assert_eq!(plain.retry_at_unix, None);
+        inventory.close().unwrap();
+        drop(inventory);
+        {
+            let path = dir.path().join("artifacts.sqlite");
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let drop_column = "ALTER TABLE job_terminals DROP COLUMN retry_at_unix";
+            conn.execute_batch(drop_column).unwrap();
+        }
+        let inventory = Inventory::open(dir.path()).unwrap();
+        let older = inventory.terminal(5).unwrap().unwrap();
+        assert_eq!(older.fetch_cause, Some(FetchCause::IndexerUnavailable));
+        assert_eq!(older.retry_at_unix, None);
     }
 
     /// Contract §2.5: with the terminal emitted and salvage settled, an open

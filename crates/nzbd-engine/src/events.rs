@@ -103,6 +103,9 @@ pub enum Event {
         reason: Option<nzbd_types::FailureReason>,
         /// `fetch` only: `gone` or `indexer_unavailable`.
         fetch_cause: Option<nzbd_types::FetchCause>,
+        /// `fetch{indexer_unavailable}` only, and only when the indexer's
+        /// Retry-After ended the fetch: when it may be asked again (Unix s).
+        retry_at_unix: Option<u64>,
         /// `failed` only: a `PostStage` name or `download` | `health` | `fetch`.
         stage: Option<String>,
         /// `failed` only: human text, at most 2048 characters.

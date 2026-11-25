@@ -3888,6 +3888,7 @@ async fn record_resumed_terminal(
         nzbd_engine::terminal::TerminalFacts {
             reason,
             fetch_cause: None,
+            retry_at_unix: None,
             stage: delivery.failure_stage.clone(),
             message: delivery.failure_cause.clone(),
             blames_release: reason.is_some_and(|reason| reason.blames_release(None)),
@@ -5233,6 +5234,7 @@ async fn process_job_ctx_from_inner(
             nzbd_engine::terminal::TerminalFacts {
                 reason: None,
                 fetch_cause: None,
+                retry_at_unix: None,
                 stage: None,
                 message: None,
                 blames_release: false,

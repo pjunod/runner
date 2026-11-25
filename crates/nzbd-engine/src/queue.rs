@@ -259,6 +259,8 @@ impl QueueState {
                     receipt.terminal_outcome = param(nzbd_types::PP_DONE_PARAM);
                     receipt.failure_reason = typed;
                     receipt.fetch_cause = param("Failure:FetchCause");
+                    receipt.retry_at_unix = param(crate::terminal::FAILURE_RETRY_AT_PARAM)
+                        .and_then(|value| value.parse().ok());
                     receipt.blames_release =
                         param("Failure:BlamesRelease").and_then(|value| value.parse().ok());
                     receipt.salvage = param("Failure:Salvage");
@@ -538,6 +540,7 @@ impl QueueState {
             source_generation: None,
             failure_reason: None,
             fetch_cause: None,
+            retry_at_unix: None,
             blames_release: None,
             salvage: None,
         });
@@ -1960,6 +1963,7 @@ mod tests {
             source_generation: Some("pinned-gen".into()),
             failure_reason: None,
             fetch_cause: None,
+            retry_at_unix: None,
             blames_release: None,
             salvage: None,
         });

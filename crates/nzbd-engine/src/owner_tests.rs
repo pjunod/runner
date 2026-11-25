@@ -1650,6 +1650,7 @@ async fn terminal_failed_job_can_keep_only_its_retained_delivery_source() {
             source_generation: Some(source_generation.clone()),
             failure_reason: None,
             fetch_cause: None,
+            retry_at_unix: None,
             blames_release: None,
             salvage: None,
         });
@@ -3873,6 +3874,7 @@ async fn admission_tombstone_refreshes_exact_source_keep_and_delete_evidence() {
             source_generation: Some(source.generation.clone()),
             failure_reason: None,
             fetch_cause: None,
+            retry_at_unix: None,
             blames_release: None,
             salvage: None,
         });
@@ -5490,6 +5492,7 @@ async fn consumer_receipt_refresh_pins_publication_while_source_progress_remains
             source_generation: Some("generation-78".into()),
             failure_reason: None,
             fetch_cause: None,
+            retry_at_unix: None,
             blames_release: None,
             salvage: None,
         });
@@ -7983,6 +7986,7 @@ fn unpinned_failed_receipt_adopts_its_jobs_source_and_reports_disposal() {
         source_generation: None,
         failure_reason: None,
         fetch_cause: None,
+        retry_at_unix: None,
         blames_release: None,
         salvage: None,
     };
@@ -8100,6 +8104,7 @@ fn failed_receipt_settles_when_its_source_is_gone() {
         source_generation: Some(artifact.generation.clone()),
         failure_reason: None,
         fetch_cause: None,
+        retry_at_unix: None,
         blames_release: None,
         salvage: None,
     };

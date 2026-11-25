@@ -103,6 +103,27 @@ pub fn salvage_owed(job: &Job, reason: FailureReason) -> bool {
         && (job.kind == JobKind::Torrent || Fetched::of(job).success_articles > 0)
 }
 
+/// The marker a `fetch{indexer_unavailable}` terminal carries the
+/// indexer's own retry time in (Unix seconds, contract §2.2).
+pub const FAILURE_RETRY_AT_PARAM: &str = "Failure:RetryAt";
+
+/// Contract §2.2: when the indexer said it may be asked again. Only a
+/// `fetch{indexer_unavailable}` failure whose fetch ended on a quota
+/// Retry-After ([`crate::FETCH_RETRY_AT_PARAM`]) carries one.
+fn fetch_retry_at(
+    job: &Job,
+    reason: FailureReason,
+    fetch_cause: Option<FetchCause>,
+) -> Option<u64> {
+    if reason != FailureReason::Fetch || fetch_cause != Some(FetchCause::IndexerUnavailable) {
+        return None;
+    }
+    job.params
+        .iter()
+        .find(|(key, _)| key == crate::FETCH_RETRY_AT_PARAM)
+        .and_then(|(_, value)| value.parse().ok())
+}
+
 /// Build the failed terminal for `job` from its queue row.
 pub fn failed_terminal(
     job: &Job,
@@ -118,6 +139,7 @@ pub fn failed_terminal(
         SalvageState::None
     };
     let blames = reason.blames_release(fetch_cause);
+    let retry_at_unix = fetch_retry_at(job, reason, fetch_cause);
     let keep = keeps_failed_source(job);
     let status = reason.history_status();
     let at = unix_now();
@@ -135,6 +157,9 @@ pub fn failed_terminal(
     ];
     if let Some(cause) = fetch_cause {
         markers.push(("Failure:FetchCause".into(), cause.as_str().into()));
+    }
+    if let Some(at) = retry_at_unix {
+        markers.push((FAILURE_RETRY_AT_PARAM.into(), at.to_string()));
     }
     if keep {
         markers.push(("Failure:KeepOnFailure".into(), "true".into()));
@@ -154,6 +179,7 @@ pub fn failed_terminal(
         TerminalFacts {
             reason: Some(reason),
             fetch_cause,
+            retry_at_unix,
             stage: Some(stage.to_string()),
             message: Some(message),
             blames_release: blames,
@@ -169,6 +195,8 @@ pub fn failed_terminal(
 pub struct TerminalFacts {
     pub reason: Option<FailureReason>,
     pub fetch_cause: Option<FetchCause>,
+    /// `fetch{indexer_unavailable}` only: the indexer's retry time.
+    pub retry_at_unix: Option<u64>,
     pub stage: Option<String>,
     pub message: Option<String>,
     pub blames_release: bool,
@@ -220,6 +248,7 @@ pub fn terminal_from_job(
         outcome,
         reason: facts.reason,
         fetch_cause: facts.fetch_cause,
+        retry_at_unix: facts.retry_at_unix,
         stage: facts.stage,
         message: facts.message,
         blames_release: facts.blames_release,
@@ -270,6 +299,9 @@ pub fn terminal_from_stamped(
         .as_deref()
         .and_then(FetchCause::parse)
         .filter(|_| reason == Some(FailureReason::Fetch));
+    let retry_at_unix: Option<u64> = param(FAILURE_RETRY_AT_PARAM)
+        .and_then(|value| value.parse().ok())
+        .filter(|_| fetch_cause == Some(FetchCause::IndexerUnavailable));
     let mut terminal = terminal_from_job(
         job,
         if success {
@@ -283,6 +315,7 @@ pub fn terminal_from_stamped(
         TerminalFacts {
             reason,
             fetch_cause,
+            retry_at_unix,
             stage: (!success).then(|| param("Failure:Stage")).flatten(),
             message: (!success)
                 .then(|| param("Failure:Message"))
@@ -438,6 +471,7 @@ pub fn event_for(row: &JobTerminal) -> Option<Event> {
         outcome: row.outcome,
         reason: row.reason,
         fetch_cause: row.fetch_cause,
+        retry_at_unix: row.retry_at_unix,
         stage: row.stage.clone(),
         message: row.message.clone(),
         blames_release: row.blames_release,
@@ -476,6 +510,73 @@ mod tests {
                 "{status}"
             );
             assert_eq!(reason_for_status(status), Some(reason));
+        }
+    }
+
+    fn url_job() -> Job {
+        Job {
+            id: nzbd_types::JobId(3),
+            kind: JobKind::Url,
+            name: "quota fixture".into(),
+            dir_name: "fixture".into(),
+            name_provisional: false,
+            delivery_lifecycle: true,
+            queued_at_unix: 1,
+            original_name: String::new(),
+            category: None,
+            priority: 0,
+            dupe: nzbd_types::DupeInfo::default(),
+            params: vec![("monarr-transfer".into(), "t-3".into())],
+            files: Vec::new(),
+            totals: nzbd_types::JobTotals::default(),
+            status: JobStatus::Failed,
+            torrent: None,
+            stages: Vec::new(),
+        }
+    }
+
+    /// Contract §2.2: only a `fetch{indexer_unavailable}` terminal whose
+    /// fetch recorded the indexer's retry time carries it — typed, as a
+    /// marker, and back from a stamped row.
+    #[test]
+    fn only_a_quota_refusal_terminal_carries_retry_at() {
+        let mut refused = url_job();
+        let key = crate::FETCH_RETRY_AT_PARAM.to_string();
+        refused.params.push((key, "1764085296".into()));
+        let unavailable = Some(FetchCause::IndexerUnavailable);
+        let terminal = failed_terminal(
+            &refused,
+            FailureReason::Fetch,
+            unavailable,
+            "fetch",
+            "asked to wait",
+        );
+        assert_eq!(terminal.retry_at_unix, Some(1_764_085_296));
+        let marker: (String, String) = (FAILURE_RETRY_AT_PARAM.into(), "1764085296".into());
+        assert!(terminal.markers.contains(&marker));
+        let mut stamped = refused.clone();
+        stamped.params.extend(terminal.markers.clone());
+        let entry = terminal.entry.clone();
+        let replayed = terminal_from_stamped(&stamped, entry, None).unwrap();
+        assert_eq!(replayed.retry_at_unix, Some(1_764_085_296));
+        let gone = failed_terminal(
+            &refused,
+            FailureReason::Fetch,
+            Some(FetchCause::Gone),
+            "fetch",
+            "not found",
+        );
+        assert_eq!(gone.retry_at_unix, None);
+        let exhausted = failed_terminal(
+            &url_job(),
+            FailureReason::Fetch,
+            unavailable,
+            "fetch",
+            "timed out",
+        );
+        assert_eq!(exhausted.retry_at_unix, None);
+        for (key, _) in &exhausted.markers {
+            assert_ne!(key, FAILURE_RETRY_AT_PARAM);
         }
     }
 }
