@@ -723,7 +723,12 @@ impl WalFile {
     #[tracing::instrument(level = "debug", skip_all)]
     #[inline]
     pub fn read_from_file(path_full: String) -> Result<Self, Error> {
-        let Some((_, fname)) = path_full.rsplit_once('/') else {
+        // Take the name with the platform's path rules: runtime callers join
+        // with '/', but inspection passes native paths, which use a backslash on Windows.
+        let Some(fname) = std::path::Path::new(&path_full)
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
             return Err(Error::InvalidPath("Invalid file path"));
         };
         let Some((num, ending)) = fname.split_once('.') else {

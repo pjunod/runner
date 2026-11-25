@@ -36,6 +36,7 @@ status page is [`STATUS.md`](../STATUS.md) at the repository root.
 | [BITTORRENT_M0_REPORT.md](BITTORRENT_M0_REPORT.md) | BitTorrent M0: the engine boundary (read by `scripts/check-bittorrent-release-review.sh`) |
 | [BITTORRENT_M1B_REPORT.md](BITTORRENT_M1B_REPORT.md) | BitTorrent M1b: one queue contract |
 | [BITTORRENT_GATE9_REVIEW.md](BITTORRENT_GATE9_REVIEW.md) | BitTorrent gate 9 dependency review (read by the release-review script) |
+| [BINCODE_COMPATIBILITY.md](BINCODE_COMPATIBILITY.md) | Maintained codecs, frozen legacy bytes, mixed-version wire and storage recovery proofs |
 | [BITTORRENT_RELEASE_REVIEW.md](BITTORRENT_RELEASE_REVIEW.md) | BitTorrent single-node release review (read by the release-review script) |
 | [BITTORRENT_BUILD_STATUS.md](BITTORRENT_BUILD_STATUS.md) | BitTorrent build record |
 | [BITTORRENT_MAGNET_DHT_STATUS.md](BITTORRENT_MAGNET_DHT_STATUS.md) | Magnet DHT build record |

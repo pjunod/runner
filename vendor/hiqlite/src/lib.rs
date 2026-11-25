@@ -223,3 +223,7 @@ where
 {
     start::start_node_inner::<C>(Box::new(node_config)).await
 }
+
+#[cfg(all(feature = "validation-test-helpers", feature = "sqlite"))]
+#[doc(hidden)]
+pub mod codec_compatibility;

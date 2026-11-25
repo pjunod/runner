@@ -181,6 +181,19 @@ fuzz-magnet-run:
 		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) \
 		-max_len=$(FUZZ_MAGNET_MAX_LEN) -dict=dictionaries/magnet.dict
 
+# Codec seeds are frozen outputs from the real prior implementation.
+.PHONY: fuzz-codecs-run
+fuzz-codecs-run: ## Fuzz native key bundles and peer wire decoding
+	python3 scripts/bincode-compatibility/seed.py --corpus-root fuzz/corpus
+	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
+		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
+		peer_protocol corpus/peer_protocol -- \
+		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) -max_len=65536
+	cd fuzz && PATH="$(RUSTUP_PATH_PREFIX)$$PATH" $(CARGO) +$(FUZZ_TOOLCHAIN) \
+		fuzz run $(if $(strip $(FUZZ_TARGET)),--target $(FUZZ_TARGET),) \
+		key_bundle corpus/key_bundle -- \
+		$(if $(strip $(FUZZ_SECONDS)),-max_total_time=$(FUZZ_SECONDS),-runs=$(FUZZ_RUNS)) -max_len=65536
+
 .PHONY: bittorrent-policy
 bittorrent-policy: ## Verify adapter, daemon, review-doc, and dependency policies
 	bash -n scripts/check-bittorrent-storage-full-probe.sh
@@ -251,10 +264,11 @@ gate: ## Deterministic release gate: core checks + BitTorrent policy + fuzz cont
 	@echo "OK - deterministic release gate passed"
 
 .PHONY: gate-fuzz
-gate-fuzz: ## Release gate plus both bounded BitTorrent libFuzzer campaigns
+gate-fuzz: ## Release gate plus bounded input and codec fuzz campaigns
 	$(MAKE) gate
 	$(MAKE) fuzz-metainfo-run
 	$(MAKE) fuzz-magnet-run
+	$(MAKE) fuzz-codecs-run
 	@echo "OK - deterministic and bounded fuzz release gates passed"
 
 ##@ Housekeeping
