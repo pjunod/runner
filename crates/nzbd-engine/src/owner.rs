@@ -5919,7 +5919,8 @@ impl Owner {
         };
         row.params.retain(|(key, _)| key != "*AddPaused");
         // A retry time belongs to this resolution's own refusal only.
-        row.params.retain(|(key, _)| key != crate::FETCH_RETRY_AT_PARAM);
+        row.params
+            .retain(|(key, _)| key != crate::FETCH_RETRY_AT_PARAM);
         for (key, value) in prepared.resolved.params.into_iter().filter(|(key, _)| {
             matches!(
                 key.as_str(),
