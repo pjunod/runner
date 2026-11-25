@@ -15,6 +15,7 @@ cryptr = { path = "../vendor/cryptr" }
 librqbit = { workspace = true }
 libfuzzer-sys = "=0.4.13"
 nzbd-torrent = { path = "../crates/nzbd-torrent", features = ["fuzzing"] }
+nzbd-probe = { path = "../crates/nzbd-probe" }
 
 [[bin]]
 name = "metainfo_preflight"
@@ -40,6 +41,13 @@ bench = false
 [[bin]]
 name = "key_bundle"
 path = "fuzz_targets/key_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "probe_rar"
+path = "fuzz_targets/probe_rar.rs"
 test = false
 doc = false
 bench = false

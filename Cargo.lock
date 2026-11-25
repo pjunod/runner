@@ -2603,6 +2603,7 @@ dependencies = [
  "nzbd-nserv",
  "nzbd-nzb",
  "nzbd-post",
+ "nzbd-probe",
  "nzbd-state",
  "nzbd-torrent",
  "nzbd-types",
@@ -2789,6 +2790,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "nzbd-probe"
+version = "0.9.8"
+dependencies = [
+ "nzbd-nntp",
+ "nzbd-nserv",
+ "nzbd-nzb",
+ "nzbd-types",
+ "nzbd-yenc",
+ "serde",
+ "tokio",
  "tracing",
 ]
 

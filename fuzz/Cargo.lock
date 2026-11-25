@@ -1545,7 +1545,7 @@ dependencies = [
  "futures",
  "httparse",
  "network-interface",
- "quick-xml",
+ "quick-xml 0.41.0",
  "reqwest",
  "serde",
  "tokio",
@@ -1737,6 +1737,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "nzbd-nntp"
+version = "0.9.8"
+dependencies = [
+ "nzbd-types",
+ "rustls",
+ "rustls-platform-verifier",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "nzbd-nzb"
+version = "0.9.8"
+dependencies = [
+ "quick-xml 0.42.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nzbd-probe"
+version = "0.9.8"
+dependencies = [
+ "nzbd-nntp",
+ "nzbd-nzb",
+ "nzbd-types",
+ "nzbd-yenc",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nzbd-torrent"
 version = "0.9.8"
 dependencies = [
@@ -1764,7 +1798,24 @@ dependencies = [
  "librqbit",
  "librqbit-buffers",
  "librqbit-peer-protocol",
+ "nzbd-probe",
  "nzbd-torrent",
+]
+
+[[package]]
+name = "nzbd-types"
+version = "0.9.8"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nzbd-yenc"
+version = "0.9.8"
+dependencies = [
+ "crc32fast",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1918,6 +1969,15 @@ checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
  "serde",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

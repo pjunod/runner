@@ -1235,6 +1235,7 @@ try {
     <button data-tab="queue" class="active">Queue</button>
     <button data-tab="history">History</button>
     <button data-tab="files">Files</button>
+    <button data-tab="probes">Probes</button>
     <button data-tab="logs">Logs</button>
     <button data-tab="settings">Settings</button>
   </nav>
@@ -1402,6 +1403,17 @@ try {
         </select>
       </label>
     </div>
+  </section>
+
+  <section id="tab-probes" hidden>
+    <p class="muted" style="margin: 12px 0 6px">Head reads for Curator: the first bytes of a release's main file,
+      read without queueing it, so Curator can measure Dolby Vision and HDR before grabbing. Runner returns
+      bytes, never an opinion about them; a release it cannot read comes back with the reason.</p>
+    <div id="probes-summary" class="muted"></div>
+    <table>
+      <thead><tr><th>Release</th><th>Inner file</th><th>Path</th><th class="num">Read</th><th>Result</th></tr></thead>
+      <tbody id="probes-body"><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+    </table>
   </section>
 
   <section id="tab-logs" hidden>
@@ -4564,6 +4576,46 @@ async function refreshClients() {
   store.clients = clients;
   renderClients();
 }
+// ---- probes ---------------------------------------------------------------
+// Head reads for Curator's pre-flight measurement (GET /api/v1/probes).
+const PROBE_RESULT = {
+  ok: "Bytes returned", encrypted: "Encrypted archive", compressed: "Compressed archive",
+  missing_articles: "Articles missing", no_media: "No media file", unreadable: "Could not read",
+  nzb_fetch: "NZB fetch failed",
+};
+async function refreshProbes() {
+  const r = await jfetch("/api/v1/probes");
+  if (!r.ok) throw new Error("probes " + r.status);
+  const p = await r.json();
+  $("probes-summary").textContent =
+    `served ${p.served} · couldn't read ${p.unavailable} · read ${fmtBytes(p.bytes)} since start`;
+  // Built from nodes, never innerHTML: release and file names come from
+  // strangers' NZBs (the live-rows law the UI DOM harness enforces).
+  const body = $("probes-body");
+  while (dom.first(body)) dom.remove(body, dom.first(body));
+  const cell = (row, text, cls) => { const td = dom.append(row, dom.create("td", cls)); dom.text(td, text); return td; };
+  const recent = p.recent || [];
+  for (const x of recent) {
+    const ok = x.result === "ok";
+    let result = PROBE_RESULT[x.result] || x.result;
+    if (ok && x.articles_missing) result = "Partial · articles missing";
+    const path = (x.path || []).map(s => s === "rar-store" ? "RAR store" : s === "yenc" ? "yEnc" : s).join(" › ");
+    const file = x.file ? `${x.file}${x.file_size ? " · " + fmtBytes(x.file_size) : ""}` : "—";
+    const read = ok ? `${fmtBytes(x.bytes)} · ${x.articles} art.` : "—";
+    const row = dom.append(body, dom.create("tr"));
+    cell(row, x.release || "—");
+    cell(row, file);
+    cell(row, path || "—");
+    cell(row, read, "num");
+    const res = cell(row, result, ok && !x.articles_missing ? "" : "muted");
+    if (x.detail) dom.attr(res, "title", x.detail);
+  }
+  if (!recent.length) {
+    const td = cell(dom.append(body, dom.create("tr")), "No probes yet. Curator asks for them when a profile ranks Dolby Vision or HDR.", "empty");
+    dom.attr(td, "colspan", "5");
+  }
+}
+
 /// Backfill only. All three scopes are fetched — the toggles filter what is
 /// already in hand, so flipping "per-file" on is a re-render, not a fetch.
 /// Backfill. Asks for the scopes that are actually ticked.
@@ -5200,7 +5252,7 @@ let activeTab = "queue";
 document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
   activeTab = b.dataset.tab;
   document.querySelectorAll("nav.tabs button").forEach(x => x.classList.toggle("active", x === b));
-  for (const t of ["queue", "history", "files", "logs", "settings"]) $("tab-" + t).hidden = t !== activeTab;
+  for (const t of ["queue", "history", "files", "probes", "logs", "settings"]) $("tab-" + t).hidden = t !== activeTab;
   refreshAll();
 });
 
@@ -5209,6 +5261,7 @@ function refreshTab(forceHistory = false) {
   if (activeTab === "queue") refreshQueue().catch(() => {});
   if (activeTab === "history") refreshHistory(forceHistory).catch(() => {});
   if (activeTab === "files") refreshFiles().catch(() => {});
+  if (activeTab === "probes") refreshProbes().catch(() => {});
   // Logs are a live tail now. Re-polling over a healthy stream would
   // replace the ring every 5 s — discarding the lines the stream just
   // delivered along with any "N skipped" markers, and re-downloading 300

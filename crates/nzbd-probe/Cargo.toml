@@ -1,0 +1,20 @@
+[package]
+name = "nzbd-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read the decoded head of a release's main file without downloading it"
+
+[dependencies]
+nzbd-types = { workspace = true }
+nzbd-nzb = { workspace = true }
+nzbd-yenc = { workspace = true }
+nzbd-nntp = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+nzbd-nserv = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
