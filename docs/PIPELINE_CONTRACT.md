@@ -153,7 +153,7 @@ Rules, each with its reason:
 | `reason` | `stage` | Set when (by) | `blames_release` | `salvage` may be `pending` | Bytes after (§2.6) |
 |---|---|---|---|---|---|
 | `health` | `health` | articles missing below critical (owner) | yes | yes, where an existing salvage obligation remains | `keep_failed_downloads`, after salvage settles |
-| `fetch` | `fetch` | NZB/URL fetch exhausted (URL fetcher, own site). Carries `fetch_cause`: `gone` (the indexer answered 404/410/403 for *this* item) or `indexer_unavailable` (exhausted through 429/5xx/timeouts/transport, `fetch.rs:230`) | **only when `cause: gone`** — an indexer outage must not blocklist healthy releases; curator re-queues the want after the indexer's `retry_at` instead of grabbing an alternative | no | nothing to dispose |
+| `fetch` | `fetch` | NZB/URL fetch exhausted (URL fetcher, own site). Carries `fetch_cause`: `gone` (the indexer answered 404/410/403 for *this* item) or `indexer_unavailable` (a 429/503 whose Retry-After exceeds the 30-minute ladder — an exhausted indexer quota — ends the fetch at once with this cause; `fetch.rs` `quota_refusal`) | **only when `cause: gone`** — an indexer outage must not blocklist healthy releases; curator re-queues the want after the indexer's `retry_at` instead of grabbing an alternative | no | nothing to dispose |
 | `par` | `par_verify`/`par_repair` | repair impossible or budget exhausted (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `unpack` | `unpack` | extractor failed on the bytes, not the disk (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `script` | `script` | post script non-zero (PP) | no | yes | `keep_failed_downloads` |

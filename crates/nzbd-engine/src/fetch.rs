@@ -7,11 +7,14 @@
 //! operator "retry now" (see [`http_get_observed`]'s `kick`) cuts any wait
 //! short.
 //!
-//! A provider's `Retry-After` of up to 30 minutes is a floor on the step; a
-//! longer one is recorded on the job (so the UI says what the indexer asked
-//! for) but not obeyed: indexers answer an exhausted daily API quota with a
-//! Retry-After of 12–22 hours, which parked jobs for most of a day with no
-//! way to move them.
+//! A provider's `Retry-After` of up to 30 minutes is a floor on the step. A
+//! longer one is an indexer quota answer (an exhausted daily allowance comes
+//! back as 429 with a 12–22 hour Retry-After): no retry inside the ladder can
+//! succeed, so the fetch ends at once as `fetch{indexer_unavailable}`
+//! (contract §2.2), naming the wait. Curator then re-queues the want after the
+//! outage instead of the job sitting in "Fetching NZB" for a day; obeying the
+//! wait parked jobs for a day, and ignoring it kept retrying a locked account
+//! every 30 minutes forever (job 4198, 2026-11-25).
 
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -46,6 +49,13 @@ pub enum FetchError {
     HttpStatus {
         status: hyper::StatusCode,
         retry_after: Option<Duration>,
+    },
+    /// A 429/503 whose Retry-After lies beyond the ladder: an exhausted
+    /// indexer quota. Terminal, never retried inside the job.
+    #[error("http: status {status}; the indexer asked to wait {}", human_wait_of(.retry_after))]
+    IndexerRefused {
+        status: hyper::StatusCode,
+        retry_after: Duration,
     },
     #[error("redirect loop / too many redirects")]
     TooManyRedirects,
@@ -275,6 +285,11 @@ where
                 current = resolve_redirect(&current, next)?;
             }
             Ok(Err(e)) => {
+                if let Some(refused) = quota_refusal(&e) {
+                    tracing::warn!(error = %refused, attempts = retry_state.attempts,
+                        "NZB fetch ended: the indexer refused for longer than the retry ladder");
+                    return Err(refused);
+                }
                 let retry_after = match &e {
                     FetchError::HttpStatus { retry_after, .. } => *retry_after,
                     _ => None,
@@ -313,10 +328,9 @@ where
     state.next_retry_at = Some(unix_deadline);
     // Do not persist URLs or error bodies; errors from providers may contain
     // credentials. The display string carries the useful stable diagnosis.
-    state.last_error = Some(match retry_after.filter(|asked| *asked > delay) {
-        Some(asked) => format!("{error} (indexer asked to wait {})", human_wait(asked)),
-        None => error.to_string(),
-    });
+    // A Retry-After past the ladder never reaches here (quota_refusal), and
+    // one inside it is the step's floor, so the step is the whole story.
+    state.last_error = Some(error.to_string());
     tracing::warn!(error = %error, retry = state.attempts, delay_secs = delay.as_secs(),
         retry_after_secs = retry_after.map(|asked| asked.as_secs()), "NZB fetch will retry");
     if !on_retry(state.clone()).await {
@@ -340,7 +354,7 @@ fn unix_now() -> i64 {
 /// other non-retried statuses, a bad URL, a redirect loop) is the indexer
 /// answering for this item: `gone`.
 pub fn cause_of(error: &FetchError) -> nzbd_types::FetchCause {
-    if retry_delay(error, 0).is_some() {
+    if matches!(error, FetchError::IndexerRefused { .. }) || retry_delay(error, 0).is_some() {
         nzbd_types::FetchCause::IndexerUnavailable
     } else {
         nzbd_types::FetchCause::Gone
@@ -368,12 +382,35 @@ fn retry_backoff(retries: u32) -> Duration {
     )
 }
 
+/// The longest wait the ladder schedules (its last step).
+fn ladder_ceiling() -> Duration {
+    Duration::from_secs(RETRY_BACKOFF_SECONDS[RETRY_BACKOFF_SECONDS.len() - 1])
+}
+
+/// A 429/503 asking for longer than the ladder's ceiling is an indexer quota
+/// reset, not a rate-limit window: the job ends as `indexer_unavailable`
+/// rather than retrying an account the indexer has locked.
+fn quota_refusal(error: &FetchError) -> Option<FetchError> {
+    match error {
+        FetchError::HttpStatus {
+            status,
+            retry_after: Some(asked),
+        } if matches!(status.as_u16(), 429 | 503) && *asked > ladder_ceiling() => {
+            Some(FetchError::IndexerRefused {
+                status: *status,
+                retry_after: *asked,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// A provider's Retry-After inside the ladder's own range (≤ 30 min) is a
 /// genuine rate-limit window: wait at least that long rather than earn a
-/// certain second refusal. Longer asks are quota resets and are not obeyed.
+/// certain second refusal. Longer asks end the fetch ([`quota_refusal`]).
 fn retry_schedule(retries: u32, retry_after: Option<Duration>) -> Duration {
     let step = retry_backoff(retries);
-    let ceiling = Duration::from_secs(RETRY_BACKOFF_SECONDS[RETRY_BACKOFF_SECONDS.len() - 1]);
+    let ceiling = ladder_ceiling();
     match retry_after.filter(|asked| *asked <= ceiling) {
         Some(asked) => step.max(asked),
         None => step,
@@ -394,6 +431,10 @@ fn resume_wait(deadline: i64, attempts: u32, now: i64) -> Duration {
     } else {
         retry_backoff(attempts.saturating_sub(1))
     }
+}
+
+fn human_wait_of(wait: &Duration) -> String {
+    human_wait(*wait)
 }
 
 fn human_wait(wait: Duration) -> String {
@@ -678,7 +719,7 @@ mod tests {
             ("429 Too Many Requests", "0", [60, 300, 600]),
             ("503 Service Unavailable", "1", [60, 300, 600]),
             ("503 Service Unavailable", "90", [90, 300, 600]),
-            ("429 Too Many Requests", "43200", [60, 300, 600]),
+            ("429 Too Many Requests", "1800", [1800, 1800, 1800]),
         ] {
             let response = format!(
                 "HTTP/1.1 {status}\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -716,7 +757,7 @@ mod tests {
             assert_eq!(
                 *delays.lock().unwrap(),
                 expected.map(Duration::from_secs),
-                "Retry-After {retry_after} must not change the local ladder"
+                "Retry-After {retry_after} inside the ladder is only the step's floor"
             );
             let scheduled = states
                 .lock()
@@ -728,10 +769,9 @@ mod tests {
             assert_eq!(scheduled.len(), 3);
             for (state, delay) in scheduled.iter().zip(expected) {
                 let error = state.last_error.as_deref().unwrap();
-                assert_eq!(
-                    error.contains("indexer asked to wait 12h"),
-                    retry_after == "43200",
-                    "a Retry-After longer than the step is shown, not obeyed: {error}"
+                assert!(
+                    !error.contains("asked to wait"),
+                    "a Retry-After inside the ladder is obeyed, not reported: {error}"
                 );
                 assert!(state.blocked_since.is_some());
                 assert!(state.next_retry_at.is_some());
@@ -743,6 +783,46 @@ mod tests {
                     "durable retry deadline must represent the selected {delay}s delay"
                 );
             }
+        }
+    }
+
+    /// Job 4198 (2026-11-25): nzb.life answered an exhausted daily allowance
+    /// with 429 and a ~24 h Retry-After, and the fetch retried the locked
+    /// account every 30 minutes, the job stuck at "Fetching NZB". A wait
+    /// beyond the ladder now ends the fetch at once, as an unavailable
+    /// indexer (never blaming the release), naming the wait.
+    #[tokio::test]
+    async fn a_quota_length_retry_after_ends_the_fetch_as_indexer_unavailable() {
+        for (status, code) in [("429 Too Many Requests", 429), ("503 Service Unavailable", 503)] {
+            let (url, server) = serve_responses(vec![format!(
+                "HTTP/1.1 {status}\r\nRetry-After: 85296\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )])
+            .await;
+            let delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let delay_capture = delays.clone();
+            let error = http_get_observed_with_sleep(
+                &url,
+                FetchRetryState::default(),
+                |_| async { true },
+                move |delay| {
+                    delay_capture.lock().unwrap().push(delay);
+                    async {}
+                },
+            )
+            .await
+            .unwrap_err();
+            match &error {
+                FetchError::IndexerRefused { status, retry_after } => {
+                    assert_eq!(status.as_u16(), code);
+                    assert_eq!(*retry_after, Duration::from_secs(85_296));
+                }
+                other => panic!("{code}: expected IndexerRefused, got {other:?}"),
+            }
+            assert!(error.to_string().contains("asked to wait 23h 42m"), "{error}");
+            assert_eq!(cause_of(&error), nzbd_types::FetchCause::IndexerUnavailable);
+            assert!(!nzbd_types::FailureReason::Fetch.blames_release(Some(cause_of(&error))));
+            assert!(delays.lock().unwrap().is_empty(), "a locked account was waited on");
+            assert_eq!(server.await.unwrap().len(), 1, "a locked account was asked twice");
         }
     }
 
@@ -799,10 +879,11 @@ mod tests {
         assert_eq!(human_wait(Duration::from_secs(61)), "2m");
     }
 
-    /// Serves 429 (with a 12 h Retry-After) `refusals` times, then the NZB.
+    /// Serves 429 (with no Retry-After: the ladder's own wait) `refusals`
+    /// times, then the NZB.
     async fn refuse_then_serve(refusals: usize) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let mut responses = vec![
-            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 43200\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
             refusals
         ];
         responses.push(
