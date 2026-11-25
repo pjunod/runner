@@ -898,12 +898,9 @@ mod tests {
     /// Serves 429 (with no Retry-After: the ladder's own wait) `refusals`
     /// times, then the NZB.
     async fn refuse_then_serve(refusals: usize) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        let mut responses =
-            vec![
-                "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_string();
-                refusals
-            ];
+        let refusal =
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let mut responses = vec![refusal.to_string(); refusals];
         responses.push(
             "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n<nzb />".into(),
         );
