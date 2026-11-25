@@ -1,5 +1,29 @@
 # nzbd — Project Status
 
+## Quota refusal carries the indexer's retry time — 2026-11-25 (0.9.10)
+
+**Status:** branch `codex/fetch-retry-at`, PR open, not merged. Owner:
+Claude (Opus 5.5 session). Not compiled locally (no Rust toolchain on the
+agent machine): CI is the first build.
+
+Follow-up to 0.9.9: a `fetch{indexer_unavailable}` terminal produced by a
+429/503 whose Retry-After exceeds the 30-minute ladder now carries a typed
+`retry_at_unix` (integer Unix seconds = time of failure + Retry-After), so
+Curator defers that indexer until then instead of a flat 15 minutes. Before
+this only the message said it ("the indexer asked to wait 6h 26m").
+
+Wire: `retry_at_unix` on `job_pp_finished` (null otherwise, like
+`fetch_cause`); `retryAtUnix` on the request-admissions receipt (omitted
+otherwise, like `fetchCause`); `Failure:RetryAt` in the history row's params.
+The deliveries feed carries no fetch cause (fetch failures publish nothing),
+so it is unchanged. Other `indexer_unavailable` failures (ladder exhausted on
+transport or timeouts, torrent metadata) carry none.
+
+Carrier: `fetch::retry_at_of` → `*Fetch:RetryAt` on the resolved URL job →
+`terminal::failed_terminal` (typed field + `Failure:RetryAt` marker, read
+back by `terminal_from_stamped` for cluster replays) → `job_terminals.retry_at_unix`
+(additive column, NULL for older rows; added on open when missing).
+
 ## Quota-locked NZB fetch ends instead of retrying forever — 2026-11-25 (0.9.9)
 
 **Status:** branch `codex/fetch-quota-exhaustion`, PR pending; merges after

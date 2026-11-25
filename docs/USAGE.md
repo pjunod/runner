@@ -119,8 +119,10 @@ longer one means the indexer has locked your account for the day (exhausted
 API or download quotas answer with 12–22 hour values), so no retry can work:
 the job fails at once as `fetch` / `indexer_unavailable`, naming the wait
 (`the indexer asked to wait 23h 42m`). That failure never blames the
-release; Curator re-queues the want after the outage instead of leaving the
-job in **Fetching NZB** for a day. **retry now** on the job (web UI detail
+release, and carries the time the indexer named (`retry_at_unix` on the
+terminal, `Failure:RetryAt` in the job's history params) so Curator re-queues
+the want once that time has passed instead of leaving the job in **Fetching
+NZB** for a day. **retry now** on the job (web UI detail
 panel, or the app's expanded card) sends the request immediately; a repeat
 short refusal continues up the ladder, and a quota-length one ends the job
 as above.

@@ -72,6 +72,8 @@ artifact inventory (§2.6).
   "transfer": "t-591-a3f9c1",            // == params[monarr-transfer]; absent only for jobs curator did not add
   "outcome": "completed",                 // completed | failed | cancelled
   "reason": null,                         // failed: closed enum, §2.2
+  "fetch_cause": null,                    // fetch: gone | indexer_unavailable (§2.2)
+  "retry_at_unix": null,                  // fetch{indexer_unavailable} ended by the indexer's Retry-After: when it may be asked again (Unix s); null otherwise
   "stage": null,                          // failed: PostStage or "download"|"health"|"fetch"
   "message": null,                        // failed: ≤ 2 KiB human text
   "blames_release": false,                // failed: whether curator should blocklist the release (§2.2)
@@ -153,7 +155,7 @@ Rules, each with its reason:
 | `reason` | `stage` | Set when (by) | `blames_release` | `salvage` may be `pending` | Bytes after (§2.6) |
 |---|---|---|---|---|---|
 | `health` | `health` | articles missing below critical (owner) | yes | yes, where an existing salvage obligation remains | `keep_failed_downloads`, after salvage settles |
-| `fetch` | `fetch` | NZB/URL fetch exhausted (URL fetcher, own site). Carries `fetch_cause`: `gone` (the indexer answered 404/410/403 for *this* item) or `indexer_unavailable` (a 429/503 whose Retry-After exceeds the 30-minute ladder — an exhausted indexer quota — ends the fetch at once with this cause; `fetch.rs` `quota_refusal`) | **only when `cause: gone`** — an indexer outage must not blocklist healthy releases; curator re-queues the want after the indexer's `retry_at` instead of grabbing an alternative | no | nothing to dispose |
+| `fetch` | `fetch` | NZB/URL fetch exhausted (URL fetcher, own site). Carries `fetch_cause`: `gone` (the indexer answered 404/410/403 for *this* item) or `indexer_unavailable` (a 429/503 whose Retry-After exceeds the 30-minute ladder — an exhausted indexer quota — ends the fetch at once with this cause; `fetch.rs` `quota_refusal`). That quota case also carries `retry_at_unix` (since 0.9.10): integer Unix seconds, the time of failure plus the indexer's Retry-After; it is null/absent on every other terminal, including an `indexer_unavailable` whose ladder ran out on transport failures or timeouts, and torrent metadata failures | **only when `cause: gone`** — an indexer outage must not blocklist healthy releases; curator re-queues the want after the indexer's `retry_at` (`retry_at_unix` when present, its own deferral otherwise) instead of grabbing an alternative | no | nothing to dispose |
 | `par` | `par_verify`/`par_repair` | repair impossible or budget exhausted (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `unpack` | `unpack` | extractor failed on the bytes, not the disk (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `script` | `script` | post script non-zero (PP) | no | yes | `keep_failed_downloads` |

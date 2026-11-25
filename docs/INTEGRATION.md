@@ -201,6 +201,7 @@ never consulted to settle a terminal in normal operation.
 | `outcome` | the admission's outcome (the continuity-loss lookup): the job's queue status while it is queued — `fetching` · `queued` · `downloading` · `paused` · `held` (since 0.6.0; a hold read `paused` before) · `post_queued` · `post_processing` · `completed` · `failed` — then `completed`, `failed` or `deleted` once it leaves the queue |
 | `terminalOutcome`, `failureStage`, `failureCause` | the terminal's history status string and failure detail |
 | `failureReason`, `fetchCause`, `blamesRelease`, `salvage` | the typed terminal (§2.2), from the `Failure:Reason` / `Failure:FetchCause` / `Failure:BlamesRelease` / `Failure:Salvage` params |
+| `retryAtUnix` | `fetch` / `indexer_unavailable` ended by the indexer's Retry-After only: when it may be asked again, integer Unix seconds, from the `Failure:RetryAt` param; omitted otherwise (since 0.9.10) |
 | `publicationPath`, `sourceArtifactId`, `sourceGeneration`, `keepSourceOnFailure` | where the bytes went |
 | `custodyState`, `sourceCleanupStatus` | **deprecated** (OpenAPI `deprecated: true`) — runner never holds bytes for curator, and source cleanup gates nothing; still sent (their removal takes the receipt custody tracking with it and is not in 0.6.0) |
 
@@ -346,6 +347,7 @@ event, never the provisional download completion.
 | `outcome` | `completed` · `failed` · `cancelled` |
 | `reason` | `failed` only: `health` · `fetch` · `par` · `unpack` · `script` · `publish` · `io` · `identity` · `hold_expired` (§2.2) |
 | `fetch_cause` | `fetch` only: `gone` · `indexer_unavailable` |
+| `retry_at_unix` | `fetch` / `indexer_unavailable` only, and only when the indexer's Retry-After (longer than the 30-minute ladder) ended the fetch: when the indexer may be asked again, integer Unix seconds (time of failure + Retry-After). Null otherwise (since 0.9.10) |
 | `stage` | `failed` only: a `PostStage` name, or `download` · `health` · `fetch` |
 | `message` | `failed` only: human text, at most 2048 characters |
 | `blames_release` | whether the consumer should blocklist the release (§2.2) |
@@ -360,7 +362,7 @@ event, never the provisional download completion.
 ```json
 {"job": 2333, "name": "Dry.Wind.2020…", "category": "movies",
  "transfer": "t-591-a3f9c1…", "outcome": "failed", "reason": "unpack",
- "fetch_cause": null, "stage": "unpack", "message": "…", "blames_release": true,
+ "fetch_cause": null, "retry_at_unix": null, "stage": "unpack", "message": "…", "blames_release": true,
  "salvage": "pending", "keep_on_failure": false,
  "fetched": {"success_articles": 1204, "total_articles": 1204, "bytes": 8123456789},
  "publication": null,
@@ -373,7 +375,7 @@ event, never the provisional download completion.
 | `reason` | `stage` | Set when (by) | `blames_release` | `salvage` may be `pending` | Bytes after (§5) |
 |---|---|---|---|---|---|
 | `health` | `health` | articles missing below critical (owner) | yes | yes | `keep_failed_downloads`, after salvage settles |
-| `fetch` | `fetch` | NZB/URL fetch failed (URL fetcher); `fetch_cause` `gone` (the indexer answered 404/410/403 or another non-retried status for this item) or `indexer_unavailable` (retries exhausted on 429/503, timeouts, transport) | only for `gone` | no | nothing to dispose |
+| `fetch` | `fetch` | NZB/URL fetch failed (URL fetcher); `fetch_cause` `gone` (the indexer answered 404/410/403 or another non-retried status for this item) or `indexer_unavailable` (retries exhausted on 429/503, timeouts, transport, or at once on a 429/503 whose Retry-After exceeds the ladder — that one also carries `retry_at_unix`) | only for `gone` | no | nothing to dispose |
 | `par` | `par_verify`/`par_repair` | repair impossible (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `unpack` | `unpack` | the extractor failed on the bytes (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `script` | `script` | post script exited non-zero (PP) | no | yes | `keep_failed_downloads` |
