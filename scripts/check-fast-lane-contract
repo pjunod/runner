@@ -27,6 +27,19 @@ fi
 grep -Fq 'workflow_dispatch:' .github/workflows/bittorrent-fuzz.yml
 grep -Fq 'schedule:' .github/workflows/bittorrent-fuzz.yml
 test "$(grep -c "github.event.pull_request.draft == false" .github/workflows/supply-chain.yml)" -eq 3
+# The fuzz campaigns stay off pull requests, so the required supply-chain job
+# must keep the derived fuzz lock in step with the product lock.
+# Anchor the step inside that required job and keep it blocking.
+reviewed_exceptions_job="$(
+  awk '/^  reviewed-exceptions:$/ { in_job = 1; next }
+       in_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+       in_job { print }' .github/workflows/supply-chain.yml
+)"
+grep -Fq 'run: make fuzz-deps' <<<"$reviewed_exceptions_job"
+if grep -Eq 'continue-on-error|^ +if: *(\$\{\{ *)?false *(\}\})? *$' <<<"$reviewed_exceptions_job"; then
+  echo "the reviewed dependency exceptions job must stay blocking" >&2
+  exit 1
+fi
 
 # The full maintained/upstream rqbit matrices belong to batch validation.
 if grep -Eq '^  (pull_request|push):' .github/workflows/rqbit-patches.yml; then

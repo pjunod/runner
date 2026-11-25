@@ -37,6 +37,11 @@ jobs:
         run: scripts/check-reviewed-dependency-exceptions.sh
       - name: Keep the BitTorrent release review aligned with the no-go gates
         run: scripts/check-bittorrent-release-review.sh
+      # fuzz/Cargo.lock is derived from Cargo.lock, and the fuzz campaigns only
+      # run on main. Check the derived lock here so a product lock change that
+      # was not carried into it (fix: make fuzz-lock) fails before merge.
+      - name: Keep the isolated fuzz lock on the reviewed product lock
+        run: make fuzz-deps
 
   policy:
     name: licenses, bans, and sources

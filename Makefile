@@ -151,6 +151,10 @@ coverage-html: ## Full HTML coverage report under target/llvm-cov/html/
 fuzz-deps: ## Verify the isolated BitTorrent fuzz dependency graph
 	scripts/check-bittorrent-fuzz-deps.sh
 
+.PHONY: fuzz-lock
+fuzz-lock: ## Regenerate fuzz/Cargo.lock from Cargo.lock (run after any product lock change)
+	scripts/check-bittorrent-fuzz-deps.sh --sync
+
 .PHONY: fuzz-test
 fuzz-test: fuzz-deps ## Verify the committed BitTorrent fuzz seed classes
 	$(CARGO) test --manifest-path fuzz/Cargo.toml --locked
