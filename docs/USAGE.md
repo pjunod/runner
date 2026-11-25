@@ -114,11 +114,16 @@ or 503) or doesn't answer stays in **Fetching NZB** and retries the same
 request after 1, 5, 10, then every 30 minutes until the indexer hands it over
 or answers for the item (404 and the like fail it). The row says what went
 wrong, when the next attempt is, and how long it has waited. An indexer's
-`Retry-After` of up to 30 minutes is honored as a minimum for that step; a
-longer one is shown on the row (`indexer asked to wait 12h`) but not obeyed —
-exhausted API quotas answer with 12–22 hour values. **retry now** on the job
-(web UI detail panel, or the app's expanded card) sends the request
-immediately; a repeat refusal continues up the ladder.
+`Retry-After` of up to 30 minutes is honored as a minimum for that step. A
+longer one means the indexer has locked your account for the day (exhausted
+API or download quotas answer with 12–22 hour values), so no retry can work:
+the job fails at once as `fetch` / `indexer_unavailable`, naming the wait
+(`the indexer asked to wait 23h 42m`). That failure never blames the
+release; Curator re-queues the want after the outage instead of leaving the
+job in **Fetching NZB** for a day. **retry now** on the job (web UI detail
+panel, or the app's expanded card) sends the request immediately; a repeat
+short refusal continues up the ladder, and a quota-length one ends the job
+as above.
 
 **Held jobs.** A job stopped by its environment — storage not answering, a
 full disk, an exhausted quota, a missing extractor, a mount that came back
