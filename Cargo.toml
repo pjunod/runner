@@ -18,6 +18,7 @@ members = [
     "crates/nzbd-cluster",
     "crates/nzbd-torrent",
     "crates/nzbd-qbit-compat",
+    "crates/nzbd-probe",
 ]
 exclude = ["contrib/rqbit/vendor", "vendor/hiqlite", "vendor/hiqlite-wal"]
 
@@ -52,6 +53,7 @@ nzbd-nserv = { version = "=0.9.8", path = "crates/nzbd-nserv" }
 nzbd-cluster = { version = "=0.9.8", path = "crates/nzbd-cluster" }
 nzbd-torrent = { version = "=0.9.8", path = "crates/nzbd-torrent" }
 nzbd-qbit-compat = { version = "=0.9.8", path = "crates/nzbd-qbit-compat" }
+nzbd-probe = { version = "=0.9.8", path = "crates/nzbd-probe" }
 
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }

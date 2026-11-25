@@ -13,6 +13,8 @@ nzbd-post = { workspace = true }
 nzbd-nntp = { workspace = true }
 nzbd-state = { workspace = true }
 nzbd-torrent = { workspace = true }
+nzbd-probe = { workspace = true }
+nzbd-nzb = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 base64 = { workspace = true }

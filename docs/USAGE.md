@@ -439,6 +439,12 @@ GET  /api/v1/history
 POST /api/v1/history/{id}/actions/{action}  hide|restore|delete|delete-files|requeue
 GET  /api/v1/events                 SSE stream of queue changes
 GET  /api/v1/logs                   recent daemon log
+POST /api/v1/probe                  head of a release's main file, without queueing it
+                                    (?url=<nzb url> or the NZB as the body, &bytes=<n>, ≤16 MiB)
+                                    → {status:"ok", file, file_size, path[], articles,
+                                       articles_missing, bytes, head(base64)}
+                                    | {status:"unavailable", reason, detail}
+GET  /api/v1/probes                 recent probes and totals (the UI's Probes tab)
 GET  /api/v1/artifacts              folder inventory: ?filter=live|attention|foreign|owned|cleared|all
                                     &sort=updated|size|files|name &q=<name> &offset &limit(≤200)
                                     → entries[{artifact,files,bytes,measured,earliest_expiry}],

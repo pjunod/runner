@@ -15,6 +15,7 @@ use base64::Engine as _;
 
 pub mod eventhub;
 pub mod logbuf;
+pub mod probe;
 pub mod torrent_admission;
 pub mod version;
 pub use eventhub::{EventHub, Replay};
@@ -679,6 +680,7 @@ fn status_dto_with_storage(snap: &QueueSnapshot, storage: Vec<StoragePathDto>) -
         capabilities: vec![
             "deliveries-v1",
             "request-token-idempotency-v1",
+            probe::CAPABILITY,
             "job-disposition-v1",
         ],
         version: version::full(),
@@ -2607,6 +2609,8 @@ async fn openapi() -> Response {
         "info": { "title": "nzbd native API", "version": env!("CARGO_PKG_VERSION") },
         "paths": {
             "/api/v1/status": { "get": { "summary": "Queue + rate + guard status" } },
+            "/api/v1/probe": { "post": { "summary": "Decoded head of a release's main file, for Curator's pre-flight measurement (?url= or NZB body, ?bytes=)" } },
+            "/api/v1/probes": { "get": { "summary": "Recent release probes and totals" } },
             "/api/v1/request-admissions/{token}": { "get": {
                 "summary": "Did a POST /jobs with this transfer token land, and as which job; after a history continuity loss, what happened to that transfer (outcome, failure_reason). Not consulted to settle a terminal in normal operation",
                 "responses": { "200": { "description": "The admission receipt", "content": { "application/json": { "schema": {
@@ -3729,6 +3733,14 @@ pub fn router_with(state: ApiState) -> Router {
     Router::new()
         .merge(artifacts::router())
         .route("/api/v1/status", get(get_status))
+        // Pre-flight release probes for Curator (ADR 0031 there): the head
+        // of the main file, never a queued job.
+        .route(
+            "/api/v1/probe",
+            post(probe::probe_release)
+                .layer(axum::extract::DefaultBodyLimit::max(upload_body_limit)),
+        )
+        .route("/api/v1/probes", get(probe::list_probes))
         .route(
             "/api/v1/request-admissions/{token}",
             get(get_request_admission),
@@ -3786,6 +3798,7 @@ pub fn router_with(state: ApiState) -> Router {
         .route("/icons/icon-maskable-512.png", get(icon_maskable))
         .route("/apple-touch-icon.png", get(apple_touch_icon))
         .layer(axum::middleware::from_fn(no_store_by_default))
+        .layer(axum::Extension(Arc::new(probe::ProbeLog::default())))
         // Attribution for the native surface. The compat shim has noted
         // its callers for a long time; a consumer speaking `/api/v1` was
         // invisible, which made a perfectly healthy native client look
@@ -6503,6 +6516,111 @@ mod tests {
         });
         assert_eq!(name, "job_publication_ready");
         assert!(data.contains("\"files\":2"), "{data}");
+    }
+
+    /// The release probe (Curator ADR 0031): advertised in status, refused
+    /// without news servers, and with them it returns the head of the main
+    /// file and lists the probe for the UI — without queueing a job.
+    #[tokio::test]
+    async fn release_probe_returns_the_head_and_logs_it() {
+        let mut media = vec![0x1a, 0x45, 0xdf, 0xa3];
+        media.extend(nzbd_nserv::prng_bytes(9, 60_000));
+        let post = nzbd_nserv::build_post(
+            "Title.2021.2160p",
+            &[
+                ("Title.2021.2160p.mkv", media.clone()),
+                ("Title.2021.2160p.par2", nzbd_nserv::prng_bytes(2, 900)),
+            ],
+            20_000,
+        );
+        let ns = nzbd_nserv::NservBuilder::new()
+            .with_post(&post)
+            .start()
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = test_engine(&tmp).await;
+        let state = |setup| ApiState {
+            engine: engine.clone(),
+            torrent: None,
+            history: None,
+            log: None,
+            setup,
+            clients: None,
+            shutdown: None,
+            pp_stats: None,
+            pp_manager: None,
+            events: None,
+        };
+        let post_probe = |app: Router, body: String| async move {
+            app.oneshot(
+                axum::http::Request::post("/api/v1/probe?bytes=30000")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        let bare = router_with(state(None));
+        let resp = bare
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = body_json(resp).await;
+        assert!(
+            status["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == probe::CAPABILITY),
+            "{status}"
+        );
+        let resp = post_probe(bare, post.nzb.clone()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let mut cfg = nzbd_config::Config::default();
+        cfg.servers.push(nzbd_config::ServerConfig {
+            host: "127.0.0.1".into(),
+            port: ns.port(),
+            tls: false,
+            ..Default::default()
+        });
+        let app = router_with(state(Some(Arc::new(SetupHandle::for_running(
+            None,
+            "127.0.0.1:0".into(),
+            cfg,
+        )))));
+        let v = body_json(post_probe(app.clone(), post.nzb.clone()).await).await;
+        assert_eq!(v["status"], "ok", "{v}");
+        assert_eq!(v["file"], "Title.2021.2160p.mkv");
+        assert_eq!(v["path"], json!(["yenc"]));
+        let head = base64::engine::general_purpose::STANDARD
+            .decode(v["head"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(head, media[..30_000]);
+        assert!(
+            engine.snapshot().jobs.is_empty(),
+            "a probe must not queue a job"
+        );
+
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/probes")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let log = body_json(resp).await;
+        assert_eq!(log["served"], 1, "{log}");
+        assert_eq!(log["recent"][0]["file"], "Title.2021.2160p.mkv");
+        assert_eq!(log["recent"][0]["bytes"], 30_000);
     }
 }
 
