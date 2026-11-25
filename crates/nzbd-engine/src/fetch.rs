@@ -793,7 +793,10 @@ mod tests {
     /// indexer (never blaming the release), naming the wait.
     #[tokio::test]
     async fn a_quota_length_retry_after_ends_the_fetch_as_indexer_unavailable() {
-        for (status, code) in [("429 Too Many Requests", 429), ("503 Service Unavailable", 503)] {
+        for (status, code) in [
+            ("429 Too Many Requests", 429),
+            ("503 Service Unavailable", 503),
+        ] {
             let (url, server) = serve_responses(vec![format!(
                 "HTTP/1.1 {status}\r\nRetry-After: 85296\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             )])
@@ -812,7 +815,10 @@ mod tests {
             .await
             .unwrap_err();
             match &error {
-                FetchError::IndexerRefused { status, retry_after } => {
+                FetchError::IndexerRefused {
+                    status,
+                    retry_after,
+                } => {
                     assert_eq!(status.as_u16(), code);
                     assert_eq!(*retry_after, Duration::from_secs(85_296));
                 }

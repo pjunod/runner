@@ -122,7 +122,8 @@ the job fails at once as `fetch` / `indexer_unavailable`, naming the wait
 release; Curator re-queues the want after the outage instead of leaving the
 job in **Fetching NZB** for a day. **retry now** on the job (web UI detail
 panel, or the app's expanded card) sends the request immediately; a repeat
-refusal continues up the ladder.
+short refusal continues up the ladder, and a quota-length one ends the job
+as above.
 
 **Held jobs.** A job stopped by its environment — storage not answering, a
 full disk, an exhausted quota, a missing extractor, a mount that came back

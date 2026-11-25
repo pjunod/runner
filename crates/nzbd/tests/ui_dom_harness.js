@@ -537,7 +537,7 @@ const models = (jobs) => jobs.map((j, i) => T.rowModel(j, { idx: i, count: jobs.
   // A fetch waiting on its backoff offers "retry now"; one in flight shows
   // the button but has nothing to cut short.
   const now = 1_700_000_000_000;
-  const waiting = job(95, { status: "fetching", url_fetch: { attempts: 3, nextRetryAtUnix: now / 1000 + 600, blockedSinceUnix: now / 1000 - 400, lastError: "http: status 429 Too Many Requests (indexer asked to wait 12h)" } });
+  const waiting = job(95, { status: "fetching", url_fetch: { attempts: 3, nextRetryAtUnix: now / 1000 + 600, blockedSinceUnix: now / 1000 - 400, lastError: "http: status 429 Too Many Requests; the indexer asked to wait 12h" } });
   const waitingModel = T.detailModel(waiting, now);
   ok(!waitingModel.lifecycleHidden && !waitingModel.lifecycleRetryHidden && !waitingModel.lifecycleRetryDisabled,
     "a fetch waiting on its backoff can be retried now");

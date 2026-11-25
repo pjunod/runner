@@ -1,5 +1,25 @@
 # nzbd — Project Status
 
+## Quota-locked NZB fetch ends instead of retrying forever — 2026-11-25 (0.9.9)
+
+**Status:** branch `codex/fetch-quota-exhaustion`, PR pending; merges after
+pjunod/curator#195 (merging this alone would only speed up Curator's import
+loop). Owner: Claude (Opus 5.5 session, effort E-5F12464522). Adversarial
+review done (no logic bugs; fmt and doc nits fixed).
+
+Field report: job 4198 sat at **Fetching NZB** for hours on a 429.
+Evidence (read-only, nuc4): nzb.life answered the 4th grab from the account
+in about an hour with 429 and Retry-After 85296 s (an exhausted allowance
+resetting at a fixed time); the 0.9.6 ladder retried it every 30 min forever.
+The grabs came from a Curator loop (one episode regrabbed 6-7 times a night,
+fixed in curator#195).
+
+Change: a 429/503 whose Retry-After exceeds the 30-minute ladder ends the
+fetch at once as `fetch{indexer_unavailable}` (contract section 2.2), naming
+the wait; never blames the release. Shorter waits keep the ladder; retry now
+unchanged. Not compiled locally (no Rust toolchain on the agent machine): CI
+is the first build.
+
 ## Out-of-space hold says what and where — 2026-11-15 (0.9.8)
 
 **Status:** branch `claude/enospc-where` (from main 648112d), draft PR.
