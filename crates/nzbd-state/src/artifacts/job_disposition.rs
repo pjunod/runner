@@ -930,6 +930,7 @@ mod tests {
                 outcome: nzbd_types::TerminalOutcome::Cancelled,
                 reason: None,
                 fetch_cause: None,
+                retry_at_unix: None,
                 stage: None,
                 message: None,
                 blames_release: false,

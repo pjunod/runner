@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-nntp"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "nzbd-types",
  "rustls",
@@ -1751,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-nzb"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "quick-xml 0.42.0",
  "thiserror 2.0.18",
@@ -1759,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-probe"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "nzbd-nntp",
  "nzbd-nzb",
@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-torrent"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "bytes",
  "httpdate",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-types"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "nzbd-yenc"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "crc32fast",
  "thiserror 2.0.18",

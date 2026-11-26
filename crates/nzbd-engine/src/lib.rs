@@ -366,6 +366,10 @@ async fn bounded_probe_deadline<T: Send + 'static>(
 /// The param a failed URL resolution carries its typed fetch cause in.
 pub const FETCH_CAUSE_PARAM: &str = "*Fetch:Cause";
 
+/// The param a failed URL resolution carries the indexer's own retry time in
+/// (Unix seconds): only an `indexer_unavailable` quota refusal sets it.
+pub const FETCH_RETRY_AT_PARAM: &str = "*Fetch:RetryAt";
+
 fn fetch_retry_state(job: &Job) -> crate::fetch::FetchRetryState {
     let value = |key: &str| {
         job.params
@@ -1466,6 +1470,8 @@ impl EngineHandle {
             // Contract §2.2: the fetcher types its own failure. A local
             // storage refusal of the cached source has no fetch cause.
             let mut fetch_cause: Option<nzbd_types::FetchCause> = None;
+            // When the indexer said it may be asked again (a quota refusal).
+            let mut fetch_retry_at: Option<u64> = None;
             let mut received = loop {
                 let store = handle.url_resolutions.clone(); let cached_origin = origin.clone();
                 match tokio::task::spawn_blocking(move || store.source(&cached_origin)).await {
@@ -1521,6 +1527,7 @@ impl EngineHandle {
                     Err(crate::fetch::FetchError::Cancelled) => return,
                     Err(error) => {
                         fetch_cause = Some(crate::fetch::cause_of(&error));
+                        fetch_retry_at = crate::fetch::retry_at_of(&error, std::time::SystemTime::now());
                         failure = Some(error.to_string());
                     }
                 }
@@ -1558,7 +1565,7 @@ impl EngineHandle {
             loop {
                 if handle.cancel.is_cancelled() { return; }
                 fetch_guard.phase = "resolution preparation";
-                let prepared = match handle.prepare_url_resolution(&origin, failure.clone(), fetch_cause).await {
+                let prepared = match handle.prepare_url_resolution(&origin, failure.clone(), fetch_cause, fetch_retry_at).await {
                     Ok(prepared) => prepared,
                     Err(EngineError::OwnershipLost | EngineError::Closed) => return,
                     Err(error @ EngineError::Timeout(_)) => {
@@ -1576,6 +1583,7 @@ impl EngineHandle {
                             tracing::error!(job=id.0, %message, "URL source is unusable; job failed"); return;
                         }
                         fetch_cause = Some(nzbd_types::FetchCause::Gone);
+                        fetch_retry_at = None;
                         failure = Some(message); continue;
                     }
                     Err(error) => {
@@ -1722,6 +1730,7 @@ impl EngineHandle {
         origin: &Job,
         failure: Option<String>,
         fetch_cause: Option<nzbd_types::FetchCause>,
+        retry_at: Option<u64>,
     ) -> Result<nzbd_state::artifacts::UrlResolutionRecord, EngineError> {
         let store = self.url_resolutions.clone();
         let source_origin = origin.clone();
@@ -1810,6 +1819,10 @@ impl EngineHandle {
                     staging.jobs[0].params.extend([("Failure:Stage".into(), "fetch".into()), ("Failure:Reason".into(), error.chars().take(2048).collect())]);
                     if let Some(cause) = fetch_cause {
                         staging.jobs[0].params.push((FETCH_CAUSE_PARAM.into(), cause.as_str().into()));
+                    }
+                    staging.jobs[0].params.retain(|(key, _)| key != FETCH_RETRY_AT_PARAM);
+                    if let Some(at) = retry_at.filter(|_| fetch_cause == Some(nzbd_types::FetchCause::IndexerUnavailable)) {
+                        staging.jobs[0].params.push((FETCH_RETRY_AT_PARAM.into(), at.to_string()));
                     }
                 }
             }
@@ -1923,7 +1936,7 @@ impl EngineHandle {
         let source_identity = nzbd_state::artifacts::url_source_identity(&origin)
             .map_err(|error| EngineError::Lifecycle(error.to_string()))?;
         let prepared = self
-            .prepare_url_resolution(&origin, Some(error), None)
+            .prepare_url_resolution(&origin, Some(error), None, None)
             .await?;
         let (tx, rx) = oneshot::channel();
         self.send(QueueCommand::CompleteUrlFetch {

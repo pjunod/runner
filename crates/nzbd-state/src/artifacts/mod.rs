@@ -840,7 +840,7 @@ impl Inventory {
           CREATE TABLE IF NOT EXISTS deliveries(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,artifact TEXT NOT NULL,generation TEXT NOT NULL,data TEXT NOT NULL,cleanup_status TEXT NOT NULL DEFAULT 'pending',cleanup_error TEXT,cleanup_attempts INTEGER NOT NULL DEFAULT 0,cleanup_next_retry_at INTEGER,cleanup_blocked_since INTEGER,cleanup_started_at INTEGER,cleanup_last_attempt_at INTEGER,cleanup_completed_at INTEGER,UNIQUE(artifact,generation));
           CREATE TABLE IF NOT EXISTS delivery_cleanup_attempts(delivery_id TEXT NOT NULL,attempt INTEGER NOT NULL,started_at INTEGER NOT NULL,ended_at INTEGER,wait_ms INTEGER NOT NULL DEFAULT 0,outcome TEXT NOT NULL,error TEXT,PRIMARY KEY(delivery_id,attempt));
           CREATE INDEX IF NOT EXISTS deliveries_recent ON deliveries(sequence);
-          CREATE TABLE IF NOT EXISTS job_terminals(job INTEGER PRIMARY KEY,transfer TEXT,outcome TEXT NOT NULL,reason TEXT,fetch_cause TEXT,stage TEXT,message TEXT,blames_release INTEGER NOT NULL DEFAULT 0,salvage TEXT NOT NULL,keep_on_failure INTEGER NOT NULL DEFAULT 0,fetched TEXT NOT NULL,publication TEXT,markers TEXT NOT NULL,entry TEXT NOT NULL,history_seq INTEGER,history_incarnation TEXT,markers_stamped INTEGER NOT NULL DEFAULT 0,emitted INTEGER NOT NULL DEFAULT 0,disposal TEXT,salvage_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS job_terminals(job INTEGER PRIMARY KEY,transfer TEXT,outcome TEXT NOT NULL,reason TEXT,fetch_cause TEXT,stage TEXT,message TEXT,blames_release INTEGER NOT NULL DEFAULT 0,salvage TEXT NOT NULL,keep_on_failure INTEGER NOT NULL DEFAULT 0,fetched TEXT NOT NULL,publication TEXT,markers TEXT NOT NULL,entry TEXT NOT NULL,history_seq INTEGER,history_incarnation TEXT,markers_stamped INTEGER NOT NULL DEFAULT 0,emitted INTEGER NOT NULL DEFAULT 0,disposal TEXT,salvage_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,retry_at_unix INTEGER);
           CREATE INDEX IF NOT EXISTS job_terminals_salvage ON job_terminals(salvage);
           CREATE TABLE IF NOT EXISTS relocation_intents(generation TEXT PRIMARY KEY,job INTEGER NOT NULL,transfer TEXT,artifact TEXT NOT NULL,operation TEXT NOT NULL,source_dir TEXT NOT NULL,target_dir TEXT NOT NULL,cross_volume INTEGER NOT NULL,files TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
           CREATE INDEX IF NOT EXISTS relocation_intents_open ON relocation_intents(state);
@@ -926,6 +926,20 @@ impl Inventory {
         if !has_intent_manifest {
             db.execute(
                 "ALTER TABLE relocation_intents ADD COLUMN manifest TEXT",
+                [],
+            )?;
+        }
+        // 0.9.10: a `fetch{indexer_unavailable}` terminal carries the
+        // indexer's own retry time (contract §2.2). Additive and idempotent;
+        // older rows read it as absent.
+        let has_terminal_retry_at: bool = db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('job_terminals') WHERE name='retry_at_unix'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n != 0),
+        )?;
+        if !has_terminal_retry_at {
+            db.execute(
+                "ALTER TABLE job_terminals ADD COLUMN retry_at_unix INTEGER",
                 [],
             )?;
         }

@@ -575,6 +575,10 @@ pub struct UrlAdmissionReceipt {
     pub failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_cause: Option<String>,
+    /// `fetch{indexer_unavailable}` only, when the indexer's Retry-After
+    /// ended the fetch: when it may be asked again (Unix seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blames_release: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1238,6 +1242,27 @@ mod tests {
         assert_eq!(recs.len(), 2, "torn line must be dropped, prior kept");
     }
 
+    /// Contract §2.2: the indexer's retry time travels on the receipt as
+    /// `retryAtUnix`, and is absent when the terminal named none.
+    #[test]
+    fn admission_receipt_carries_retry_at_only_when_set() {
+        let base = serde_json::json!({
+            "protocolVersion": 1,
+            "requestToken": "t",
+            "submissionSha256": "a",
+            "jobId": 1,
+            "generation": "g",
+            "runnerInstanceId": "r",
+        });
+        let mut receipt: UrlAdmissionReceipt = serde_json::from_value(base).unwrap();
+        let absent = serde_json::to_value(&receipt).unwrap();
+        assert!(absent.get("retryAtUnix").is_none(), "{absent}");
+        receipt.fetch_cause = Some("indexer_unavailable".into());
+        receipt.retry_at_unix = Some(1_764_085_296);
+        let present = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(present["retryAtUnix"], 1_764_085_296);
+    }
+
     #[test]
     fn snapshot_save_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -1266,6 +1291,7 @@ mod tests {
                 source_generation: Some("source-generation".into()),
                 failure_reason: None,
                 fetch_cause: None,
+                retry_at_unix: None,
                 blames_release: None,
                 salvage: None,
             }],

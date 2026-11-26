@@ -542,6 +542,7 @@ async fn job_disposition_retires_started_assembly_after_original_receiver_restar
         source_generation: None,
         failure_reason: None,
         fetch_cause: None,
+        retry_at_unix: None,
         blames_release: None,
         salvage: None,
     };

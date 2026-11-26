@@ -524,6 +524,7 @@ impl Owner {
                             crate::terminal::TerminalFacts {
                                 reason: None,
                                 fetch_cause: None,
+                                retry_at_unix: None,
                                 stage: None,
                                 message: Some("deleted by the operator".into()),
                                 blames_release: false,

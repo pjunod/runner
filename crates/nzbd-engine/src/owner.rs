@@ -3542,6 +3542,7 @@ impl Owner {
                             source_generation: None,
                             failure_reason: None,
                             fetch_cause: None,
+                            retry_at_unix: None,
                             blames_release: None,
                             salvage: None,
                         };
@@ -3687,6 +3688,7 @@ impl Owner {
                         source_generation: None,
                         failure_reason: None,
                         fetch_cause: None,
+                        retry_at_unix: None,
                         blames_release: None,
                         salvage: None,
                     };
@@ -5916,10 +5918,16 @@ impl Owner {
             JobStatus::Queued
         };
         row.params.retain(|(key, _)| key != "*AddPaused");
+        // A retry time belongs to this resolution's own refusal only.
+        row.params
+            .retain(|(key, _)| key != crate::FETCH_RETRY_AT_PARAM);
         for (key, value) in prepared.resolved.params.into_iter().filter(|(key, _)| {
             matches!(
                 key.as_str(),
-                "Failure:Stage" | "Failure:Reason" | crate::FETCH_CAUSE_PARAM
+                "Failure:Stage"
+                    | "Failure:Reason"
+                    | crate::FETCH_CAUSE_PARAM
+                    | crate::FETCH_RETRY_AT_PARAM
             )
         }) {
             set_owner_param(&mut row.params, &key, Some(value));
