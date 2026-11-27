@@ -80,7 +80,7 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc
 sha2 = "0.10"
 quick-xml = "0.42"
 crc32fast = "1"
-base64 = "0.22"
+base64 = "0.23"
 libc = "0.2"
 md-5 = "0.10"
 rusqlite = { version = "0.41", features = ["bundled"] }
