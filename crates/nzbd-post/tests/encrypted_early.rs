@@ -21,21 +21,22 @@ const LATER_VOLUMES: usize = 4;
 const ARTICLE: usize = 16 * 1024;
 const LATER_VOLUME_BYTES: usize = 16 * ARTICLE;
 
-/// A RAR5 first volume whose headers are encrypted: the signature, then an
-/// archive encryption header (type 4), then opaque bytes.
-fn header_encrypted_rar5() -> Vec<u8> {
+/// A RAR5 volume whose headers are encrypted: the signature, then an
+/// archive encryption header (type 4), then opaque bytes. Every volume of
+/// such a set looks like this, so each one is verifiable.
+fn header_encrypted_rar5(seed: u64, len: usize) -> Vec<u8> {
     let mut out = b"Rar!\x1a\x07\x01\x00".to_vec();
     // CRC32, header size, type 4, flags 0, version 0, flags 1, kdf 15, salt.
     out.extend_from_slice(&[0, 0, 0, 0, 21, 4, 0, 0, 1, 15]);
     out.extend_from_slice(&[0x5a; 16]);
     out.extend_from_slice(&[0; 1]);
-    out.extend(prng_bytes(7, 4096));
+    out.extend(prng_bytes(seed, len));
     out
 }
 
-/// Stands in for unrar: `t`/`x` with `-pright` succeed (`x` writes the set's
+/// Stands in for unrar: `l`/`x` with `-pright` succeed (`x` writes the set's
 /// bytes as the film), anything else is refused the way unrar refuses a
-/// RAR5 password. Every password it is given is logged.
+/// RAR5 password (exit 11). Every command and password is logged.
 fn unrar(root: &Path) -> String {
     use std::os::unix::fs::PermissionsExt;
     let path = root.join("fake-unrar");
@@ -67,11 +68,14 @@ fn post_config(root: &Path) -> PostConfig {
 }
 
 fn release() -> GeneratedPost {
-    let mut inputs = vec![("release.part1.rar".to_owned(), header_encrypted_rar5())];
+    let mut inputs = vec![(
+        "release.part1.rar".to_owned(),
+        header_encrypted_rar5(7, 4096),
+    )];
     inputs.extend((2..=LATER_VOLUMES + 1).map(|n| {
         (
             format!("release.part{n}.rar"),
-            prng_bytes(100 + n as u64, LATER_VOLUME_BYTES),
+            header_encrypted_rar5(100 + n as u64, LATER_VOLUME_BYTES),
         )
     }));
     let refs: Vec<_> = inputs
@@ -176,9 +180,10 @@ async fn encrypted_release_without_a_working_password_stops_after_its_first_volu
         "{:?}",
         terminal.message
     );
-    // Only the release's own password was tried, by a test (`t`) run.
+    // Only the release's own password was tried, once, by listing the
+    // encrypted headers (`l`).
     let tried = std::fs::read_to_string(tmp.path().join("passwords-tried")).unwrap();
-    assert_eq!(tried.trim(), "t wrong");
+    assert_eq!(tried.trim(), "l wrong");
     // The download stopped: only the articles already requested when the
     // first volume landed were fetched (the provider counts a pipelined
     // request when it reads it, after the delay of the one before), never
@@ -228,14 +233,19 @@ async fn encrypted_release_whose_password_works_downloads_and_unpacks() {
     let out = process_job(&scoped, &cfg, &history, &tmp.path().join("data"), job).await;
     engine.end_post_admission(admission).await.unwrap();
     assert!(matches!(out, Ok(PpFinal::Success)), "{out:?}");
-    // The first volume was tested once with the release's password, and
-    // later volumes were not asked about again.
+    // Every volume is verifiable (header-encrypted), but once one opened
+    // with the release's password the job's later volumes were not asked
+    // about again. (A volume that finished while the first verdict was on
+    // its way back may still have been asked once more.)
     let tried = std::fs::read_to_string(tmp.path().join("passwords-tried")).unwrap();
-    let tests: Vec<_> = tried
+    let listings: Vec<_> = tried
         .lines()
-        .filter(|line| line.starts_with("t "))
+        .filter(|line| line.starts_with("l "))
         .collect();
-    assert_eq!(tests, ["t right"], "{tried}");
+    assert!(
+        !listings.is_empty() && listings.len() <= 2 && listings.iter().all(|l| *l == "l right"),
+        "{tried}"
+    );
     assert!(tried.lines().any(|line| line == "x right"), "{tried}");
     engine.shutdown().await;
 }

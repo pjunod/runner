@@ -4,23 +4,33 @@
 //! Two steps, the cheap one first:
 //!
 //! 1. [`sniff`] reads the volume's own headers — content, never the name,
-//!    because obfuscated posts hide extensions. Only the first volume of a
-//!    RAR set (or a header-encrypted RAR volume, whose volume number is
-//!    itself encrypted) and a 7z whose header lies inside the file can be
-//!    judged; everything else is [`Sniff::Plain`] and costs one small read.
-//! 2. For an encrypted one, each known password is tested with the
-//!    configured extractor (`unrar t` / `7z t`), read exactly as unpack reads
-//!    it. Only when every candidate is refused is the volume locked —
-//!    the same evidence that ends unpack `failed/unpack`.
+//!    because obfuscated posts hide extensions — and answers only for an
+//!    archive that carries a **password verifier**: encrypted headers
+//!    (RAR5's archive encryption header, RAR4's `MHD_PASSWORD`, 7z's
+//!    AES-encoded header), which no wrong password decrypts, or a RAR5
+//!    first volume whose file entry stores a password check value.
+//!    Everything else is [`Sniff::Plain`] and costs one small read.
+//! 2. Each known password is tried against that verifier with the
+//!    configured extractor — a listing (`l`) for encrypted headers, a test
+//!    (`t`) for a RAR5 check value — and only an **unambiguous** refusal
+//!    counts ([`crate::tools::Extractors::refuses_password`]). Only when
+//!    every candidate is refused is the volume locked.
 //!
-//! What a first volume cannot settle stays with unpack: a RAR4 set whose
-//! file data alone is encrypted has no password check value, so a wrong
-//! password shows only as a checksum error at the end of the file, in a
-//! later volume; a split 7z keeps its header in its last part.
+//! Wording such as "Corrupt file or wrong password" is never a refusal
+//! here: damage in this volume or in a later one already on disk reads the
+//! same, and that is par2's to repair. So what a verifier cannot settle
+//! stays with unpack, which judges as before: a RAR4 set whose file data
+//! alone is encrypted (a wrong password shows only as a checksum error at
+//! the end of the file), 7z with encrypted streams but a plain header, a
+//! split 7z (its header is in the last part).
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use nzbd_engine::archive_probe::{ArchiveProbe, ArchiveProbeJob, ArchiveVerdict};
+use nzbd_types::JobId;
 use tokio_util::sync::CancellationToken;
 
 use crate::manager::PostConfig;
@@ -42,8 +52,11 @@ const SEVENZIP_AES: &[u8] = &[0x06, 0xf1, 0x07, 0x01];
 pub enum Sniff {
     /// Not an encrypted archive that can be judged from this volume.
     Plain,
-    /// Encrypted (headers or file entries); judge it with the extractor.
-    Encrypted(ArchiveKind),
+    /// Encrypted with a password verifier; judge it with the extractor.
+    /// `headers`: the headers themselves are encrypted, so a listing
+    /// proves the password; otherwise a RAR5 file check value, which the
+    /// test command checks before reading any data.
+    Verifiable { kind: ArchiveKind, headers: bool },
 }
 
 /// Read `path`'s headers. Any read failure is `Plain`: this check only
@@ -95,6 +108,7 @@ fn rar5_headers(buf: &[u8]) -> Option<Sniff> {
     const HAS_DATA: u64 = 0x0002;
     const MAIN_VOLUME_NUMBER: u64 = 0x0002;
     const EXTRA_ENCRYPTION: u64 = 0x01;
+    const PASSWORD_CHECK: u64 = 0x0001;
     let mut pos = 0usize;
     // A handful of headers is enough to reach the first file header.
     for _ in 0..16 {
@@ -119,7 +133,12 @@ fn rar5_headers(buf: &[u8]) -> Option<Sniff> {
         match kind {
             // Everything after the signature is encrypted, the volume
             // number included: any volume of the set can be tested.
-            ENCRYPTION_HEADER => return Some(Sniff::Encrypted(ArchiveKind::Rar)),
+            ENCRYPTION_HEADER => {
+                return Some(Sniff::Verifiable {
+                    kind: ArchiveKind::Rar,
+                    headers: true,
+                })
+            }
             MAIN_HEADER => {
                 let archive_flags = vint(header, &mut at)?;
                 if archive_flags & MAIN_VOLUME_NUMBER != 0 {
@@ -134,7 +153,18 @@ fn rar5_headers(buf: &[u8]) -> Option<Sniff> {
                     let next = r.checked_add(record)?;
                     let mut t = r;
                     if vint(records, &mut t)? == EXTRA_ENCRYPTION {
-                        return Some(Sniff::Encrypted(ArchiveKind::Rar));
+                        let _version = vint(records, &mut t)?;
+                        let encryption_flags = vint(records, &mut t)?;
+                        // Without a check value a wrong password shows only
+                        // as a checksum error: not a verdict this can give.
+                        return Some(if encryption_flags & PASSWORD_CHECK != 0 {
+                            Sniff::Verifiable {
+                                kind: ArchiveKind::Rar,
+                                headers: false,
+                            }
+                        } else {
+                            Sniff::Plain
+                        });
                     }
                     r = next;
                 }
@@ -157,7 +187,6 @@ fn rar4_headers(buf: &[u8]) -> Option<Sniff> {
     const MHD_VOLUME: u16 = 0x0001;
     const MHD_PASSWORD: u16 = 0x0080;
     const MHD_FIRSTVOLUME: u16 = 0x0100;
-    const LHD_PASSWORD: u16 = 0x0004;
     const LONG_BLOCK: u16 = 0x8000;
     let u16_at = |at: usize| -> Option<u16> {
         Some(u16::from_le_bytes(buf.get(at..at + 2)?.try_into().ok()?))
@@ -178,16 +207,15 @@ fn rar4_headers(buf: &[u8]) -> Option<Sniff> {
                     return Some(Sniff::Plain);
                 }
                 if flags & MHD_PASSWORD != 0 {
-                    return Some(Sniff::Encrypted(ArchiveKind::Rar));
+                    return Some(Sniff::Verifiable {
+                        kind: ArchiveKind::Rar,
+                        headers: true,
+                    });
                 }
             }
-            FILE_HEAD => {
-                return Some(if flags & LHD_PASSWORD != 0 {
-                    Sniff::Encrypted(ArchiveKind::Rar)
-                } else {
-                    Sniff::Plain
-                });
-            }
+            // Plain headers: encrypted file data (`LHD_PASSWORD`) has no
+            // password check value in RAR4, so it is unpack's to judge.
+            FILE_HEAD => return Some(Sniff::Plain),
             _ => {}
         }
         let add = if flags & LONG_BLOCK != 0 {
@@ -202,9 +230,9 @@ fn rar4_headers(buf: &[u8]) -> Option<Sniff> {
 
 /// A 7z archive keeps its header at the end, located by the start header.
 /// It is judged only when that header lies inside this file (a whole,
-/// unsplit archive) and names the AES coder — for an encrypted header
-/// (`kEncodedHeader`) or for encrypted file streams alike, the coder id is
-/// stored in the clear.
+/// unsplit archive) and is itself AES-encrypted: a `kEncodedHeader` whose
+/// coder (stored in the clear) is AES. Encrypted streams under a plain
+/// header have no verifier — a wrong password reads as a data error.
 fn sevenzip(path: &Path, head: &[u8], len: u64) -> Sniff {
     let field = |at: usize| -> Option<u64> {
         Some(u64::from_le_bytes(head.get(at..at + 8)?.try_into().ok()?))
@@ -227,25 +255,60 @@ fn sevenzip(path: &Path, head: &[u8], len: u64) -> Sniff {
     if read.is_err() {
         return Sniff::Plain;
     }
-    if header
-        .windows(SEVENZIP_AES.len())
-        .any(|w| w == SEVENZIP_AES)
+    const ENCODED_HEADER: u8 = 0x17;
+    if header.first() == Some(&ENCODED_HEADER)
+        && header
+            .windows(SEVENZIP_AES.len())
+            .any(|w| w == SEVENZIP_AES)
     {
-        Sniff::Encrypted(ArchiveKind::SevenZip)
+        Sniff::Verifiable {
+            kind: ArchiveKind::SevenZip,
+            headers: true,
+        }
     } else {
         Sniff::Plain
     }
 }
 
+/// How long one candidate may take. A refusal is immediate (a listing of
+/// encrypted headers, or the RAR5 check value read before any data); only a
+/// password that opens the archive goes on to read data, and stopping that
+/// early changes nothing — it was not a refusal. So the bound costs no
+/// verdict, and it keeps a probe from holding the job's terminal-use guard
+/// for the configured extraction timeout.
+const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The post-processing side of [`ArchiveProbe`]: this node's `[post]`
 /// extractors, unpack rules and password file.
 pub struct EncryptedArchiveProbe {
     cfg: PostConfig,
+    /// Jobs with an extractor run in flight. Every volume of a
+    /// header-encrypted RAR5 set is verifiable and the password is the same
+    /// for all, so one judgement per job at a time is enough.
+    judging: Mutex<HashSet<JobId>>,
+}
+
+/// Releases a job's [`EncryptedArchiveProbe::judging`] claim.
+struct Claim<'a> {
+    judging: &'a Mutex<HashSet<JobId>>,
+    job: JobId,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.judging
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.job);
+    }
 }
 
 impl EncryptedArchiveProbe {
     pub fn new(cfg: PostConfig) -> EncryptedArchiveProbe {
-        EncryptedArchiveProbe { cfg }
+        EncryptedArchiveProbe {
+            cfg,
+            judging: Mutex::new(HashSet::new()),
+        }
     }
 
     fn unpacks(&self, category: Option<&str>) -> bool {
@@ -255,6 +318,17 @@ impl EncryptedArchiveProbe {
             .unwrap_or(self.cfg.unpack)
     }
 
+    fn claim(&self, job: JobId) -> Option<Claim<'_>> {
+        self.judging
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job)
+            .then_some(Claim {
+                judging: &self.judging,
+                job,
+            })
+    }
+
     /// Whether every known password is refused, in unpack's order: the
     /// release's own first (none: one attempt without a password), then the
     /// password file, read only once those are refused. `None` when the
@@ -262,26 +336,35 @@ impl EncryptedArchiveProbe {
     async fn all_refused(
         &self,
         path: &Path,
-        kind: ArchiveKind,
+        sniffed: (ArchiveKind, bool),
         release: &[String],
         cancel: CancellationToken,
     ) -> Option<bool> {
+        let (kind, headers) = sniffed;
         let ex = Extractors {
             unrar_cmd: self.cfg.unrar_cmd.clone(),
             sevenzip_cmd: self.cfg.sevenzip_cmd.clone(),
-            timeout: self.cfg.tool_timeout,
+            timeout: self.cfg.tool_timeout.min(CANDIDATE_TIMEOUT),
         };
         let mut tried: Vec<Option<String>> = if release.is_empty() {
             vec![None]
         } else {
             release.iter().cloned().map(Some).collect()
         };
+        let refused = |candidate: Option<String>| {
+            let ex = &ex;
+            let cancel = cancel.clone();
+            async move {
+                if cancel.is_cancelled() {
+                    return None;
+                }
+                ex.refuses_password(path, kind, headers, candidate.as_deref(), cancel)
+                    .await
+                    .ok()
+            }
+        };
         for candidate in &tried {
-            if !ex
-                .refuses_password(path, kind, candidate.as_deref(), cancel.clone())
-                .await
-                .ok()?
-            {
+            if !refused(candidate.clone()).await? {
                 return Some(false);
             }
         }
@@ -292,14 +375,7 @@ impl EncryptedArchiveProbe {
             {
                 continue;
             }
-            if cancel.is_cancelled() {
-                return None;
-            }
-            if !ex
-                .refuses_password(path, kind, Some(&candidate), cancel.clone())
-                .await
-                .ok()?
-            {
+            if !refused(Some(candidate.clone())).await? {
                 return Some(false);
             }
             tried.push(Some(candidate));
@@ -318,7 +394,12 @@ impl ArchiveProbe for EncryptedArchiveProbe {
         if !self.unpacks(job.category.as_deref()) {
             return ArchiveVerdict::Opens; // nothing will unpack it
         }
-        let Sniff::Encrypted(kind) = sniff(file) else {
+        let Sniff::Verifiable { kind, headers } = sniff(file) else {
+            return ArchiveVerdict::Plain;
+        };
+        // Another volume of this job is being judged; its verdict stands
+        // for the job.
+        let Some(_claim) = self.claim(job.job) else {
             return ArchiveVerdict::Plain;
         };
         // This runs on the engine's blocking pool; the extractor is a child
@@ -331,7 +412,12 @@ impl ArchiveProbe for EncryptedArchiveProbe {
             return ArchiveVerdict::Opens;
         };
         let path: PathBuf = file.to_path_buf();
-        match runtime.block_on(self.all_refused(&path, kind, &job.passwords, cancel.clone())) {
+        match runtime.block_on(self.all_refused(
+            &path,
+            (kind, headers),
+            &job.passwords,
+            cancel.clone(),
+        )) {
             Some(true) => {
                 tracing::warn!(file = %path.display(), "encrypted archive refused every known password");
                 ArchiveVerdict::Locked(format!(
@@ -379,14 +465,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bytes = rar5(&[rar5_header(4, 0, &[0, 0, 15], &[])]);
         let path = write(tmp.path(), "x", &bytes);
-        assert_eq!(sniff(&path), Sniff::Encrypted(ArchiveKind::Rar));
+        assert_eq!(sniff(&path), HEADERS_RAR);
     }
 
+    const HEADERS_RAR: Sniff = Sniff::Verifiable {
+        kind: ArchiveKind::Rar,
+        headers: true,
+    };
+
     #[test]
-    fn rar5_encrypted_file_entry_is_encrypted_only_on_the_first_volume() {
+    fn rar5_file_check_value_is_verifiable_only_on_the_first_volume() {
         let tmp = tempfile::tempdir().unwrap();
-        // File header: flags HAS_EXTRA; extra = one encryption record.
-        let file = rar5_header(2, 0x01, &[0, 0, 0], &[2, 0x01, 0]);
+        // File header: flags HAS_EXTRA; extra = one encryption record
+        // (size 3: type 1, version 0, flags 1 = password check present).
+        let file = rar5_header(2, 0x01, &[0, 0, 0], &[3, 0x01, 0, 0x01]);
+        // The same record without a check value cannot be judged.
+        let unchecked = rar5(&[
+            rar5_header(1, 0, &[0x01], &[]),
+            rar5_header(2, 0x01, &[0, 0, 0], &[3, 0x01, 0, 0x00]),
+        ]);
         let first = rar5(&[rar5_header(1, 0, &[0x01], &[]), file.clone()]);
         let later = rar5(&[rar5_header(1, 0, &[0x03, 2], &[]), file]);
         let plain = rar5(&[
@@ -395,9 +492,13 @@ mod tests {
         ]);
         assert_eq!(
             sniff(&write(tmp.path(), "a", &first)),
-            Sniff::Encrypted(ArchiveKind::Rar)
+            Sniff::Verifiable {
+                kind: ArchiveKind::Rar,
+                headers: false
+            }
         );
         assert_eq!(sniff(&write(tmp.path(), "b", &later)), Sniff::Plain);
+        assert_eq!(sniff(&write(tmp.path(), "d", &unchecked)), Sniff::Plain);
         assert_eq!(sniff(&write(tmp.path(), "c", &plain)), Sniff::Plain);
     }
 
@@ -411,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn rar4_flags_decide_encryption_and_first_volume() {
+    fn rar4_only_encrypted_headers_are_verifiable() {
         let tmp = tempfile::tempdir().unwrap();
         let main = |flags| rar4_block(0x73, flags, &[0; 6]);
         // File header with LONG_BLOCK: PACK_SIZE 0 so no data follows.
@@ -424,12 +525,12 @@ mod tests {
             out
         };
         let cases = [
-            (mk(vec![main(0x0080)]), Sniff::Encrypted(ArchiveKind::Rar)),
-            (
-                mk(vec![main(0x0101), file(0x0004)]),
-                Sniff::Encrypted(ArchiveKind::Rar),
-            ),
-            (mk(vec![main(0x0001), file(0x0004)]), Sniff::Plain),
+            (mk(vec![main(0x0080)]), HEADERS_RAR),
+            (mk(vec![main(0x0181)]), HEADERS_RAR),
+            // A later volume, header-encrypted or not.
+            (mk(vec![main(0x0081)]), Sniff::Plain),
+            // Encrypted file data has no check value in RAR4.
+            (mk(vec![main(0x0101), file(0x0004)]), Sniff::Plain),
             (mk(vec![main(0x0000), file(0x0000)]), Sniff::Plain),
         ];
         for (i, (bytes, want)) in cases.into_iter().enumerate() {
@@ -442,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn sevenzip_aes_coder_is_encrypted_when_the_header_is_inside() {
+    fn sevenzip_is_verifiable_when_its_inside_header_is_aes_encoded() {
         let tmp = tempfile::tempdir().unwrap();
         let mk = |header: &[u8], declared: u64| {
             let mut out = SEVENZIP_SIGNATURE.to_vec();
@@ -456,7 +557,16 @@ mod tests {
         let aes = [0x17, 0x06, 0x24, 0x06, 0xf1, 0x07, 0x01, 0x00];
         assert_eq!(
             sniff(&write(tmp.path(), "a", &mk(&aes, aes.len() as u64))),
-            Sniff::Encrypted(ArchiveKind::SevenZip)
+            Sniff::Verifiable {
+                kind: ArchiveKind::SevenZip,
+                headers: true
+            }
+        );
+        // AES streams under a plain header: no verifier.
+        let plain_header = [0x01, 0x04, 0x06, 0x24, 0x06, 0xf1, 0x07, 0x01];
+        assert_eq!(
+            sniff(&write(tmp.path(), "d", &mk(&plain_header, 8))),
+            Sniff::Plain
         );
         // Header past the end of this part (a split archive): not judged.
         assert_eq!(
@@ -467,6 +577,114 @@ mod tests {
             sniff(&write(tmp.path(), "c", &mk(&[0x01, 0x04, 0x00], 3))),
             Sniff::Plain
         );
+    }
+
+    /// A fake extractor answering every run with `reply` (shell code) and
+    /// logging `<command> <password>`; returns the probe and the log path.
+    fn probe_with(root: &Path, reply: &str, password_file: Option<&str>) -> EncryptedArchiveProbe {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = root.join("fake-unrar");
+        std::fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\nmode=$1; pw=\nfor a; do case \"$a\" in -p*) pw=\"${{a#-p}}\";; esac; done\n\
+                 echo \"$mode $pw\" >> '{}'\n{reply}\n",
+                root.join("log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let password_file = password_file.map(|lines| {
+            let path = root.join("passwords.txt");
+            std::fs::write(&path, lines).unwrap();
+            path
+        });
+        EncryptedArchiveProbe::new(PostConfig {
+            unrar_cmd: tool.to_string_lossy().into_owned(),
+            sevenzip_cmd: tool.to_string_lossy().into_owned(),
+            password_file,
+            ..PostConfig::default()
+        })
+    }
+
+    fn verdict(root: &Path, probe: &EncryptedArchiveProbe, passwords: &[&str]) -> ArchiveVerdict {
+        // A header-encrypted RAR5 volume under a name that contains
+        // "password", the way a missing next volume is named on stderr.
+        let file = write(
+            root,
+            "the.password.game.part1.rar",
+            &rar5(&[rar5_header(4, 0, &[0, 0, 15], &[])]),
+        );
+        probe.probe(
+            &file,
+            &ArchiveProbeJob {
+                job: JobId(9),
+                category: None,
+                passwords: passwords.iter().map(|p| p.to_string()).collect(),
+            },
+            &CancellationToken::new(),
+        )
+    }
+
+    #[test]
+    fn only_an_unambiguous_refusal_locks() {
+        let refused = "echo 'The specified password is incorrect.' >&2; exit 11";
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = probe_with(tmp.path(), refused, None);
+        assert!(matches!(
+            verdict(tmp.path(), &probe, &["wrong"]),
+            ArchiveVerdict::Locked(_)
+        ));
+        // Damage reads like a wrong password but is par2's to repair; a
+        // missing next volume names its (password-containing) path.
+        for reply in [
+            "echo 'Checksum error in the encrypted file x. Corrupt file or wrong password.' >&2; exit 3",
+            "echo \"Cannot find volume $PWD/the.password.game.part2.rar\" >&2; exit 10",
+            "exit 0",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let probe = probe_with(tmp.path(), reply, None);
+            assert_eq!(
+                verdict(tmp.path(), &probe, &["right"]),
+                ArchiveVerdict::Opens,
+                "{reply}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_file_candidates_follow_the_release_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reply = "[ \"$pw\" = second ] && exit 0; echo 'The specified password is incorrect.' >&2; exit 11";
+        let probe = probe_with(tmp.path(), reply, Some("first\nwrong\nsecond\nthird\n"));
+        assert_eq!(
+            verdict(tmp.path(), &probe, &["wrong"]),
+            ArchiveVerdict::Opens
+        );
+        let log = std::fs::read_to_string(tmp.path().join("log")).unwrap();
+        assert_eq!(log, "l wrong\nl first\nl second\n");
+        // No usable candidate at all: locked without the release's own.
+        let tmp = tempfile::tempdir().unwrap();
+        let refused = "echo 'The specified password is incorrect.' >&2; exit 11";
+        let probe = probe_with(tmp.path(), refused, None);
+        assert!(matches!(
+            verdict(tmp.path(), &probe, &[]),
+            ArchiveVerdict::Locked(_)
+        ));
+        let log = std::fs::read_to_string(tmp.path().join("log")).unwrap();
+        assert_eq!(log, "l -\n");
+    }
+
+    #[test]
+    fn unpack_disabled_category_is_never_judged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut probe = probe_with(tmp.path(), "exit 11", None);
+        probe.cfg.unpack = false;
+        assert_eq!(
+            verdict(tmp.path(), &probe, &["wrong"]),
+            ArchiveVerdict::Opens
+        );
+        assert!(!tmp.path().join("log").exists());
     }
 
     #[test]

@@ -185,9 +185,9 @@ impl ClusterRuntime {
     /// Start with an independently enrolled lifecycle inventory identity.
     /// The original constructor remains suitable for first-time enrollment.
     /// `archive_probe` judges finished archive volumes on this node's
-    /// download executors (`nzbd_engine::archive_probe`); it is independent
-    /// of `pp` because a download-only node unpacks nothing itself yet its
-    /// jobs are unpacked elsewhere.
+    /// download executors (`nzbd_engine::archive_probe`). Pass one only when
+    /// this node's `[post]` config is one that unpacks the cluster's jobs
+    /// (it post-processes): the verdict predicts unpack's.
     #[allow(clippy::too_many_arguments)] // Preserve the existing constructor plus its enrollment identity.
     pub async fn start_expected(
         cfg: ClusterConfig,

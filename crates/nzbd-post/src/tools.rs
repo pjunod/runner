@@ -614,23 +614,31 @@ fn sevenzip_refused_password(lower: &str) -> bool {
 }
 
 impl Extractors {
-    /// Test (`t`) `archive` with one candidate password, writing nothing,
-    /// and report whether the extractor refused the password — read from
-    /// its output exactly as extraction reads it, so this agrees with the
-    /// verdict unpack would reach. Anything else (success, a missing later
-    /// volume, damage, a tool that cannot run) is not a refusal.
+    /// Try one candidate password against `archive`'s password verifier,
+    /// writing nothing, and report whether the extractor **unambiguously**
+    /// refused it: unrar's bad-password exit (11) or "password is
+    /// incorrect", 7-Zip's "can not open encrypted archive". Damage reads
+    /// differently ("Corrupt file or wrong password", a data or checksum
+    /// error — in this volume or a later one already on disk) and is not a
+    /// refusal, nor is success, a missing later volume or a tool that cannot
+    /// run. This is stricter than extraction's reading on purpose: a
+    /// refusal here ends a download, so it must never be damage.
     ///
-    /// RAR goes to unrar, and to 7-Zip only when unrar cannot run, the same
-    /// tool order as extraction.
+    /// `headers`: the archive's headers are encrypted, so a listing (`l`)
+    /// proves the password without reading data; otherwise a test (`t`),
+    /// which checks a RAR5 check value before the data. RAR goes to unrar,
+    /// and to 7-Zip only when unrar cannot run, the extraction order.
     pub async fn refuses_password(
         &self,
         archive: &Path,
         kind: ArchiveKind,
+        headers: bool,
         password: Option<&str>,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<bool, PostError> {
         let dir = archive.parent().unwrap_or(Path::new(".")).to_path_buf();
         let arch = archive.to_string_lossy().into_owned();
+        let command = if headers { "l" } else { "t" };
         if matches!(kind, ArchiveKind::Rar) {
             let pw = match password {
                 Some(p) => format!("-p{p}"),
@@ -639,7 +647,7 @@ impl Extractors {
             // `-y` answers the missing-next-volume prompt with a failure
             // instead of waiting on stdin: only the volumes on disk are read.
             let args = [
-                "t".to_string(),
+                command.to_string(),
                 "-y".into(),
                 "-idc".into(),
                 pw,
@@ -656,14 +664,16 @@ impl Extractors {
             {
                 Ok(out) => {
                     let lower = format!("{}\n{}", out.stdout, out.stderr).to_lowercase();
-                    return Ok(unrar_refused_password(out.code, &out.stderr, &lower));
+                    return Ok(out.code == 11
+                        || lower.contains("password is incorrect")
+                        || lower.contains("incorrect password"));
                 }
                 Err(PostError::ToolMissing(_)) => {}
                 Err(e) => return Err(e),
             }
         }
         let args = [
-            "t".to_string(),
+            command.to_string(),
             "-y".into(),
             format!("-p{}", password.unwrap_or("")),
             arch,
@@ -671,7 +681,9 @@ impl Extractors {
         let out =
             run_tool_owned(&self.sevenzip_cmd, &args, &dir, self.timeout, cancellation).await?;
         let lower = format!("{}\n{}", out.stdout, out.stderr).to_lowercase();
-        Ok(sevenzip_refused_password(&lower))
+        Ok(headers
+            && (lower.contains("can not open encrypted archive")
+                || lower.contains("cannot open encrypted archive")))
     }
 
     /// Extract with each candidate password in turn, the way NZBGet walks

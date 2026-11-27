@@ -20,8 +20,10 @@ use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 /// What the probe knows about the job that owns the file.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ArchiveProbeJob {
+    /// The job that owns the file.
+    pub job: nzbd_types::JobId,
     /// The job's category, for per-category unpack rules.
     pub category: Option<String>,
     /// The release's own passwords (`*Unpack:Password`), tried first.
@@ -44,9 +46,11 @@ pub enum ArchiveVerdict {
 
 /// Judges a finished file. Called on the blocking pool while the job's
 /// terminal-use guard is held, so the file cannot be disposed underneath
-/// it; it must return (any failure to judge is [`ArchiveVerdict::Plain`]
-/// or [`ArchiveVerdict::Opens`], never a hang) and should stop promptly
-/// once `cancel` fires.
+/// it; it must return promptly (any failure to judge is
+/// [`ArchiveVerdict::Plain`] or [`ArchiveVerdict::Opens`], never a hang)
+/// and stop once `cancel` fires — the owner fires it when the job is
+/// being disposed of or removed. `Locked` must rest on an unambiguous
+/// password refusal, never on damage, which par2 may still repair.
 pub trait ArchiveProbe: Send + Sync {
     fn probe(
         &self,

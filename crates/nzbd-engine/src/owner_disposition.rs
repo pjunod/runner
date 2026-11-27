@@ -428,6 +428,8 @@ impl Owner {
                 .get(&job)
                 .is_some_and(|writers| writers.iter().any(|writer| !*writer.stopped.borrow()))
         {
+            // A running extractor need not finish for a job being disposed of.
+            self.cancel_file_inspections(job);
             self.reply_disposition_wait(
                 receipt,
                 JobDispositionState::Pending,

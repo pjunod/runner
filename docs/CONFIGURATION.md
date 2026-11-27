@@ -432,19 +432,38 @@ and a job an earlier build held as `password_required` is converted to
 older files load, but it is ignored. With no password at all, an encrypted
 archive skips the forced PAR repair (repair cannot produce a password).
 
-The verdict usually comes during the download, not after it. When a
-complete, undamaged file turns out to be the first volume of an encrypted
-archive (Runner reads its headers, so obfuscated names are fine), Runner
-tests the same passwords against that one volume with `unrar t` / `7z t`.
-If every one is refused, the download stops right there and the job ends
-`failed/unpack` as above, without fetching the rest of the release. This is
-SABnzbd's "abort on encrypted RAR" behavior, and it is not a setting: it
-only reaches the result unpack would have reached anyway. It does not run
-for a category with `unpack = false`, or when post-processing is off. A
-first volume can't always decide. For example, a RAR4 set where only the
-file data is encrypted has no password check value, and a split 7z keeps
-its header in its last part. Those releases download in full and unpack
-judges them.
+The verdict often comes during the download instead of after it. When a
+complete, undamaged file is an encrypted archive volume that carries a
+password check, Runner tests the same passwords against that one volume.
+Runner reads the file's headers, so obfuscated names are fine. A file
+carries a password check when:
+
+- its headers are encrypted: RAR5 or RAR4 header encryption (`-hp`), or a
+  7z with an encrypted header;
+- or it is a RAR5 first volume whose file entry stores a check value.
+
+A header-encrypted volume gets a listing (`unrar l` / `7z l`); a RAR5
+check value gets a test (`unrar t`). If the tool refuses every password
+outright, the download stops right there. Outright means unrar exits 11 or
+says "password is incorrect", or 7z says "can not open encrypted archive".
+The job then ends `failed/unpack` as above, without fetching the rest of
+the release.
+
+This is SABnzbd's "abort on encrypted RAR". It is not a setting: it only
+reaches the result unpack would have reached anyway. Damage never counts
+as a refusal ("Corrupt file or wrong password" is also what a damaged
+volume says), because par2 may still repair it. In these cases the
+release downloads in full and unpack judges it as before:
+
+- a RAR4 set where only the file data is encrypted, or 7z streams under a
+  plain header (neither has a password check);
+- a split 7z (its header is in the last part);
+- a category with `unpack = false`, or post-processing turned off.
+
+In a cluster, only nodes with `cluster.post_process = true` make this
+check, because their `[post]` settings, `password_file` included, are the
+ones that unpack. Download-only nodes download in full. Post-processing
+nodes should share one `password_file`.
 
 **Failure disposition.** `[post] keep_failed_downloads` defaults to `false`:
 Runner deletes failed payload after salvage and cleanup custody settle. Set it

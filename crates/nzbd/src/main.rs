@@ -280,7 +280,7 @@ fn advertise(port: u16, name: Option<String>, tls: bool, auth: String) -> anyhow
 /// Post-processing's early verdict on finished archive volumes: an
 /// encrypted release no known password opens ends `failed/unpack` after its
 /// first volume instead of after the whole download. Nothing to judge when
-/// post-processing (and so unpack) is off.
+/// post-processing (and so unpack) is off on this node.
 fn archive_probe(
     cfg: &nzbd_config::Config,
 ) -> Option<Arc<dyn nzbd_engine::archive_probe::ArchiveProbe>> {
@@ -1754,7 +1754,14 @@ async fn run_cluster(
         cfg.max_active_downloads(),
         pp,
         expected_identity,
-        archive_probe(&cfg),
+        // Only a node that post-processes may predict the unpack verdict: a
+        // download-only node's `[post]` (its password file above all) is
+        // not what unpacks the cluster's jobs, so it downloads in full and
+        // the post-processing node judges, as before.
+        cfg.cluster
+            .post_process
+            .then(|| archive_probe(&cfg))
+            .flatten(),
     )
     .await
     .map_err(with_fs_hint)?;

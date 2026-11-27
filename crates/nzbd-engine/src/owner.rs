@@ -1224,6 +1224,10 @@ pub(crate) struct Owner {
     /// Jobs whose encrypted archive a known password opens (or that a
     /// first volume cannot judge): later volumes are not asked about.
     archives_judged: HashSet<JobId>,
+    /// Cancels a job's in-flight finished-file inspections (a running
+    /// extractor) when the job is disposed of or removed; a child of the
+    /// engine's own token. Lives while `pending_file_inspections` does.
+    inspection_cancels: HashMap<JobId, CancellationToken>,
     file_sizes: HashMap<FileId, u64>,
     /// Jobs whose bytes did not survive the trip to disk, and why.
     ///
@@ -1823,6 +1827,7 @@ impl Owner {
             pending_file_inspections: HashMap::new(),
             archive_probe: None,
             archives_judged: HashSet::new(),
+            inspection_cancels: HashMap::new(),
             file_sizes,
             write_failures: HashMap::new(),
             delegated: HashMap::new(),
@@ -2189,13 +2194,7 @@ impl Owner {
                 {
                     self.on_file_inspected(job, name, archive);
                 } else {
-                    match self.pending_file_inspections.get_mut(&job) {
-                        Some(count) if *count > 1 => *count -= 1,
-                        Some(_) => {
-                            self.pending_file_inspections.remove(&job);
-                        }
-                        None => {}
-                    }
+                    self.file_inspection_answered(job);
                 }
                 self.drain_replacements();
             }
@@ -6315,6 +6314,9 @@ impl Owner {
         }
         self.pending_file_inspections.remove(&job);
         self.archives_judged.remove(&job);
+        if let Some(token) = self.inspection_cancels.remove(&job) {
+            token.cancel();
+        }
         self.allocated_jobs.remove(&job);
         self.allocation_cache.remove(&job);
         self.pending_finalize
@@ -8268,6 +8270,7 @@ impl Owner {
             .filter(|_| intact && !self.archives_judged.contains(&job))
             .map(|probe| {
                 let context = crate::archive_probe::ArchiveProbeJob {
+                    job,
                     category: j.category.clone(),
                     passwords: j
                         .params
@@ -8286,7 +8289,12 @@ impl Owner {
         let tx = self.engine_tx.clone();
         let generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         let inventory = self.artifacts.clone();
-        let cancellation = self.cancel.clone();
+        let engine_cancel = &self.cancel;
+        let cancellation = self
+            .inspection_cancels
+            .entry(job)
+            .or_insert_with(|| engine_cancel.child_token())
+            .clone();
         self.tracker.spawn_blocking(move || {
             let checkpoint = || {
                 if cancellation.is_cancelled() {
@@ -8318,19 +8326,32 @@ impl Owner {
         });
     }
 
+    /// One finished-file inspection of `job` answered (or was discarded).
+    fn file_inspection_answered(&mut self, job: JobId) {
+        match self.pending_file_inspections.get_mut(&job) {
+            Some(pending) if *pending > 1 => *pending -= 1,
+            Some(_) => {
+                self.pending_file_inspections.remove(&job);
+                self.inspection_cancels.remove(&job);
+            }
+            None => {}
+        }
+    }
+
+    /// Stop `job`'s in-flight inspections early (they still answer).
+    pub(super) fn cancel_file_inspections(&self, job: JobId) {
+        if let Some(token) = self.inspection_cancels.get(&job) {
+            token.cancel();
+        }
+    }
+
     fn on_file_inspected(
         &mut self,
         job: JobId,
         name: Option<String>,
         archive: Option<crate::archive_probe::ArchiveVerdict>,
     ) {
-        match self.pending_file_inspections.get_mut(&job) {
-            Some(pending) if *pending > 1 => *pending -= 1,
-            Some(_) => {
-                self.pending_file_inspections.remove(&job);
-            }
-            None => {}
-        }
+        self.file_inspection_answered(job);
         if let Some(name) = name {
             self.adopt_learned_name(job, name);
         }
