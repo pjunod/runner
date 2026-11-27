@@ -65,7 +65,7 @@ jobs:
         run: scripts/ci-merge-candidate
       # cargo-deny-action v2.1.1, cargo-deny 0.20.2. Pin the immutable
       # revision so the supply-chain gate cannot change underneath a run.
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # 3c6349835b2b7b196a839186cb8b78e02f7b5f25
+      - uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # 3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
           rust-version: "1.95"
           command: check bans licenses sources
@@ -83,14 +83,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: scripts/ci-merge-candidate
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: cargo-audit@0.22.0
       - name: Restore vendored crates to registry provenance
         run: scripts/vendor-audit-lock --output target/vendor-audit/Cargo.lock
       - name: Audit workspace and vendored release identities
         run: cargo audit --file target/vendor-audit/Cargo.lock
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # 3c6349835b2b7b196a839186cb8b78e02f7b5f25
+      - uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # 3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
           rust-version: "1.95"
           command: check advisories
