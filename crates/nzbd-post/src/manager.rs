@@ -10615,6 +10615,7 @@ mod decision_tests {
         assert_eq!(PpFinal::Success.as_str(), "SUCCESS");
         assert_eq!(PpFinal::ParFailure.as_str(), "PAR_FAILURE");
         assert_eq!(PpFinal::UnpackFailure.as_str(), "UNPACK_FAILURE");
+        assert_eq!(PpFinal::PasswordFailure.as_str(), "FAILURE/PASSWORD");
         assert_eq!(PpFinal::ScriptFailure.as_str(), "SCRIPT_FAILURE");
         assert_eq!(PpFinal::HealthFailure.as_str(), "FAILURE/HEALTH");
 

@@ -378,6 +378,7 @@ event, never the provisional download completion.
 | `fetch` | `fetch` | NZB/URL fetch failed (URL fetcher); `fetch_cause` `gone` (the indexer answered 404/410/403 or another non-retried status for this item) or `indexer_unavailable` (retries exhausted on 429/503, timeouts, transport, or at once on a 429/503 whose Retry-After exceeds the ladder — that one also carries `retry_at_unix`) | only for `gone` | no | nothing to dispose |
 | `par` | `par_verify`/`par_repair` | repair impossible (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `unpack` | `unpack` | the extractor failed on the bytes (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `password` | `unpack` | an encrypted archive no known password opens (PP unpack, or the owner during download from the first volume's password check) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `script` | `script` | post script exited non-zero (PP) | no | yes | `keep_failed_downloads` |
 | `publish` | `move`/`publication_verify` | nothing passes selection (PP) | no | yes | `keep_failed_downloads`, after salvage settles |
 | `io` | any | a write or filesystem step failed in a way retrying cannot fix (owner or PP) | no | yes | `keep_failed_downloads`, after salvage settles |
@@ -385,7 +386,7 @@ event, never the provisional download completion.
 | `hold_expired` | the hold's stage | an environmental hold passed its deadline (§2.3) | no | yes | `keep_failed_downloads`, after salvage settles |
 
 History status strings, per reason: `FAILURE/HEALTH` · `FAILURE/FETCH` ·
-`PAR_FAILURE` · `UNPACK_FAILURE` · `SCRIPT_FAILURE` · `FAILURE/PUBLISH` ·
+`PAR_FAILURE` · `UNPACK_FAILURE` · `FAILURE/PASSWORD` · `SCRIPT_FAILURE` · `FAILURE/PUBLISH` ·
 `FAILURE/IO` · `FAILURE/IDENTITY` · `FAILURE/HOLD_EXPIRED`; success is
 `SUCCESS…`, an operator delete `DELETED`.
 

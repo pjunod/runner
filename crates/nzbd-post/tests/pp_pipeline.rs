@@ -2065,6 +2065,67 @@ async fn encrypted_archive_without_a_working_password_fails_password_not_held() 
     engine.shutdown().await;
 }
 
+/// A password failure is the cause only when it is the only one: an
+/// encrypted archive beside a damaged one is still `failed/unpack`.
+#[tokio::test]
+async fn encrypted_and_damaged_archives_fail_unpack_not_password() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = spawn_engine(tmp.path()).await;
+    let dir = tmp.path().join("dest/mixedjob");
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = b"7z encrypted bytes";
+    let broken = b"7z damaged bytes!!";
+    std::fs::write(dir.join("secret.7z"), secret).unwrap();
+    std::fs::write(dir.join("broken.7z"), broken).unwrap();
+    let mut job = completed_job(
+        1,
+        "mixedjob",
+        vec![
+            file_entry(1, "secret.7z", Some(crc(secret)), false),
+            file_entry(2, "broken.7z", Some(crc(broken)), false),
+        ],
+    );
+    job.params.push((
+        nzbd_engine::queue::UNPACK_PASSWORD_PARAM.into(),
+        "wrong".into(),
+    ));
+    engine
+        .import_fixture_job(tmp.path(), job, false, false)
+        .await
+        .unwrap();
+    let tool = tmp.path().join("mixed-archive-tool");
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\nfor a; do last=\"$a\"; done\n\
+         case \"$last\" in *secret.7z) echo 'ERROR: Wrong password : secret.7z' >&2;; \
+         *) echo 'ERROR: Data Error : broken.7z' >&2;; esac\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tool = tool.to_string_lossy().into_owned();
+    let out = process_job(
+        &engine,
+        &PostConfig {
+            unrar_cmd: tool.clone(),
+            sevenzip_cmd: tool,
+            failure_action: FailureAction::Delete,
+            deobfuscate_final: false,
+            ..PostConfig::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::UnpackFailure);
+    let terminal = engine.artifacts().terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    assert!(terminal.blames_release);
+    engine.shutdown().await;
+}
+
 /// The release's own password is tried first, then `password_file` in
 /// order (duplicates and blank lines skipped); the first that opens the
 /// archive wins.

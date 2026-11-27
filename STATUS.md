@@ -1391,7 +1391,7 @@ Curator M2 depends on this landing first.
   `inject_terminal_crash` (test-support) proves the replay produces one
   history row and one event.
 - **Typed at the producer.** The closed `FailureReason` set is health · fetch
-  · par · unpack · script · publish · io · identity · hold_expired.
+  · par · unpack · password · script · publish · io · identity · hold_expired.
   - `fetch` carries `FetchCause` gone/indexer_unavailable (`fetch::cause_of`).
   - `blames_release` and `salvage_possible` are decided by the reason.
   - Producers:

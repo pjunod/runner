@@ -574,8 +574,8 @@ The per-job pipeline and its knobs are described in
   **Keep on failure** retains its source indefinitely. Reasons and
   recoverability do not override this choice; failed jobs remain in History.
 - **Every failure has a reason.** History and `job_pp_finished` name one of
-  `health`, `fetch`, `par`, `unpack`, `script`, `publish`, `io`, `identity`
-  or `hold_expired`. Any usable salvage is settled before source disposal;
+  `health`, `fetch`, `par`, `unpack`, `password`, `script`, `publish`, `io`,
+  `identity` or `hold_expired`. Any usable salvage is settled before source disposal;
   failure alone never proves that writers stopped or remote custody ended.
 
 ## History, duplicates, quotas

@@ -800,8 +800,8 @@ pub enum FailureReason {
     HoldExpired,
     /// The release's archive is encrypted and no known password (the NZB's
     /// own, then `[post] password_file`) opens it. Found by unpack, or
-    /// during download from the first archive volume. Appended last: the
-    /// variant index is part of the stored form.
+    /// during download from the first archive volume. Stored and sent as
+    /// its snake_case name; a binary older than this one cannot read it.
     Password,
 }
 
