@@ -18,8 +18,22 @@ if [[ "${GITHUB_EVENT_NAME:?}" != pull_request ]]; then
   exit 0
 fi
 
+# A payload that already says ready needs no lookup: if the PR became a
+# draft since, validating it anyway is harmless. Only a draft payload can be
+# stale in the direction that would skip validation.
+if [[ "$(jq -r .pull_request.draft "${GITHUB_EVENT_PATH:?}")" == false ]]; then
+  exit 0
+fi
+
 pr=${PR_NUMBER:?PR_NUMBER must name the pull request}
-draft="$(gh api "repos/${GITHUB_REPOSITORY:?}/pulls/${pr}" --jq .draft)"
+draft=
+for attempt in 1 2 3; do
+  if draft="$(gh api "repos/${GITHUB_REPOSITORY:?}/pulls/${pr}" --jq .draft)"; then
+    break
+  fi
+  draft=
+  sleep $((attempt * 5))
+done
 case "$draft" in
   false) ;;
   true)

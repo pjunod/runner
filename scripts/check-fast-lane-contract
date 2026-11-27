@@ -3,8 +3,6 @@ set -euo pipefail
 
 lane=.github/workflows/main-fast-lane.yml
 supply=.github/workflows/supply-chain.yml
-grep -Fq 'ready_for_review' "$lane"
-grep -Fq 'converted_to_draft' "$lane"
 grep -Fq 'cancel-in-progress: true' "$lane"
 grep -Fq 'name: Main promotion gate' "$lane"
 
@@ -20,15 +18,20 @@ job_body() {
 # so no required job may skip on it. Each one instead runs
 # scripts/ci-merge-candidate, which fails unless the live PR is ready.
 for workflow in "$lane" "$supply"; do
-  if grep -Fq 'github.event.pull_request.draft' "$workflow"; then
+  grep -Fq 'ready_for_review' "$workflow"
+  grep -Fq 'converted_to_draft' "$workflow"
+  if grep -v '^ *#' "$workflow" | grep -Eq 'pull_request(\.draft|\[)'; then
     echo "$workflow must read the live draft state, not the event payload" >&2
     exit 1
   fi
-  grep -Eq '^  pull-requests: read$' "$workflow"
 done
+grep -Eq '^  pull-requests: read$' "$supply"
+grep -Fq '      pull-requests: read' <<<"$(job_body "$lane" scope)"
+# A guarded job may not skip itself (if), soften its result
+# (continue-on-error), or skip through a dependency (needs).
 for spec in "$lane:scope" "$supply:reviewed-exceptions" "$supply:policy" "$supply:advisories"; do
   body="$(job_body "${spec%%:*}" "${spec#*:}")"
-  if [[ -z "$body" ]] || grep -Eq '^    (if|continue-on-error):' <<<"$body"; then
+  if [[ -z "$body" ]] || grep -Eq '^    (if|continue-on-error|needs):' <<<"$body"; then
     echo "${spec} must exist and must never skip or soft-fail" >&2
     exit 1
   fi
@@ -36,11 +39,15 @@ for spec in "$lane:scope" "$supply:reviewed-exceptions" "$supply:policy" "$suppl
   grep -Fq 'PR_NUMBER: ${{ github.event.pull_request.number }}' <<<"$body"
 done
 # The gate always reports and needs every lane, so a failed or skipped scope
-# (a draft) or a cancelled lane fails it.
+# (a draft) or a cancelled lane fails it. Its check step runs unconditionally.
 gate="$(job_body "$lane" gate)"
 grep -Fxq '    if: always()' <<<"$gate"
 grep -Fxq '    needs: [scope, preflight, rust, mobile]' <<<"$gate"
 grep -Fq '*) echo "Selected lane ended with: $result"; exit 1 ;;' <<<"$gate"
+if grep -Eq '^      +(if|continue-on-error):' <<<"$gate"; then
+  echo "the promotion gate's check must run unconditionally and block" >&2
+  exit 1
+fi
 
 for workflow in lint.yml coverage.yml; do
   grep -A2 '^on:' ".github/workflows/$workflow" | grep -Fq 'workflow_dispatch:'
