@@ -1758,10 +1758,11 @@ async fn run_cluster(
         // download-only node's `[post]` (its password file above all) is
         // not what unpacks the cluster's jobs, so it downloads in full and
         // the post-processing node judges, as before.
-        cfg.cluster
-            .post_process
-            .then(|| archive_probe(&cfg))
-            .flatten(),
+        if cfg.cluster.post_process {
+            archive_probe(&cfg)
+        } else {
+            None
+        },
     )
     .await
     .map_err(with_fs_hint)?;
