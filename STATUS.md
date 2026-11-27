@@ -508,7 +508,7 @@ Third review pass (2026-11-11, on the latch probe and the remover):
 | job hold cause | `allocation` | timer: resumes when the resource returns; deadline → failed/hold_expired |
 | job hold cause | `mount_unavailable` | timer: mount re-checked every pass; deadline → failed/hold_expired |
 | job hold cause | `missing_tool` | timer: retry ladder; deadline → failed/hold_expired |
-| job hold cause | `password_required` (legacy, 2026-11-27) | boot conversion → failed/unpack; no longer written |
+| job hold cause | `password_required` (legacy, 2026-11-27) | boot conversion → failed/password; no longer written |
 | artifact | `allocating` | event: allocation commit; startup classifies an interrupted one (missing → source_gone, present → unowned adoption) |
 | artifact | `active` | event: the job finishes: delivery, failure policy, or retirement |
 | artifact | `active_unverified` | event: queue admission verifies it (→ active) or it stays an unowned adoption candidate |
@@ -1391,7 +1391,7 @@ Curator M2 depends on this landing first.
   `inject_terminal_crash` (test-support) proves the replay produces one
   history row and one event.
 - **Typed at the producer.** The closed `FailureReason` set is health · fetch
-  · par · unpack · script · publish · io · identity · hold_expired.
+  · par · unpack · password · script · publish · io · identity · hold_expired.
   - `fetch` carries `FetchCause` gone/indexer_unavailable (`fetch::cause_of`).
   - `blames_release` and `salvage_possible` are decided by the reason.
   - Producers:
@@ -1407,7 +1407,7 @@ Curator M2 depends on this landing first.
   - Every hold gets `deadline_unix`/`deadline_in_s` from `[post]
     hold_deadline_secs` (a day). (`password_hold_deadline_secs` is
     ignored since 2026-11-27: an archive no known password opens is
-    `failed/unpack`, not a hold.)
+    `failed/password`, not a hold.)
     Past the deadline the job fails `hold_expired`, even when the queue is
     paused.
   - At boot, persisted legacy holds convert to the matching terminal. This

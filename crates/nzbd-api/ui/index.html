@@ -5591,7 +5591,7 @@ function holdDeadlineLeftMs(hold, nowMs) {
 const FAILURE_REASONS = {
   health: "too few articles", fetch: "fetch failed", par: "PAR2 repair failed", unpack: "unpack failed",
   script: "script failed", publish: "publication failed", io: "disk error", identity: "conflicting data",
-  hold_expired: "hold expired",
+  hold_expired: "hold expired", password: "archive password unknown",
 };
 function fileHoldText(a) {
   if (!a.hold) return "";

@@ -3,7 +3,7 @@
 //! real provider, real writers, real owner, the configured extractor.
 //!
 //! * No known password opens it: the download stops after that volume and
-//!   the job ends `failed/unpack`, blaming the release — the outcome unpack
+//!   the job ends `failed/password`, blaming the release — the outcome unpack
 //!   would have reached after downloading everything.
 //! * The release's password opens it: it downloads and unpacks normally.
 use nzbd_engine::{Engine, EngineConfig, EngineHandle, Event, Tuning};
@@ -170,7 +170,8 @@ async fn encrypted_release_without_a_working_password_stops_after_its_first_volu
 
     assert_eq!(finished(&mut events, job).await, JobStatus::Failed);
     let terminal = engine.artifacts().terminal(job.0).unwrap().unwrap();
-    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Password));
+    assert_eq!(terminal.stage.as_deref(), Some("unpack"));
     assert!(terminal.blames_release);
     assert!(
         terminal

@@ -749,7 +749,7 @@ impl HoldCause {
             // An archive no known password opened. Earlier builds held it,
             // though nothing could ever supply the password; it is the
             // release's failure (contract §2.3, 2026-11-27).
-            "password_required" => Some(FailureReason::Unpack),
+            "password_required" => Some(FailureReason::Password),
             "post_failure" => Some(FailureReason::Publish),
             _ => None,
         }
@@ -798,10 +798,15 @@ pub enum FailureReason {
     Io,
     Identity,
     HoldExpired,
+    /// The release's archive is encrypted and no known password (the NZB's
+    /// own, then `[post] password_file`) opens it. Found by unpack, or
+    /// during download from the first archive volume. Stored and sent as
+    /// its snake_case name; a binary older than this one cannot read it.
+    Password,
 }
 
 impl FailureReason {
-    pub const ALL: [FailureReason; 9] = [
+    pub const ALL: [FailureReason; 10] = [
         FailureReason::Health,
         FailureReason::Fetch,
         FailureReason::Par,
@@ -811,6 +816,7 @@ impl FailureReason {
         FailureReason::Io,
         FailureReason::Identity,
         FailureReason::HoldExpired,
+        FailureReason::Password,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -823,6 +829,7 @@ impl FailureReason {
             FailureReason::Io => "io",
             FailureReason::Identity => "identity",
             FailureReason::HoldExpired => "hold_expired",
+            FailureReason::Password => "password",
         }
     }
     pub fn parse(s: &str) -> Option<FailureReason> {
@@ -841,6 +848,7 @@ impl FailureReason {
             FailureReason::Io => "FAILURE/IO",
             FailureReason::Identity => "FAILURE/IDENTITY",
             FailureReason::HoldExpired => "FAILURE/HOLD_EXPIRED",
+            FailureReason::Password => "FAILURE/PASSWORD",
         }
     }
     /// Legacy environmental-failure classification. Kept for API compatibility;
@@ -860,6 +868,7 @@ impl FailureReason {
             FailureReason::Health
             | FailureReason::Par
             | FailureReason::Unpack
+            | FailureReason::Password
             | FailureReason::Identity => true,
             FailureReason::Fetch => fetch_cause == Some(FetchCause::Gone),
             FailureReason::Script

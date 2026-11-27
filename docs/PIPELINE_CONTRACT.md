@@ -158,6 +158,7 @@ Rules, each with its reason:
 | `fetch` | `fetch` | NZB/URL fetch exhausted (URL fetcher, own site). Carries `fetch_cause`: `gone` (the indexer answered 404/410/403 for *this* item) or `indexer_unavailable` (a 429/503 whose Retry-After exceeds the 30-minute ladder — an exhausted indexer quota — ends the fetch at once with this cause; `fetch.rs` `quota_refusal`). That quota case also carries `retry_at_unix` (since 0.9.10): integer Unix seconds, the time of failure plus the indexer's Retry-After; it is null/absent on every other terminal, including an `indexer_unavailable` whose ladder ran out on transport failures or timeouts, and torrent metadata failures | **only when `cause: gone`** — an indexer outage must not blocklist healthy releases; curator re-queues the want after the indexer's `retry_at` (`retry_at_unix` when present, its own deferral otherwise) instead of grabbing an alternative | no | nothing to dispose |
 | `par` | `par_verify`/`par_repair` | repair impossible or budget exhausted (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `unpack` | `unpack` | extractor failed on the bytes, not the disk (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `password` | `unpack` | an encrypted archive no known password (the NZB's, then `[post] password_file`) opens: found by unpack, or during download from the first volume's password check (owner, `archive_probe`; the download stops there). History status `FAILURE/PASSWORD` | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `script` | `script` | post script non-zero (PP) | no | yes | `keep_failed_downloads` |
 | `publish` | `move`/`publication_verify` | nothing passes selection: unknown kind, missing proof, empty (PP) | no | yes if anything verified | `keep_failed_downloads`, after salvage settles |
 | `io` | any | write failure, digest/size mismatch, missing file, refused permission (owner or PP) | no | yes | `keep_failed_downloads`, after salvage settles |
@@ -219,9 +220,10 @@ params), so the hold could only wait out its deadline and end
 `hold_expired`, which does not blame the release, so curator never re-grabbed.
 Runner now tries the release's own password (`{{password}}` in the NZB name,
 else `<meta type="password">`) and `[post] password_file`. An archive none of
-them opens is `failed/unpack` (`blames_release`), which is what SABnzbd and
-NZBGet report. A persisted `password_required` control is a legacy terminal
-cause: the boot conversion ends it `failed/unpack`.
+them opens is `failed/password` (`blames_release`). Over the NZBGet API it
+reads `FAILURE/UNPACK` with `UnpackStatus: PASSWORD`, as NZBGet reports it. A
+persisted `password_required` control is a legacy terminal cause: the boot
+conversion ends it `failed/password`.
 
 - **Persisted legacy causes are converted at boot**, before any generic
   handling: a stored `*Control:v1` with cause `io`, `identity_conflict` or

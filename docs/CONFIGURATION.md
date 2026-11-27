@@ -425,10 +425,11 @@ hold_deadline_secs = 86400     # how long an environmental hold (storage down,
 `{{password}}` in the NZB name (`Show.S01E01{{secret}}.nzb`; the marker is
 removed from the job name), else the NZB's `<meta type="password">`. Then it
 tries each line of `password_file`. If none opens the archive, the job ends
-`failed/unpack`, which blames the release, so the consumer blocklists it and
-grabs another one. There is no hold: nothing could supply a password later,
+`failed/password` (history `FAILURE/PASSWORD`; NZBGet API `FAILURE/UNPACK`
+with `UnpackStatus: PASSWORD`). That blames the release, so the consumer
+blocklists it and grabs another one. There is no hold: nothing could supply a password later,
 and a job an earlier build held as `password_required` is converted to
-`failed/unpack` at startup. `password_hold_deadline_secs` is still accepted so
+`failed/password` at startup. `password_hold_deadline_secs` is still accepted so
 older files load, but it is ignored. With no password at all, an encrypted
 archive skips the forced PAR repair (repair cannot produce a password).
 
@@ -446,7 +447,7 @@ A header-encrypted volume gets a listing (`unrar l` / `7z l`); a RAR5
 check value gets a test (`unrar t`). If the tool refuses every password
 outright, the download stops right there. Outright means unrar exits 11 or
 says "password is incorrect", or 7z says "can not open encrypted archive".
-The job then ends `failed/unpack` as above, without fetching the rest of
+The job then ends `failed/password` as above, without fetching the rest of
 the release.
 
 This is SABnzbd's "abort on encrypted RAR". It is not a setting: it only

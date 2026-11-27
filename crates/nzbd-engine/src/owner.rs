@@ -7311,12 +7311,17 @@ impl Owner {
 
     /// End a download whose first archive volume is encrypted against
     /// every known password (`crate::archive_probe`): the terminal unpack
-    /// would reach, `failed/unpack`, now instead of after the rest.
+    /// would reach, `failed/password`, now instead of after the rest.
     fn abort_locked_archive(&mut self, job_id: JobId, message: &str) {
         if self.download_ending_early(job_id).is_none() {
             return; // already post-side or terminal: unpack judges it
         }
-        self.end_download_early(job_id, nzbd_types::FailureReason::Unpack, "unpack", message);
+        self.end_download_early(
+            job_id,
+            nzbd_types::FailureReason::Password,
+            "unpack",
+            message,
+        );
     }
 
     /// The job, while its download may still be ended early: not terminal

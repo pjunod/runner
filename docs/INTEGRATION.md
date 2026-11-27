@@ -345,7 +345,7 @@ event, never the provisional download completion.
 | `job`, `name`, `category` | the job |
 | `transfer` | `params["monarr-transfer"]`, or null for a job curator did not add |
 | `outcome` | `completed` · `failed` · `cancelled` |
-| `reason` | `failed` only: `health` · `fetch` · `par` · `unpack` · `script` · `publish` · `io` · `identity` · `hold_expired` (§2.2) |
+| `reason` | `failed` only: `health` · `fetch` · `par` · `unpack` · `password` · `script` · `publish` · `io` · `identity` · `hold_expired` (§2.2) |
 | `fetch_cause` | `fetch` only: `gone` · `indexer_unavailable` |
 | `retry_at_unix` | `fetch` / `indexer_unavailable` only, and only when the indexer's Retry-After (longer than the 30-minute ladder) ended the fetch: when the indexer may be asked again, integer Unix seconds (time of failure + Retry-After). Null otherwise (since 0.9.10) |
 | `stage` | `failed` only: a `PostStage` name, or `download` · `health` · `fetch` |
@@ -378,6 +378,7 @@ event, never the provisional download completion.
 | `fetch` | `fetch` | NZB/URL fetch failed (URL fetcher); `fetch_cause` `gone` (the indexer answered 404/410/403 or another non-retried status for this item) or `indexer_unavailable` (retries exhausted on 429/503, timeouts, transport, or at once on a 429/503 whose Retry-After exceeds the ladder — that one also carries `retry_at_unix`) | only for `gone` | no | nothing to dispose |
 | `par` | `par_verify`/`par_repair` | repair impossible (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `unpack` | `unpack` | the extractor failed on the bytes (PP) | yes | yes | `keep_failed_downloads`, after salvage settles |
+| `password` | `unpack` | an encrypted archive no known password opens (PP unpack, or the owner during download from the first volume's password check) | yes | yes | `keep_failed_downloads`, after salvage settles |
 | `script` | `script` | post script exited non-zero (PP) | no | yes | `keep_failed_downloads` |
 | `publish` | `move`/`publication_verify` | nothing passes selection (PP) | no | yes | `keep_failed_downloads`, after salvage settles |
 | `io` | any | a write or filesystem step failed in a way retrying cannot fix (owner or PP) | no | yes | `keep_failed_downloads`, after salvage settles |
@@ -385,7 +386,7 @@ event, never the provisional download completion.
 | `hold_expired` | the hold's stage | an environmental hold passed its deadline (§2.3) | no | yes | `keep_failed_downloads`, after salvage settles |
 
 History status strings, per reason: `FAILURE/HEALTH` · `FAILURE/FETCH` ·
-`PAR_FAILURE` · `UNPACK_FAILURE` · `SCRIPT_FAILURE` · `FAILURE/PUBLISH` ·
+`PAR_FAILURE` · `UNPACK_FAILURE` · `FAILURE/PASSWORD` · `SCRIPT_FAILURE` · `FAILURE/PUBLISH` ·
 `FAILURE/IO` · `FAILURE/IDENTITY` · `FAILURE/HOLD_EXPIRED`; success is
 `SUCCESS…`, an operator delete `DELETED`.
 
@@ -399,7 +400,7 @@ read-only (`EROFS` — ext4 `errors=remount-ro`, an export flipped read-only;
 both heal on remount) → `storage_unavailable` (SQLite `SQLITE_FULL` →
 `capacity`); a missing tool → `missing_tool`; an unavailable engine →
 `engine_unavailable`; a replaced or absent mount → `mount_unavailable`. An
-archive that no known password opens is not a hold: it ends `failed/unpack`
+archive that no known password opens is not a hold: it ends `failed/password`
 (§2.2; see CONFIGURATION.md, *Encrypted archives*). The
 errno is read from the `io::Error` (`raw_os_error()`, or the error it wraps)
 wherever one exists, and from its kind when only the kind survived; only a
@@ -421,7 +422,7 @@ purposes.
 A held job is waiting on something environmental: `storage_unavailable` ·
 `capacity` · `quota` · `allocation` · `mount_unavailable` · `missing_tool` ·
 `engine_unavailable`. (`password_required` is legacy: a build before
-2026-11-27 wrote it; startup converts such a job to `failed/unpack`.) It is
+2026-11-27 wrote it; startup converts such a job to `failed/password`.) It is
 visible as
 `status: "held"` (and `status_projected: "held"`) on `/api/v1/jobs` and
 `status: "held"` on `job_status_changed`, with `control.lifecycle == "held"`.

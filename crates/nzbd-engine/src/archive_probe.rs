@@ -1,6 +1,6 @@
 //! Early encrypted-archive verdicts (the download-time half of unpack).
 //!
-//! An encrypted release that no known password opens ends `failed/unpack`
+//! An encrypted release that no known password opens ends `failed/password`
 //! once post-processing reaches it. Every byte downloaded after its first
 //! archive volume is waste: the verdict is already decided by that volume.
 //! SABnzbd aborts such a job during download (`pause_on_pwrar`); this is
@@ -14,7 +14,7 @@
 //! inspection (the same scoped, fenced read that learns a job's name from
 //! its par2 index), and a [`ArchiveVerdict::Locked`] answer ends the
 //! download through the owner's ordinary early-failure path: writers
-//! retired, connections released, terminal `failed/unpack` recorded.
+//! retired, connections released, terminal `failed/password` recorded.
 use std::path::Path;
 
 use tokio_util::sync::CancellationToken;
@@ -40,7 +40,7 @@ pub enum ArchiveVerdict {
     /// volume alone cannot judge. Unpack decides; stop asking for this job.
     Opens,
     /// An encrypted archive that every known password was refused by.
-    /// Unpack would end the job `failed/unpack` with this message.
+    /// Unpack would end the job `failed/password` with this message.
     Locked(String),
 }
 
