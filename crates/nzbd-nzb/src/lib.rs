@@ -28,6 +28,25 @@ pub struct NzbMeta {
     pub category: Option<String>,
 }
 
+/// The release-password convention SABnzbd and NZBGet share: a password
+/// carried in the NZB's name as `Name{{password}}` (usually followed by
+/// `.nzb`). Returns the name without the marker and the password, if the
+/// name carries a non-empty one.
+pub fn split_name_password(name: &str) -> (String, Option<String>) {
+    if let Some(open) = name.find("{{") {
+        if let Some(len) = name[open + 2..].find("}}") {
+            let close = open + 2 + len;
+            let password = &name[open + 2..close];
+            if !password.is_empty() {
+                let mut rest = name[..open].trim_end().to_string();
+                rest.push_str(&name[close + 2..]);
+                return (rest, Some(password.to_string()));
+            }
+        }
+    }
+    (name.to_string(), None)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSegment {
     /// Message-id without angle brackets.
@@ -282,6 +301,27 @@ mod tests {
     </segments>
   </file>
 </nzb>"#;
+
+    #[test]
+    fn name_password_convention() {
+        assert_eq!(
+            split_name_password("Show.S01E01{{pw1}}.nzb"),
+            ("Show.S01E01.nzb".into(), Some("pw1".into()))
+        );
+        assert_eq!(
+            split_name_password("Show.S01E01 {{a b}}"),
+            ("Show.S01E01".into(), Some("a b".into()))
+        );
+        assert_eq!(
+            split_name_password("Show{{}}.nzb"),
+            ("Show{{}}.nzb".into(), None)
+        );
+        assert_eq!(
+            split_name_password("Show{{open.nzb"),
+            ("Show{{open.nzb".into(), None)
+        );
+        assert_eq!(split_name_password("Show.nzb"), ("Show.nzb".into(), None));
+    }
 
     #[test]
     fn parses_sample() {
