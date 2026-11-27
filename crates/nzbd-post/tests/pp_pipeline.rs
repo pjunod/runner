@@ -2019,11 +2019,11 @@ async fn encrypted_job(tmp: &Path, release_password: &str) -> EngineHandle {
     engine
 }
 
-/// An archive no known password opens ends `failed/unpack` (blaming the
+/// An archive no known password opens ends `failed/password` (blaming the
 /// release, so the consumer re-grabs) on the first pass — never a hold that
 /// waits for a password nothing can supply.
 #[tokio::test]
-async fn encrypted_archive_without_a_working_password_fails_unpack_not_held() {
+async fn encrypted_archive_without_a_working_password_fails_password_not_held() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = encrypted_job(tmp.path(), "wrong").await;
     let tool = encrypted_archive_tool(tmp.path());
@@ -2042,9 +2042,10 @@ async fn encrypted_archive_without_a_working_password_fails_unpack_not_held() {
     )
     .await
     .unwrap();
-    assert_eq!(out, PpFinal::UnpackFailure);
+    assert_eq!(out, PpFinal::PasswordFailure);
     let terminal = engine.artifacts().terminal(1).unwrap().unwrap();
-    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Password));
+    assert_eq!(terminal.stage.as_deref(), Some("unpack"));
     assert!(terminal.blames_release);
     assert!(
         terminal
@@ -2119,10 +2120,16 @@ async fn unreadable_password_file_does_not_blame_the_release() {
         JobId(1),
     )
     .await;
-    assert!(!matches!(out, Ok(PpFinal::UnpackFailure)), "{out:?}");
+    assert!(
+        !matches!(out, Ok(PpFinal::UnpackFailure | PpFinal::PasswordFailure)),
+        "{out:?}"
+    );
     if let Some(terminal) = engine.artifacts().terminal(1).unwrap() {
         assert!(!terminal.blames_release);
-        assert_ne!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+        assert!(!matches!(
+            terminal.reason,
+            Some(nzbd_types::FailureReason::Unpack | nzbd_types::FailureReason::Password)
+        ));
     }
     engine.shutdown().await;
 }

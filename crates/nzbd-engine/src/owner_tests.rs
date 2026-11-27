@@ -3730,11 +3730,11 @@ fn rearm_reclassifies_by_errno_and_derives_policy() {
     )
     .is_none());
     // A pre-2026-11-27 password hold is a legacy terminal: left for the
-    // boot conversion, which ends it `failed/unpack` (contract §2.3).
+    // boot conversion, which ends it `failed/password` (contract §2.3).
     assert!(rearmed_hold(hold("password_required", "resume_same_job", "x"), 1000).is_none());
     assert_eq!(
         nzbd_types::HoldCause::legacy_terminal("password_required"),
-        Some(nzbd_types::FailureReason::Unpack)
+        Some(nzbd_types::FailureReason::Password)
     );
     // Capacity used to carry no time.
     assert_eq!(

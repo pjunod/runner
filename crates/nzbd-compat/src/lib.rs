@@ -125,6 +125,9 @@ fn history_status(native: &str) -> &str {
         "SUCCESS" => "SUCCESS/ALL",
         "PAR_FAILURE" => "FAILURE/PAR",
         "UNPACK_FAILURE" => "FAILURE/UNPACK",
+        // NZBGet reports an archive no password opens as an unpack failure
+        // whose `UnpackStatus` is `PASSWORD` (see `history_json`).
+        "FAILURE/PASSWORD" => "FAILURE/UNPACK",
         "SCRIPT_FAILURE" => "WARNING/SCRIPT",
         other => other, // already TOTAL/DETAIL shaped ("FAILURE/HEALTH", "DELETED/MANUAL")
     }
@@ -164,6 +167,7 @@ fn history_json(e: &HistoryEntry) -> Value {
             _ => "NONE",
         },
         "UnpackStatus": match status {
+            "FAILURE/UNPACK" if e.status == "FAILURE/PASSWORD" => "PASSWORD",
             "FAILURE/UNPACK" => "FAILURE",
             "SUCCESS/ALL" => "SUCCESS",
             _ => "NONE",
@@ -1191,6 +1195,41 @@ pub fn router(state: CompatState) -> Router {
 mod tests {
     use super::*;
     use nzbd_engine::{Engine, EngineConfig, Tuning};
+
+    /// NZBGet reports an archive no password opens as an unpack failure
+    /// whose `UnpackStatus` is `PASSWORD`; *arr clients read it that way.
+    #[test]
+    fn password_failure_reads_as_nzbget_unpack_password() {
+        let entry = |status: &str| HistoryEntry {
+            job: JobId(7),
+            name: "locked".into(),
+            category: None,
+            final_dir: None,
+            status: status.into(),
+            size: 1,
+            health: 1000,
+            params: vec![],
+            dupe_key: String::new(),
+            dupe_score: 0,
+            completed_at_unix: 1,
+            hidden: false,
+            first_seen_at_unix: None,
+            last_seen_at_unix: None,
+            seen_count: 0,
+            removed_at_unix: None,
+            picked_up_by: None,
+            record: None,
+            stages: Vec::new(),
+            seq: 0,
+        };
+        let locked = history_json(&entry("FAILURE/PASSWORD"));
+        assert_eq!(locked["Status"], "FAILURE/UNPACK");
+        assert_eq!(locked["TotalStatus"], "FAILURE");
+        assert_eq!(locked["UnpackStatus"], "PASSWORD");
+        let damaged = history_json(&entry("UNPACK_FAILURE"));
+        assert_eq!(damaged["Status"], "FAILURE/UNPACK");
+        assert_eq!(damaged["UnpackStatus"], "FAILURE");
+    }
 
     async fn test_state(tmp: &tempfile::TempDir) -> CompatState {
         std::fs::create_dir_all(tmp.path().join("dest")).unwrap();

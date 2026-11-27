@@ -208,6 +208,8 @@ pub enum PpFinal {
     Success,
     ParFailure,
     UnpackFailure,
+    /// Unpack failed only because no known password opened an archive.
+    PasswordFailure,
     ScriptFailure,
     HealthFailure,
     FetchFailure,
@@ -219,6 +221,7 @@ impl PpFinal {
             PpFinal::Success => "SUCCESS",
             PpFinal::ParFailure => "PAR_FAILURE",
             PpFinal::UnpackFailure => "UNPACK_FAILURE",
+            PpFinal::PasswordFailure => "FAILURE/PASSWORD",
             PpFinal::ScriptFailure => "SCRIPT_FAILURE",
             PpFinal::HealthFailure => "FAILURE/HEALTH",
             PpFinal::FetchFailure => "FAILURE/FETCH",
@@ -3835,6 +3838,7 @@ async fn record_resumed_terminal(
         "SUCCESS" => PpFinal::Success,
         "PAR_FAILURE" => PpFinal::ParFailure,
         "UNPACK_FAILURE" => PpFinal::UnpackFailure,
+        "FAILURE/PASSWORD" => PpFinal::PasswordFailure,
         "SCRIPT_FAILURE" => PpFinal::ScriptFailure,
         "FAILURE/HEALTH" => PpFinal::HealthFailure,
         "FAILURE/FETCH" => PpFinal::FetchFailure,
@@ -4671,7 +4675,14 @@ async fn process_job_ctx_from_inner(
     } else if !par_ok {
         PpFinal::ParFailure
     } else if !unpack_ok {
-        PpFinal::UnpackFailure
+        // Every archive that failed was refused its passwords: the cause is
+        // the password, not the bytes. Any other failure is plain unpack.
+        if !password_required_archive_paths.is_empty() && terminal_unusable_archive_paths.is_empty()
+        {
+            PpFinal::PasswordFailure
+        } else {
+            PpFinal::UnpackFailure
+        }
     } else if !script_ok {
         PpFinal::ScriptFailure
     } else {
@@ -5498,6 +5509,11 @@ fn pp_failure(
             FailureReason::Unpack,
             "unpack",
             "the extractor failed on the downloaded archive".into(),
+        ),
+        PpFinal::PasswordFailure => (
+            FailureReason::Password,
+            "unpack",
+            ENCRYPTED_ARCHIVE_DIAGNOSTIC.into(),
         ),
         PpFinal::ScriptFailure => (
             FailureReason::Script,

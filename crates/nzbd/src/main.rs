@@ -278,7 +278,7 @@ fn advertise(port: u16, name: Option<String>, tls: bool, auth: String) -> anyhow
 
 /// Map `[post]` config onto the PP manager's runtime config.
 /// Post-processing's early verdict on finished archive volumes: an
-/// encrypted release no known password opens ends `failed/unpack` after its
+/// encrypted release no known password opens ends `failed/password` after its
 /// first volume instead of after the whole download. Nothing to judge when
 /// post-processing (and so unpack) is off on this node.
 fn archive_probe(
