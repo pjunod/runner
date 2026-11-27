@@ -34,7 +34,7 @@ consequence of those three.
 | **job** | one runner download attempt, `JobId` | a release, a title |
 | **transfer** | curator's request token — an **opaque string compared by exact equality** (today `t-<rowID or 0>-<32 hex>`, 16 random bytes, minted before the row may have an id, `ports/transfer.go:12`; deployed values must be preserved as-is), runner job param `monarr-transfer`, cinema `correlation_id`. **Every fact about a job carries it, and a fact whose transfer does not match the row is dropped** (§3.2) | a parseable structure; a row id |
 | **terminal** | `completed`, `failed` or `cancelled`, **authored by runner**. Emitted once, never revised. A terminal curator writes on its own (`submit`, `lost`, `stalled`) is *provisional* and yields to any later runner fact (§3.2) | held, paused, retrying |
-| **held** | runner is waiting on something *environmental* that will come back (storage, space, a password) with a deadline after which **runner** ends it as `failed/hold_expired` | a post-processing error; something curator decides |
+| **held** | runner is waiting on something *environmental* that will come back (storage, space, a mount, a tool) with a deadline after which **runner** ends it as `failed/hold_expired` | a post-processing error; something curator decides |
 | **publication** | a directory under `<completed>/` named `<name>.job-<id>.runner-<gen>` containing only selected files **and** `.runner-manifest.json`, written last as the commit marker. A directory without the manifest is not a publication — curator ignores it, runner's restart reconciliation finishes or unwinds it (§2.5). **During the rollout a v1 delivery record is an equivalent manifest** (§6) | runner's processing dir |
 | **publication generation** | `<gen>` — the unit curator imports, notifies and cleans up. One download row may have several (the completed one, a salvage, a late one); each has its own lifecycle (§3.4) | the download row |
 | **manifest** | the immutable file list + per-file size + SHA-256 + generation | an acknowledgement |
@@ -211,7 +211,17 @@ promise.
 
 `HoldCause` shrinks to the causes that heal without a code change:
 `storage_unavailable · capacity · quota · allocation · mount_unavailable ·
-missing_tool · engine_unavailable · password_required`.
+missing_tool · engine_unavailable`.
+
+*(2026-11-27)* `password_required` is no longer a hold. No surface can
+supply an archive password after admission (every client path rejects `*`
+params), so the hold could only wait out its deadline and end
+`hold_expired`, which does not blame the release, so curator never re-grabbed.
+Runner now tries the release's own password (`{{password}}` in the NZB name,
+else `<meta type="password">`) and `[post] password_file`. An archive none of
+them opens is `failed/unpack` (`blames_release`), which is what SABnzbd and
+NZBGet report. A persisted `password_required` control is a legacy terminal
+cause: the boot conversion ends it `failed/unpack`.
 
 - **Persisted legacy causes are converted at boot**, before any generic
   handling: a stored `*Control:v1` with cause `io`, `identity_conflict` or
@@ -232,8 +242,7 @@ missing_tool · engine_unavailable · password_required`.
   `stage`, `retry_policy`, `next_retry_at_unix`, `blocked_since_unix`,
   `message`), plus `deadline_in_s` (seconds remaining, relative — hosts do
   not share a clock) and `deadline_unix` for display.
-- has a **deadline** — `[post] hold_deadline_secs` (default `86400`;
-  `password_hold_deadline_secs` default `604800`) — after which **runner** ends the job
+- has a **deadline** — `[post] hold_deadline_secs` (default `86400`) — after which **runner** ends the job
   `failed/hold_expired` with the hold's message, bytes disposed per §2.2. Curator never
   authors `hold_expired` (§3.2): during a partition runner may recover the
   hold and complete the job, and a curator-side guess would then contradict

@@ -5576,7 +5576,7 @@ function fileIsTerminal(a) { return a.state === "deleted" || a.state === "source
 const HOLD_CAUSES = {
   storage_unavailable: "storage unavailable", capacity: "out of space", quota: "quota reached",
   allocation: "allocation failed", mount_unavailable: "mount unavailable", missing_tool: "tool missing",
-  engine_unavailable: "engine unavailable", password_required: "password required",
+  engine_unavailable: "engine unavailable",
 };
 function holdCauseLabel(cause) { return HOLD_CAUSES[cause] || cause || "held"; }
 // Time left on a hold. `deadline_unix` gives a live countdown against this

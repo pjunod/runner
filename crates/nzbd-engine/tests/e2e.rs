@@ -2333,9 +2333,9 @@ async fn public_resume_releases_allocation_and_identity_holds() {
     assert!(engine
         .hold_job(
             job,
-            nzbd_types::HoldCause::PasswordRequired,
+            nzbd_types::HoldCause::MissingTool,
             "extract",
-            "password required",
+            "unrar not found",
         )
         .await
         .unwrap());

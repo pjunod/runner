@@ -398,8 +398,9 @@ failure, only when its errno says the environment will heal: `ENOSPC` →
 read-only (`EROFS` — ext4 `errors=remount-ro`, an export flipped read-only;
 both heal on remount) → `storage_unavailable` (SQLite `SQLITE_FULL` →
 `capacity`); a missing tool → `missing_tool`; an unavailable engine →
-`engine_unavailable`; a wrong or missing archive password →
-`password_required`; a replaced or absent mount → `mount_unavailable`. The
+`engine_unavailable`; a replaced or absent mount → `mount_unavailable`. An
+archive that no known password opens is not a hold: it ends `failed/unpack`
+(§2.2; see CONFIGURATION.md, *Encrypted archives*). The
 errno is read from the `io::Error` (`raw_os_error()`, or the error it wraps)
 wherever one exists, and from its kind when only the kind survived; only a
 subprocess's stderr is read as text (`nzbd_engine::stderr_hold_cause`).
@@ -419,7 +420,9 @@ purposes.
 
 A held job is waiting on something environmental: `storage_unavailable` ·
 `capacity` · `quota` · `allocation` · `mount_unavailable` · `missing_tool` ·
-`engine_unavailable` · `password_required`. It is visible as
+`engine_unavailable`. (`password_required` is legacy: a build before
+2026-11-27 wrote it; startup converts such a job to `failed/unpack`.) It is
+visible as
 `status: "held"` (and `status_projected: "held"`) on `/api/v1/jobs` and
 `status: "held"` on `job_status_changed`, with `control.lifecycle == "held"`.
 Since 0.6.0 `held` is the persisted status: a job is `held` exactly while
@@ -452,7 +455,7 @@ retention validators still apply.
   every 5 m (`HOLD_RETRY_DELAYS_SECONDS`, jittered). Storage holds use
   the shorter delays described below. The owner schedules held work.
 - **A deadline runner enforces.** `[post] hold_deadline_secs` (default
-  `86400`; `password_hold_deadline_secs`, default `604800`) after the episode
+  `86400`) after the episode
   began, runner ends the job `failed/hold_expired`; bytes follow the retention
   preference. Curator
   never authors that terminal. `deadline_in_s` is the time remaining as of
