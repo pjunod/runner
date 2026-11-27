@@ -313,6 +313,11 @@ fn post_config(
         par_fetch_timeout: Duration::from_secs(cfg.post.par_fetch_timeout_secs.max(1)),
         categories: category_rules(cfg),
         stats,
+        password_file: cfg
+            .post
+            .password_file
+            .as_ref()
+            .map(|p| nzbd_config::expand_home(p)),
     }
 }
 
@@ -396,7 +401,6 @@ fn engine_tuning(cfg: &nzbd_config::Config) -> Tuning {
         quota_start_day: cfg.queue.quota_start_day.clamp(1, 28),
         health_abort: true,
         hold_deadline: Duration::from_secs(cfg.post.hold_deadline_secs.max(1)),
-        password_hold_deadline: Duration::from_secs(cfg.post.password_hold_deadline_secs.max(1)),
         ..Tuning::default()
     }
 }

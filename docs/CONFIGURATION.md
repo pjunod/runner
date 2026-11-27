@@ -414,9 +414,23 @@ par_fetch_timeout_secs = 600   # wait for delayed par files during repair
 hold_deadline_secs = 86400     # how long an environmental hold (storage down,
                                # disk full, quota, missing tool, mount gone…)
                                # may last before the job fails `hold_expired`
-password_hold_deadline_secs = 604800   # the same, for an archive waiting on
-                               # a password (a person has to act, so longer)
+# password_file = "/data/usenet/passwords.txt"  # candidate archive passwords,
+                               # one per line, tried after the release's own
+                               # (NZBGet UnpackPassFile); read only when that
+                               # is rejected. Unreadable → a storage hold or
+                               # failed/io, never a blamed release
 ```
+
+**Encrypted archives.** Runner tries the release's own password first: a
+`{{password}}` in the NZB name (`Show.S01E01{{secret}}.nzb`; the marker is
+removed from the job name), else the NZB's `<meta type="password">`. Then it
+tries each line of `password_file`. If none opens the archive, the job ends
+`failed/unpack`, which blames the release, so the consumer blocklists it and
+grabs another one. There is no hold: nothing could supply a password later,
+and a job an earlier build held as `password_required` is converted to
+`failed/unpack` at startup. `password_hold_deadline_secs` is still accepted so
+older files load, but it is ignored. With no password at all, an encrypted
+archive skips the forced PAR repair (repair cannot produce a password).
 
 **Failure disposition.** `[post] keep_failed_downloads` defaults to `false`:
 Runner deletes failed payload after salvage and cleanup custody settle. Set it

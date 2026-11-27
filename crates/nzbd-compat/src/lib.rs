@@ -545,6 +545,10 @@ fn listgroups_json(state: &CompatState) -> Value {
 /// Content)`. Returns the NZBID, or 0 on failure (NZBGet's convention).
 async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'static str)> {
     let filename = p_str(params, 0);
+    // The name may carry the release password (`Name{{password}}.nzb`).
+    // Admission takes it from `filename`; everything else here — logs and
+    // the duplicate-reject history row — sees the name without it.
+    let shown = nzbd_nzb::split_name_password(&filename).0;
     // Which positional form? v13+ carries content at [1]; legacy at [4].
     let (content, category, priority, add_paused, dupe) = match classify_content(&p_str(params, 1))
     {
@@ -564,7 +568,7 @@ async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'st
         ),
     };
     let Some(content) = content else {
-        tracing::warn!(%filename, "append: content is neither base64 NZB, raw XML, nor a URL");
+        tracing::warn!(filename = %shown, "append: content is neither base64 NZB, raw XML, nor a URL");
         return Ok(json!(0));
     };
     let category = (!category.is_empty()).then_some(category);
@@ -573,8 +577,8 @@ async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'st
     // a same-key job in the queue blocks the add (mode-dependent).
     if let Some(d) = &dupe {
         if is_duplicate(state, d).await {
-            tracing::info!(%filename, key = %d.key, "append rejected: duplicate");
-            record_dupe_reject(state, &filename, d).await;
+            tracing::info!(filename = %shown, key = %d.key, "append rejected: duplicate");
+            record_dupe_reject(state, &shown, d).await;
             return Ok(json!(0));
         }
     }
@@ -596,7 +600,7 @@ async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'st
             match state.engine.add_nzb_opts(&filename, &bytes, opts).await {
                 Ok(id) => Ok(json!(id.0)),
                 Err(e) => {
-                    tracing::warn!(%filename, error = %e, "append failed");
+                    tracing::warn!(filename = %shown, error = %e, "append failed");
                     Ok(json!(0))
                 }
             }
@@ -617,7 +621,7 @@ async fn append(state: &CompatState, params: &Value) -> Result<Value, (i64, &'st
             match state.engine.add_url(&filename, &url, opts).await {
                 Ok(id) => Ok(json!(id.0)),
                 Err(e) => {
-                    tracing::warn!(%filename, error = %e, "append(url) failed");
+                    tracing::warn!(filename = %shown, error = %e, "append(url) failed");
                     Ok(json!(0))
                 }
             }

@@ -1976,6 +1976,183 @@ async fn a_multi_volume_archive_extracts_whole_or_fails() {
     }
 }
 
+/// A 7-Zip stand-in for an encrypted archive: it opens only with `-pright`,
+/// says "Wrong password" for anything else, and logs each password it saw.
+fn encrypted_archive_tool(root: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("encrypted-archive-tool");
+    let log = root.join("passwords-tried");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\npw=; out=\nfor a; do case \"$a\" in -p*) pw=\"${{a#-p}}\";; -o*) out=\"${{a#-o}}\";; esac; done\n\
+             echo \"$pw\" >> '{}'\n\
+             if [ \"$pw\" = right ]; then mkdir -p \"$out\"; printf movie > \"$out/movie.mkv\"; echo 'Everything is Ok'; exit 0; fi\n\
+             echo 'ERROR: Wrong password : secret.7z' >&2\nexit 2\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+async fn encrypted_job(tmp: &Path, release_password: &str) -> EngineHandle {
+    let engine = spawn_engine(tmp).await;
+    let dir = tmp.join("dest/encjob");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = b"7z encrypted bytes";
+    std::fs::write(dir.join("secret.7z"), bytes).unwrap();
+    let mut job = completed_job(
+        1,
+        "encjob",
+        vec![file_entry(1, "secret.7z", Some(crc(bytes)), false)],
+    );
+    job.params.push((
+        nzbd_engine::queue::UNPACK_PASSWORD_PARAM.into(),
+        release_password.into(),
+    ));
+    engine
+        .import_fixture_job(tmp, job, false, false)
+        .await
+        .unwrap();
+    engine
+}
+
+/// An archive no known password opens ends `failed/unpack` (blaming the
+/// release, so the consumer re-grabs) on the first pass — never a hold that
+/// waits for a password nothing can supply.
+#[tokio::test]
+async fn encrypted_archive_without_a_working_password_fails_unpack_not_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = encrypted_job(tmp.path(), "wrong").await;
+    let tool = encrypted_archive_tool(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig {
+            unrar_cmd: tool.clone(),
+            sevenzip_cmd: tool,
+            failure_action: FailureAction::Delete,
+            deobfuscate_final: false,
+            ..PostConfig::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::UnpackFailure);
+    let terminal = engine.artifacts().terminal(1).unwrap().unwrap();
+    assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    assert!(terminal.blames_release);
+    assert!(
+        terminal
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("encrypted")),
+        "{:?}",
+        terminal.message
+    );
+    let job = engine.export_fixture_job(JobId(1)).await.unwrap().unwrap();
+    assert!(!job.held());
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("passwords-tried")).unwrap(),
+        "wrong\n",
+        "one extraction per candidate"
+    );
+    engine.shutdown().await;
+}
+
+/// The release's own password is tried first, then `password_file` in
+/// order (duplicates and blank lines skipped); the first that opens the
+/// archive wins.
+#[tokio::test]
+async fn encrypted_archive_opens_with_a_password_file_candidate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = encrypted_job(tmp.path(), "fromnzb").await;
+    let tool = encrypted_archive_tool(tmp.path());
+    let file = tmp.path().join("passwords.txt");
+    std::fs::write(&file, "fromnzb\n\nother\r\nright\nnever\n").unwrap();
+    let out = process_job(
+        &engine,
+        &PostConfig {
+            unrar_cmd: tool.clone(),
+            sevenzip_cmd: tool,
+            deobfuscate_final: false,
+            password_file: Some(file),
+            ..PostConfig::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::Success);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("passwords-tried")).unwrap(),
+        "fromnzb\nother\nright\n"
+    );
+    engine.shutdown().await;
+}
+
+/// A password file this host cannot read is this host's problem: the
+/// release must not be blamed (blocklisted) for it.
+#[tokio::test]
+async fn unreadable_password_file_does_not_blame_the_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = encrypted_job(tmp.path(), "wrong").await;
+    let tool = encrypted_archive_tool(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig {
+            unrar_cmd: tool.clone(),
+            sevenzip_cmd: tool,
+            failure_action: FailureAction::Delete,
+            deobfuscate_final: false,
+            password_file: Some(tmp.path().join("missing-passwords.txt")),
+            ..PostConfig::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(1),
+    )
+    .await;
+    assert!(!matches!(out, Ok(PpFinal::UnpackFailure)), "{out:?}");
+    if let Some(terminal) = engine.artifacts().terminal(1).unwrap() {
+        assert!(!terminal.blames_release);
+        assert_ne!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    }
+    engine.shutdown().await;
+}
+
+/// An unencrypted archive never reads the password file, so a broken one
+/// cannot fail a release that needs no password.
+#[tokio::test]
+async fn unencrypted_archive_ignores_an_unreadable_password_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = encrypted_job(tmp.path(), "right").await;
+    let tool = encrypted_archive_tool(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig {
+            unrar_cmd: tool.clone(),
+            sevenzip_cmd: tool,
+            deobfuscate_final: false,
+            password_file: Some(tmp.path().join("missing-passwords.txt")),
+            ..PostConfig::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::Success);
+    engine.shutdown().await;
+}
+
 /// A real UNPACK_FAILURE must still publish independently verified direct
 /// media from the same failed attempt. The bad pack remains in the separate
 /// Runner source generation with a concrete retained outcome; it must never

@@ -760,6 +760,10 @@ impl QueueState {
         self.next_job_id += 1;
         let job_id = JobId(self.next_job_id);
         let category = category.or_else(|| parsed.meta.category.clone());
+        let (name, name_password) = nzbd_nzb::split_name_password(&name);
+        let params = admission_password(name_password, parsed)
+            .map(|password| vec![(UNPACK_PASSWORD_PARAM.to_string(), password)])
+            .unwrap_or_default();
         let files = self.build_files(parsed, pause_extra_pars);
 
         let dir_name = self.unique_dir_name(job_id, sanitize_name(&name));
@@ -775,7 +779,7 @@ impl QueueState {
             category,
             priority,
             dupe: DupeInfo::default(),
-            params: Vec::new(),
+            params,
             files,
             totals: Default::default(),
             status: JobStatus::Queued,
@@ -834,6 +838,11 @@ impl QueueState {
     ) -> JobId {
         self.next_job_id += 1;
         let job_id = JobId(self.next_job_id);
+        let (name, name_password) = nzbd_nzb::split_name_password(&name);
+        let mut params = vec![("*URL".into(), url.to_string())];
+        if let Some(password) = name_password {
+            params.push((UNPACK_PASSWORD_PARAM.to_string(), password));
+        }
         let dir_name = self.unique_dir_name(job_id, sanitize_name(&name));
         self.jobs.push(Job {
             id: job_id,
@@ -847,7 +856,7 @@ impl QueueState {
             category,
             priority,
             dupe: DupeInfo::default(),
-            params: vec![("*URL".into(), url.to_string())],
+            params,
             files: Vec::new(),
             totals: Default::default(),
             status: JobStatus::Fetching,
@@ -874,6 +883,18 @@ impl QueueState {
         }
         if job.category.is_none() {
             job.category = meta_category;
+        }
+        // A password in the job's name was taken at admission and is the
+        // more specific claim; otherwise the NZB's own `<meta>` supplies it.
+        if !job
+            .params
+            .iter()
+            .any(|(key, _)| key == UNPACK_PASSWORD_PARAM)
+        {
+            if let Some(password) = admission_password(None, parsed) {
+                job.params
+                    .push((UNPACK_PASSWORD_PARAM.to_string(), password));
+            }
         }
         // URL jobs were named from the URL tail; re-clean now that the
         // NZB's own metadata (meta title, par2 set name) is available.
@@ -1167,6 +1188,25 @@ fn url_host(url: &str) -> Option<String> {
 /// Reserved (`*`-prefixed) like `*URL`, so a client cannot set it on
 /// itself through the public params surface.
 pub const CLIENT_PARAM: &str = "*Client";
+
+/// The archive password post-processing hands the extractor (NZBGet's
+/// name). Reserved like [`CLIENT_PARAM`]: Runner sets it at admission from
+/// the release's own documents, and no client can write or read it back.
+pub const UNPACK_PASSWORD_PARAM: &str = "*Unpack:Password";
+
+/// The password a release brings with it, by the convention SABnzbd and
+/// NZBGet share: `Name{{password}}` in the job name (already split off by
+/// the caller) wins over the NZB's `<meta type="password">`.
+fn admission_password(name_password: Option<String>, parsed: &ParsedNzb) -> Option<String> {
+    name_password.or_else(|| {
+        parsed
+            .meta
+            .password
+            .as_ref()
+            .map(|password| password.trim().to_string())
+            .filter(|password| !password.is_empty())
+    })
+}
 
 /// Adopt a better name.
 ///
@@ -2938,6 +2978,51 @@ mod tests {
             "accumulate largest-first"
         );
         assert_eq!(pick_par_files(&c, 100).len(), 4, "take everything if short");
+    }
+
+    fn unpack_password(job: &Job) -> Option<&str> {
+        job.params
+            .iter()
+            .find(|(key, _)| key == UNPACK_PASSWORD_PARAM)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn admission_takes_the_release_password_from_name_then_meta() {
+        let mut q = QueueState::default();
+        let mut nzb = nzb_with(&["a.rar"], None);
+        nzb.meta.password = Some(" metapw ".into());
+        let id = q.admit_nzb("Show.S01E01".into(), &nzb, None, 0, true);
+        assert_eq!(unpack_password(q.job(id).unwrap()), Some("metapw"));
+
+        let id = q.admit_nzb("Show.S01E02{{namepw}}".into(), &nzb, None, 0, true);
+        let job = q.job(id).unwrap();
+        assert_eq!(unpack_password(job), Some("namepw"));
+        assert_eq!(job.name, "Show.S01E02");
+        assert!(!job.dir_name.contains("namepw"));
+
+        let id = q.admit_nzb("Plain".into(), &nzb_with(&["a.rar"], None), None, 0, true);
+        assert_eq!(unpack_password(q.job(id).unwrap()), None);
+
+        let id = q.admit_url("Url{{urlpw}}".into(), "https://indexer/x", None, 0);
+        assert!(q.complete_url_fetch(id, &nzb, false));
+        let job = q.job(id).unwrap();
+        assert_eq!(
+            unpack_password(job),
+            Some("urlpw"),
+            "the name's claim is kept"
+        );
+        assert_eq!(
+            job.params
+                .iter()
+                .filter(|(key, _)| key == UNPACK_PASSWORD_PARAM)
+                .count(),
+            1
+        );
+
+        let id = q.admit_url("Url".into(), "https://indexer/y", None, 0);
+        assert!(q.complete_url_fetch(id, &nzb, false));
+        assert_eq!(unpack_password(q.job(id).unwrap()), Some("metapw"));
     }
 
     #[test]

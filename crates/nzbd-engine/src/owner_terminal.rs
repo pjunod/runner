@@ -532,8 +532,7 @@ impl Owner {
             }) else {
                 continue;
             };
-            let deadline =
-                now.saturating_add(self.tuning.hold_deadline_secs(&control.hold_cause()));
+            let deadline = now.saturating_add(self.tuning.hold_deadline_secs());
             control.deadline_unix = Some(deadline);
             control.deadline_in_s = Some(deadline.saturating_sub(now));
             job.set_control(&control);
