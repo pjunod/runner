@@ -149,35 +149,33 @@ impl Default for PostConfig {
 const ENCRYPTED_ARCHIVE_DIAGNOSTIC: &str = "archive is encrypted and no known password opened it \
      (NZB password, `{{password}}` in the NZB name, or [post] password_file)";
 
-/// The passwords to try on a job's archives, in order: the release's own
-/// (`*Unpack:Password`, set at admission from the NZB), then each line of
-/// `[post] password_file`. Empty means one attempt without a password.
-fn unpack_passwords(job: &Job, cfg: &PostConfig) -> Vec<String> {
-    let mut passwords: Vec<String> = job
-        .params
+/// The release's own archive password (`*Unpack:Password`, set at
+/// admission from the NZB). Tried first; empty means no password.
+fn release_passwords(job: &Job) -> Vec<String> {
+    job.params
         .iter()
         .filter(|(key, _)| key == nzbd_engine::queue::UNPACK_PASSWORD_PARAM)
         .map(|(_, value)| value.clone())
         .filter(|value| !value.is_empty())
-        .collect();
-    if let Some(path) = &cfg.password_file {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                for line in text.lines() {
-                    let line = line.trim_end_matches('\r');
-                    if !line.is_empty() && !passwords.iter().any(|known| known == line) {
-                        passwords.push(line.to_string());
-                    }
-                }
-            }
-            Err(error) => tracing::warn!(
-                path = %path.display(),
-                %error,
-                "password_file unreadable; trying only the release's own password"
-            ),
-        }
-    }
-    passwords
+        .collect()
+}
+
+/// `[post] password_file`, one candidate per line, read only once the
+/// release's own password was rejected (so edits apply to the next unpack).
+/// A file that cannot be read is an error on this host, classified like
+/// any other filesystem error (a storage hold, or `failed/io`) — never an
+/// archive no password opens, which would blame a good release.
+fn password_file_candidates(cfg: &PostConfig) -> Result<Vec<String>, PostError> {
+    let Some(path) = &cfg.password_file else {
+        return Ok(Vec::new());
+    };
+    let text = std::fs::read_to_string(path).at("read password file", path)?;
+    Ok(text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 impl PostConfig {
@@ -1726,7 +1724,7 @@ async fn extract_complete_failed_archives(
         sevenzip_cmd: cfg.sevenzip_cmd.clone(),
         timeout: cfg.tool_timeout,
     };
-    let passwords = unpack_passwords(job, cfg);
+    let passwords = release_passwords(job);
     for (archive, kind) in detect_archives(&source.path) {
         use sha2::{Digest, Sha256};
         if gate.as_ref().is_some_and(|claim| !claim(job.id)) {
@@ -1759,7 +1757,9 @@ async fn extract_complete_failed_archives(
         let staging = attempt.join("output");
         std::fs::create_dir_all(&staging).at("create directory", &staging)?;
         let result = extractors
-            .extract_with_passwords(&archive, kind, &staging, &passwords)
+            .extract_with_passwords(&archive, kind, &staging, &passwords, || {
+                password_file_candidates(cfg)
+            })
             .await?;
         if result.disk_space_error {
             inventory.abandon_workspace(&workspace)?;
@@ -4150,7 +4150,7 @@ async fn process_job_ctx_from_inner(
                 sevenzip_cmd: cfg.sevenzip_cmd.clone(),
                 timeout: cfg.tool_timeout,
             };
-            let passwords = unpack_passwords(&job, cfg);
+            let passwords = release_passwords(&job);
             // A retry that restarts before unpack meets volumes the final
             // deobfuscation pass already renamed. The extraction workspace is
             // keyed by archive path, so the renamed set would look new and be
@@ -4221,7 +4221,9 @@ async fn process_job_ctx_from_inner(
                 // with the lease still live (double-unpack can't happen).
                 std::fs::create_dir_all(&staging).at("create directory", &staging)?;
                 let mut r = ex
-                    .extract_with_passwords(archive, *kind, &staging, &passwords)
+                    .extract_with_passwords(archive, *kind, &staging, &passwords, || {
+                        password_file_candidates(cfg)
+                    })
                     .await?;
                 staging = r.output_dir.clone();
                 if r.disk_space_error {
@@ -4268,7 +4270,7 @@ async fn process_job_ctx_from_inner(
                     return Err(PostError::Subprocess(detail));
                 }
                 if !r.success
-                    && !(r.password_error && passwords.is_empty())
+                    && !(r.password_error && passwords.is_empty() && cfg.password_file.is_none())
                     && !par_did_repair
                     && par_ok
                 {
@@ -4303,7 +4305,13 @@ async fn process_job_ctx_from_inner(
                                     .map_err(|e| PostError::Subprocess(e.to_string()))?;
                                 staging = attempt.join("output");
                                 r = ex
-                                    .extract_with_passwords(archive, *kind, &staging, &passwords)
+                                    .extract_with_passwords(
+                                        archive,
+                                        *kind,
+                                        &staging,
+                                        &passwords,
+                                        || password_file_candidates(cfg),
+                                    )
                                     .await?;
                                 staging = r.output_dir.clone();
                             }
@@ -4799,8 +4807,16 @@ async fn process_job_ctx_from_inner(
             .ok_or_else(|| PostError::Subprocess("job vanished before its terminal".into()))?;
         record_deobfuscation(&mut fin.params, &deobfuscated);
         fin.params.extend(script_receipts);
-        let (default_reason, default_stage, default_message) =
+        let (default_reason, default_stage, mut default_message) =
             pp_failure(outcome, unusable_source_reason.as_deref());
+        // Say why when it was the password: "the extractor failed" reads as
+        // a damaged release, and the operator should know to look for one.
+        if outcome == PpFinal::UnpackFailure
+            && unusable_source_reason.is_none()
+            && !password_required_archive_paths.is_empty()
+        {
+            default_message = ENCRYPTED_ARCHIVE_DIAGNOSTIC.into();
+        }
         let (reason, stage, message) = download_failure
             .as_ref()
             .map(|(reason, stage, message)| (*reason, stage.as_str(), message.clone()))

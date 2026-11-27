@@ -2046,6 +2046,14 @@ async fn encrypted_archive_without_a_working_password_fails_unpack_not_held() {
     let terminal = engine.artifacts().terminal(1).unwrap().unwrap();
     assert_eq!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
     assert!(terminal.blames_release);
+    assert!(
+        terminal
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("encrypted")),
+        "{:?}",
+        terminal.message
+    );
     let job = engine.export_fixture_job(JobId(1)).await.unwrap().unwrap();
     assert!(!job.held());
     assert_eq!(
@@ -2086,6 +2094,62 @@ async fn encrypted_archive_opens_with_a_password_file_candidate() {
         std::fs::read_to_string(tmp.path().join("passwords-tried")).unwrap(),
         "fromnzb\nother\nright\n"
     );
+    engine.shutdown().await;
+}
+
+/// A password file this host cannot read is this host's problem: the
+/// release must not be blamed (blocklisted) for it.
+#[tokio::test]
+async fn unreadable_password_file_does_not_blame_the_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = encrypted_job(tmp.path(), "wrong").await;
+    let tool = encrypted_archive_tool(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig {
+            unrar_cmd: tool.clone(),
+            sevenzip_cmd: tool,
+            failure_action: FailureAction::Delete,
+            deobfuscate_final: false,
+            password_file: Some(tmp.path().join("missing-passwords.txt")),
+            ..PostConfig::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(1),
+    )
+    .await;
+    assert!(!matches!(out, Ok(PpFinal::UnpackFailure)), "{out:?}");
+    if let Some(terminal) = engine.artifacts().terminal(1).unwrap() {
+        assert!(!terminal.blames_release);
+        assert_ne!(terminal.reason, Some(nzbd_types::FailureReason::Unpack));
+    }
+    engine.shutdown().await;
+}
+
+/// An unencrypted archive never reads the password file, so a broken one
+/// cannot fail a release that needs no password.
+#[tokio::test]
+async fn unencrypted_archive_ignores_an_unreadable_password_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = encrypted_job(tmp.path(), "right").await;
+    let tool = encrypted_archive_tool(tmp.path());
+    let out = process_job(
+        &engine,
+        &PostConfig {
+            unrar_cmd: tool.clone(),
+            sevenzip_cmd: tool,
+            deobfuscate_final: false,
+            password_file: Some(tmp.path().join("missing-passwords.txt")),
+            ..PostConfig::default()
+        },
+        &history(tmp.path()),
+        &tmp.path().join("dest"),
+        JobId(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, PpFinal::Success);
     engine.shutdown().await;
 }
 

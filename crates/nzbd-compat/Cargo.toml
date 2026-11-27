@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nzbd-types = { workspace = true }
 nzbd-engine = { workspace = true }
+nzbd-nzb = { workspace = true }
 nzbd-state = { workspace = true }
 nzbd-api = { workspace = true }
 nzbd-nntp = { workspace = true }

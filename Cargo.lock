@@ -2661,6 +2661,7 @@ dependencies = [
  "nzbd-feed",
  "nzbd-nntp",
  "nzbd-nserv",
+ "nzbd-nzb",
  "nzbd-state",
  "nzbd-types",
  "quick-xml 0.42.0",

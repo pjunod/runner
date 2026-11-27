@@ -416,7 +416,9 @@ hold_deadline_secs = 86400     # how long an environmental hold (storage down,
                                # may last before the job fails `hold_expired`
 # password_file = "/data/usenet/passwords.txt"  # candidate archive passwords,
                                # one per line, tried after the release's own
-                               # (NZBGet UnpackPassFile); re-read every unpack
+                               # (NZBGet UnpackPassFile); read only when that
+                               # is rejected. Unreadable → a storage hold or
+                               # failed/io, never a blamed release
 ```
 
 **Encrypted archives.** Runner tries the release's own password first: a

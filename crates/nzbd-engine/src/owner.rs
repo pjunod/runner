@@ -3363,7 +3363,14 @@ impl Owner {
                 }
                 // Nothing has been written yet, so a better name may take
                 // the directory with it.
-                let name = self.name_from_requestor(id, true).unwrap_or(name);
+                // Admission strips a `{{password}}` from the name; from here on the
+                // stored name is the only one that may reach a log or event.
+                let name = self.name_from_requestor(id, true).unwrap_or_else(|| {
+                    self.state
+                        .job(id)
+                        .map(|job| job.name.clone())
+                        .unwrap_or(name)
+                });
                 let generation = fresh_epoch();
                 self.job_epochs.insert(id, generation);
                 let persistent = self.persist;
@@ -3658,7 +3665,14 @@ impl Owner {
                         ));
                     }
                 }
-                let name = self.name_from_requestor(id, true).unwrap_or(name);
+                // Admission strips a `{{password}}` from the name; from here on the
+                // stored name is the only one that may reach a log or event.
+                let name = self.name_from_requestor(id, true).unwrap_or_else(|| {
+                    self.state
+                        .job(id)
+                        .map(|job| job.name.clone())
+                        .unwrap_or(name)
+                });
                 if let (Some(token), Some(fingerprint), Some(nonce)) = (
                     request_token.as_ref(),
                     submission_sha256.as_ref(),

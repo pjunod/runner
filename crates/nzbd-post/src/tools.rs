@@ -596,32 +596,57 @@ fn terminal_archive_diagnostic(diagnostic: &str) -> bool {
 impl Extractors {
     /// Extract with each candidate password in turn, the way NZBGet walks
     /// `UnpackPassFile` and SABnzbd its password file: stop at the first
-    /// attempt that is not a password failure. No candidates is one attempt
-    /// without a password. Each candidate gets a fresh sibling destination
-    /// inside the same journal-owned attempt, so a rejected password's
-    /// partial output never mixes with the next one's.
+    /// attempt that is not a password failure. The release's own
+    /// `passwords` go first (none: one attempt without a password); only
+    /// once they are all rejected is `more` asked for further candidates,
+    /// so an archive that is not encrypted never depends on the password
+    /// file being readable. Each attempt after the first gets a fresh
+    /// sibling destination inside the same journal-owned attempt, so a
+    /// rejected password's partial output never mixes with the next one's.
     pub async fn extract_with_passwords(
         &self,
         archive: &Path,
         kind: ArchiveKind,
         dest: &Path,
         passwords: &[String],
+        more: impl FnOnce() -> Result<Vec<String>, PostError>,
     ) -> Result<ExtractOutcome, PostError> {
-        let Some((first, rest)) = passwords.split_first() else {
-            return self.extract(archive, kind, dest, None).await;
+        let mut pending: std::collections::VecDeque<Option<String>> = if passwords.is_empty() {
+            [None].into()
+        } else {
+            passwords.iter().cloned().map(Some).collect()
         };
-        let mut outcome = self.extract(archive, kind, dest, Some(first)).await?;
-        for (index, password) in rest.iter().enumerate() {
-            if !outcome.password_error {
-                break;
-            }
-            let next = dest.with_extension(format!("password-{}", index + 1));
-            std::fs::create_dir(&next).at("create directory", &next)?;
+        let mut tried = passwords.to_vec();
+        let mut more = Some(more);
+        let mut target = dest.to_path_buf();
+        let mut attempt = 0usize;
+        loop {
+            let password = pending.pop_front().flatten();
             // Every rejected candidate says the same thing; the outcome
             // carries the last tool run, not one diagnostic per password.
-            outcome = self.extract(archive, kind, &next, Some(password)).await?;
+            let outcome = self
+                .extract(archive, kind, &target, password.as_deref())
+                .await?;
+            if !outcome.password_error {
+                return Ok(outcome);
+            }
+            if pending.is_empty() {
+                if let Some(load) = more.take() {
+                    for candidate in load()? {
+                        if !tried.contains(&candidate) {
+                            tried.push(candidate.clone());
+                            pending.push_back(Some(candidate));
+                        }
+                    }
+                }
+            }
+            if pending.is_empty() {
+                return Ok(outcome);
+            }
+            attempt += 1;
+            target = dest.with_extension(format!("password-{attempt}"));
+            std::fs::create_dir(&target).at("create directory", &target)?;
         }
-        Ok(outcome)
     }
 
     pub async fn extract(
@@ -795,9 +820,16 @@ impl Extractors {
                 .take(4096)
                 .collect();
                 let success = out.code == 0 && all.contains("All OK") && !broke_the_chain;
+                // unrar words a rejected password several ways across
+                // versions and encryption modes, on either stream: exit 11
+                // (RAR5), "The specified password is incorrect", or, for
+                // encrypted file data, "Checksum error in the encrypted file
+                // … Corrupt file or wrong password" with exit 3.
                 let password_error = out.code == 11
                     || out.stderr.contains("password")
-                    || out.stdout.contains("password is incorrect");
+                    || lower.contains("password is incorrect")
+                    || lower.contains("wrong password")
+                    || lower.contains("incorrect password");
                 let disk_space_error = capacity || quota_error;
                 Ok(ExtractOutcome {
                     output_dir: dest.to_path_buf(),
