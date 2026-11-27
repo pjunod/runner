@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Fail unless this run validates a merge candidate.
+#
+# Branch protection counts a *skipped* required check as passing, so a
+# required job must never skip because its pull request is a draft. It runs
+# this script first and fails instead.
+#
+# The draft state comes from the live pull request, not from
+# github.event.pull_request.draft. That payload is a snapshot taken when the
+# event fired: a push made while the PR was a draft is delivered as a
+# synchronize event with draft == true even when it arrives after
+# ready_for_review (PR #362), and re-running a job replays the same payload.
+# Reading the live state lets whichever run survives the concurrency group
+# validate the head it was started for.
+set -euo pipefail
+
+if [[ "${GITHUB_EVENT_NAME:?}" != pull_request ]]; then
+  exit 0
+fi
+
+pr=${PR_NUMBER:?PR_NUMBER must name the pull request}
+draft="$(gh api "repos/${GITHUB_REPOSITORY:?}/pulls/${pr}" --jq .draft)"
+case "$draft" in
+  false) ;;
+  true)
+    echo "::error::PR #${pr} is a draft, so it is not a merge candidate. Mark it ready for review to run this check."
+    exit 1
+    ;;
+  *)
+    echo "::error::could not read the draft state of PR #${pr} (got '${draft}')"
+    exit 1
+    ;;
+esac

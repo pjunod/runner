@@ -9,17 +9,22 @@ env:
   CARGO_TERM_COLOR: always
   NZBD_REQUIRE_TOOLS: 1
 
+# Newer events for the same PR cancel older runs. Event payloads are
+# snapshots, so the surviving run may carry a stale draft flag; the scope job
+# reads the live PR instead (scripts/ci-merge-candidate). A cancelled lane
+# fails the gate, and nothing here may skip on a draft: GitHub counts a
+# skipped required check as passing.
 concurrency:
   group: main-fast-lane-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   scope:
     name: Select affected validation
-    if: github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     outputs:
@@ -33,6 +38,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Require a merge candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/ci-merge-candidate
       - id: scope
         env:
           VALIDATION_BASE: ${{ github.event.pull_request.base.sha }}
@@ -115,7 +125,9 @@ jobs:
 
   gate:
     name: Main promotion gate
-    if: always() && github.event.pull_request.draft == false
+    # Always report, and pass only when every lane succeeded. A draft fails
+    # the scope job, so this gate fails rather than skipping.
+    if: always()
     needs: [scope, preflight, rust, mobile]
     runs-on: ubuntu-24.04
     timeout-minutes: 2

@@ -146,7 +146,11 @@ Clippy, recovery/cluster regressions, and mobile type/unit checks), **Tests**
 (the complete workspace suite, MSRV 1.95, and Android signing guards),
 **Supply chain** (dependency policy and RustSec), and **CodeQL** (Rust and
 JavaScript/TypeScript). Metadata and build-number changes use the same real
-Rust and mobile checks. CI uses fresh GitHub-hosted runners; Linux jobs use
+Rust and mobile checks. Draft pull requests do not run the fast lane or
+supply-chain checks, but those required checks fail on a draft instead of
+skipping (GitHub counts a skipped required check as passing):
+[`scripts/ci-merge-candidate`](scripts/ci-merge-candidate) reads the live
+draft state, so mark the PR ready for review to validate it. CI uses fresh GitHub-hosted runners; Linux jobs use
 Ubuntu 24.04. Main requires up-to-date branches, resolved conversations,
 and verified CI publishers, including for administrators. Solo-owner
 maintenance requires zero approving reviews; this does not provide an
