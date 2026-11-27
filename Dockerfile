@@ -23,7 +23,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --locked --release -p nzbd
 
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime-tools
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e AS runtime-tools
 # The configured defaults require par2, real UnRAR and 7z. Debian's UnRAR
 # package is in non-free; unrar-free cannot reliably handle multi-volume RAR.
 # Keep both 7z and modern 7zz available for fallback and other archive formats.
