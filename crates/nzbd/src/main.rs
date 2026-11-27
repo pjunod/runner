@@ -277,6 +277,20 @@ fn advertise(port: u16, name: Option<String>, tls: bool, auth: String) -> anyhow
 // ---------------------------------------------------------------------------
 
 /// Map `[post]` config onto the PP manager's runtime config.
+/// Post-processing's early verdict on finished archive volumes: an
+/// encrypted release no known password opens ends `failed/unpack` after its
+/// first volume instead of after the whole download. Nothing to judge when
+/// post-processing (and so unpack) is off.
+fn archive_probe(
+    cfg: &nzbd_config::Config,
+) -> Option<Arc<dyn nzbd_engine::archive_probe::ArchiveProbe>> {
+    cfg.post.enabled.then(|| {
+        Arc::new(nzbd_post::archive_lock::EncryptedArchiveProbe::new(
+            post_config(cfg, 1, None),
+        )) as Arc<dyn nzbd_engine::archive_probe::ArchiveProbe>
+    })
+}
+
 fn post_config(
     cfg: &nzbd_config::Config,
     slots: usize,
@@ -1285,6 +1299,7 @@ fn run(
     engine_cfg.expected_installation_id = expected_identity;
     engine_cfg.workspace_dir = cfg.configured_workspace_dir();
     engine_cfg.payload_roots = payload_roots(&cfg);
+    engine_cfg.archive_probe = archive_probe(&cfg);
 
     // Keep a shutdown handle outside the startup future: any later failure
     // (torrent restore, watch roots, router setup) must drain the accepted
@@ -1739,6 +1754,7 @@ async fn run_cluster(
         cfg.max_active_downloads(),
         pp,
         expected_identity,
+        archive_probe(&cfg),
     )
     .await
     .map_err(with_fs_hint)?;

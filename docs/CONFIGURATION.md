@@ -432,6 +432,20 @@ and a job an earlier build held as `password_required` is converted to
 older files load, but it is ignored. With no password at all, an encrypted
 archive skips the forced PAR repair (repair cannot produce a password).
 
+The verdict usually comes during the download, not after it. When a
+complete, undamaged file turns out to be the first volume of an encrypted
+archive (Runner reads its headers, so obfuscated names are fine), Runner
+tests the same passwords against that one volume with `unrar t` / `7z t`.
+If every one is refused, the download stops right there and the job ends
+`failed/unpack` as above, without fetching the rest of the release. This is
+SABnzbd's "abort on encrypted RAR" behavior, and it is not a setting: it
+only reaches the result unpack would have reached anyway. It does not run
+for a category with `unpack = false`, or when post-processing is off. A
+first volume can't always decide. For example, a RAR4 set where only the
+file data is encrypted has no password check value, and a split 7z keeps
+its header in its last part. Those releases download in full and unpack
+judges them.
+
 **Failure disposition.** `[post] keep_failed_downloads` defaults to `false`:
 Runner deletes failed payload after salvage and cleanup custody settle. Set it
 to `true` to park failed payload in `failed_dir`, subject to

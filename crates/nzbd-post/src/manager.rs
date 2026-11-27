@@ -146,7 +146,8 @@ impl Default for PostConfig {
 /// of the known passwords opened. Assessed as unusable, not repairable: no
 /// later step can supply a password, so the bytes follow the failed-download
 /// retention policy instead of being held back for a review nothing ends.
-const ENCRYPTED_ARCHIVE_DIAGNOSTIC: &str = "archive is encrypted and no known password opened it \
+pub(crate) const ENCRYPTED_ARCHIVE_DIAGNOSTIC: &str =
+    "archive is encrypted and no known password opened it \
      (NZB password, `{{password}}` in the NZB name, or [post] password_file)";
 
 /// The release's own archive password (`*Unpack:Password`, set at
@@ -165,7 +166,7 @@ fn release_passwords(job: &Job) -> Vec<String> {
 /// A file that cannot be read is an error on this host, classified like
 /// any other filesystem error (a storage hold, or `failed/io`) — never an
 /// archive no password opens, which would blame a good release.
-fn password_file_candidates(cfg: &PostConfig) -> Result<Vec<String>, PostError> {
+pub(crate) fn password_file_candidates(cfg: &PostConfig) -> Result<Vec<String>, PostError> {
     let Some(path) = &cfg.password_file else {
         return Ok(Vec::new());
     };
@@ -182,7 +183,7 @@ impl PostConfig {
     /// The `[[category]]` rule for a job's category, if one is configured.
     /// Matched case-insensitively, like the compat shim's category
     /// handling — an *arr sending "TV" must land on `name = "tv"`.
-    fn rule_for(&self, category: Option<&str>) -> Option<&CategoryRule> {
+    pub(crate) fn rule_for(&self, category: Option<&str>) -> Option<&CategoryRule> {
         let want = category?.trim();
         if want.is_empty() {
             return None;

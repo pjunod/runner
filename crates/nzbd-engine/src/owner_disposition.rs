@@ -416,7 +416,7 @@ impl Owner {
 
         if self.post_admissions.contains_key(&job)
             || self.record_transitions.contains(&job)
-            || self.pending_name_inspections.contains_key(&job)
+            || self.pending_file_inspections.contains_key(&job)
             || self.terminals_in_flight.contains(&job)
             || self.deferred_terminals.contains_key(&job)
             || self

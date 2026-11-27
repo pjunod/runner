@@ -12,6 +12,7 @@
 //! Public surface: [`Engine::spawn`] → [`EngineHandle`].
 
 mod admissions;
+pub mod archive_probe;
 pub mod automatic_control;
 pub mod backend;
 mod cluster_stop;
@@ -532,6 +533,9 @@ pub struct EngineConfig {
     /// Checked immediately before every snapshot commit (CLUSTERING.md
     /// §6.4): returns false once this node is no longer the authority.
     pub persist_guard: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Post-processing's verdict on finished archive volumes
+    /// ([`archive_probe`]). `None` when nothing unpacks this node's jobs.
+    pub archive_probe: Option<Arc<dyn archive_probe::ArchiveProbe>>,
 }
 
 impl EngineConfig {
@@ -563,6 +567,7 @@ impl EngineConfig {
             persist_queue: true,
             journal_suffix: "local".into(),
             persist_guard: None,
+            archive_probe: None,
         }
     }
 }
@@ -657,6 +662,7 @@ impl Engine {
             owner_heartbeat.clone(),
         )?;
         owner.configured_payload_roots = cfg.payload_roots.clone();
+        owner.archive_probe = cfg.archive_probe.clone();
         // Seed the shared snapshot with recovered state synchronously, so
         // the API never serves an empty queue in the window before the
         // async run loop's first publish (UI "queue is empty" flash).
