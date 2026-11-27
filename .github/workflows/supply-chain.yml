@@ -11,8 +11,12 @@ on:
     - cron: "17 6 * * *"
   workflow_dispatch:
 
+# Each job below is a required check. None may skip on a draft (GitHub counts
+# a skipped required check as passing); each fails through
+# scripts/ci-merge-candidate instead, which reads the live PR state.
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,13 +24,17 @@ env:
 jobs:
   reviewed-exceptions:
     name: reviewed dependency exceptions
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Require a merge candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/ci-merge-candidate
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95"
@@ -45,12 +53,16 @@ jobs:
 
   policy:
     name: licenses, bans, and sources
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Require a merge candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/ci-merge-candidate
       # cargo-deny-action v2.1.1, cargo-deny 0.20.2. Pin the immutable
       # revision so the supply-chain gate cannot change underneath a run.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # 3c6349835b2b7b196a839186cb8b78e02f7b5f25
@@ -61,12 +73,16 @@ jobs:
 
   advisories:
     name: RustSec advisories
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Require a merge candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/ci-merge-candidate
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-audit@0.22.0
