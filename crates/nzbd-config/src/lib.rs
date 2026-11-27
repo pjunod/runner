@@ -230,9 +230,13 @@ pub struct PostSection {
     /// last before runner ends the job `failed/hold_expired` with its bytes
     /// parked (pipeline contract v2 §2.3).
     pub hold_deadline_secs: u64,
-    /// The same deadline for `password_required` holds, which wait on a
-    /// person.
+    /// Accepted so older files still load; ignored. An archive no known
+    /// password opens now ends `failed/unpack` instead of being held.
+    #[serde(skip_serializing)]
     pub password_hold_deadline_secs: u64,
+    /// Candidate archive passwords, one per line, tried after the
+    /// release's own (NZBGet `UnpackPassFile`). None = only the release's.
+    pub password_file: Option<PathBuf>,
 }
 
 impl Default for PostSection {
@@ -254,7 +258,8 @@ impl Default for PostSection {
             script_timeout_secs: 3600,
             par_fetch_timeout_secs: 600,
             hold_deadline_secs: 86_400,
-            password_hold_deadline_secs: 604_800,
+            password_hold_deadline_secs: 0,
+            password_file: None,
         }
     }
 }
@@ -1452,6 +1457,10 @@ pub fn import_nzbget_conf(content: &str) -> Result<(Config, ImportReport), Confi
             "scriptdir" => {
                 cfg.post.scripts_dir = (!v.is_empty()).then(|| PathBuf::from(&v));
                 Some("post.scripts_dir".into())
+            }
+            "unpackpassfile" => {
+                cfg.post.password_file = (!v.is_empty()).then(|| PathBuf::from(&v));
+                Some("post.password_file".into())
             }
             "unpack" => {
                 cfg.post.unpack = yes(&v);

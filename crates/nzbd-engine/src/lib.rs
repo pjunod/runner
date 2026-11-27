@@ -455,20 +455,14 @@ pub struct Tuning {
     /// hold-recovery task ends it `failed/hold_expired` (`[post]
     /// hold_deadline_secs`).
     pub hold_deadline: Duration,
-    /// The same for `password_required` holds (`[post]
-    /// password_hold_deadline_secs`).
-    pub password_hold_deadline: Duration,
 }
 
 impl Tuning {
-    /// Seconds a hold for `cause` may last before it expires.
-    pub fn hold_deadline_secs(&self, cause: &nzbd_types::HoldCause) -> i64 {
-        let deadline = if *cause == nzbd_types::HoldCause::PasswordRequired {
-            self.password_hold_deadline
-        } else {
-            self.hold_deadline
-        };
-        i64::try_from(deadline.as_secs()).unwrap_or(i64::MAX).max(1)
+    /// Seconds a hold may last before it expires.
+    pub fn hold_deadline_secs(&self) -> i64 {
+        i64::try_from(self.hold_deadline.as_secs())
+            .unwrap_or(i64::MAX)
+            .max(1)
     }
 }
 
@@ -488,9 +482,6 @@ impl Default for Tuning {
             quota_start_day: 1,
             health_abort: false,
             hold_deadline: Duration::from_secs(nzbd_types::HOLD_DEADLINE_SECONDS_DEFAULT as u64),
-            password_hold_deadline: Duration::from_secs(
-                nzbd_types::PASSWORD_HOLD_DEADLINE_SECONDS_DEFAULT as u64,
-            ),
         }
     }
 }

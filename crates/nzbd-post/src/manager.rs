@@ -112,6 +112,10 @@ pub struct PostConfig {
     pub categories: Vec<CategoryRule>,
     /// Stage-duration counters for `/metrics`, when the daemon wired one.
     pub stats: Option<Arc<PpStageStats>>,
+    /// `[post] password_file`: candidate archive passwords, one per line,
+    /// tried after the release's own (NZBGet `UnpackPassFile`, SABnzbd's
+    /// password file). Read at each unpack, so edits apply to the next one.
+    pub password_file: Option<PathBuf>,
 }
 
 impl Default for PostConfig {
@@ -133,8 +137,47 @@ impl Default for PostConfig {
             par_fetch_timeout: Duration::from_secs(600),
             categories: Vec::new(),
             stats: None,
+            password_file: None,
         }
     }
+}
+
+/// What a failed source's diagnostics say about an encrypted archive none
+/// of the known passwords opened. Assessed as unusable, not repairable: no
+/// later step can supply a password, so the bytes follow the failed-download
+/// retention policy instead of being held back for a review nothing ends.
+const ENCRYPTED_ARCHIVE_DIAGNOSTIC: &str = "archive is encrypted and no known password opened it \
+     (NZB password, `{{password}}` in the NZB name, or [post] password_file)";
+
+/// The passwords to try on a job's archives, in order: the release's own
+/// (`*Unpack:Password`, set at admission from the NZB), then each line of
+/// `[post] password_file`. Empty means one attempt without a password.
+fn unpack_passwords(job: &Job, cfg: &PostConfig) -> Vec<String> {
+    let mut passwords: Vec<String> = job
+        .params
+        .iter()
+        .filter(|(key, _)| key == nzbd_engine::queue::UNPACK_PASSWORD_PARAM)
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.is_empty())
+        .collect();
+    if let Some(path) = &cfg.password_file {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                for line in text.lines() {
+                    let line = line.trim_end_matches('\r');
+                    if !line.is_empty() && !passwords.iter().any(|known| known == line) {
+                        passwords.push(line.to_string());
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "password_file unreadable; trying only the release's own password"
+            ),
+        }
+    }
+    passwords
 }
 
 impl PostConfig {
@@ -1683,11 +1726,7 @@ async fn extract_complete_failed_archives(
         sevenzip_cmd: cfg.sevenzip_cmd.clone(),
         timeout: cfg.tool_timeout,
     };
-    let password = job
-        .params
-        .iter()
-        .find(|(key, _)| key == "*Unpack:Password")
-        .map(|(_, value)| value.as_str());
+    let passwords = unpack_passwords(job, cfg);
     for (archive, kind) in detect_archives(&source.path) {
         use sha2::{Digest, Sha256};
         if gate.as_ref().is_some_and(|claim| !claim(job.id)) {
@@ -1720,7 +1759,7 @@ async fn extract_complete_failed_archives(
         let staging = attempt.join("output");
         std::fs::create_dir_all(&staging).at("create directory", &staging)?;
         let result = extractors
-            .extract(&archive, kind, &staging, password)
+            .extract_with_passwords(&archive, kind, &staging, &passwords)
             .await?;
         if result.disk_space_error {
             inventory.abandon_workspace(&workspace)?;
@@ -1822,9 +1861,7 @@ fn salvage_failed_delivery(
     for path in &archive_assessment.password_required {
         diagnostics.insert(
             path.clone(),
-            FileAssessment::Repairable(
-                "archive requires a password; set *Unpack:Password and retry extraction".into(),
-            ),
+            FileAssessment::Corrupt(ENCRYPTED_ARCHIVE_DIAGNOSTIC.into()),
         );
     }
     for (path, reason) in &archive_assessment.par_failures {
@@ -4113,11 +4150,7 @@ async fn process_job_ctx_from_inner(
                 sevenzip_cmd: cfg.sevenzip_cmd.clone(),
                 timeout: cfg.tool_timeout,
             };
-            let password = job
-                .params
-                .iter()
-                .find(|(k, _)| k == "*Unpack:Password")
-                .map(|(_, v)| v.as_str());
+            let passwords = unpack_passwords(&job, cfg);
             // A retry that restarts before unpack meets volumes the final
             // deobfuscation pass already renamed. The extraction workspace is
             // keyed by archive path, so the renamed set would look new and be
@@ -4187,7 +4220,9 @@ async fn process_job_ctx_from_inner(
                 // staging dir and is renamed into place only on success
                 // with the lease still live (double-unpack can't happen).
                 std::fs::create_dir_all(&staging).at("create directory", &staging)?;
-                let mut r = ex.extract(archive, *kind, &staging, password).await?;
+                let mut r = ex
+                    .extract_with_passwords(archive, *kind, &staging, &passwords)
+                    .await?;
                 staging = r.output_dir.clone();
                 if r.disk_space_error {
                     let cause = if r.quota_error {
@@ -4232,9 +4267,16 @@ async fn process_job_ctx_from_inner(
                     // owner took it.
                     return Err(PostError::Subprocess(detail));
                 }
-                if !r.success && !par_did_repair && par_ok {
+                if !r.success
+                    && !(r.password_error && passwords.is_empty())
+                    && !par_did_repair
+                    && par_ok
+                {
                     // The unpack↔repair loop: a broken archive that quick
                     // verification couldn't see; force a repair and retry once.
+                    // With no password to offer, an encrypted archive is not
+                    // damage and repair cannot help. With one, "corrupt file
+                    // or wrong password" is ambiguous, so repair gets its once.
                     if let Some(set) = par2::load_dir(&dir)? {
                         if let Some(main) = set.main_path.clone() {
                             tracing::warn!(
@@ -4260,7 +4302,9 @@ async fn process_job_ctx_from_inner(
                                     .begin_workspace_attempt(&mut workspace)
                                     .map_err(|e| PostError::Subprocess(e.to_string()))?;
                                 staging = attempt.join("output");
-                                r = ex.extract(archive, *kind, &staging, password).await?;
+                                r = ex
+                                    .extract_with_passwords(archive, *kind, &staging, &passwords)
+                                    .await?;
                                 staging = r.output_dir.clone();
                             }
                         }
@@ -4304,21 +4348,6 @@ async fn process_job_ctx_from_inner(
                     // verdict (stage `unpack`), which reports whether the
                     // owner took it.
                     return Err(PostError::Subprocess(detail));
-                }
-                if r.password_error {
-                    engine
-                        .artifacts()
-                        .abandon_workspace(&workspace)
-                        .map_err(|e| PostError::Subprocess(e.to_string()))?;
-                    let _ = engine
-                        .hold_job(
-                            job_id,
-                            HoldCause::PasswordRequired,
-                            "unpack",
-                            "encrypted archive needs a corrected password; source files are retained",
-                        )
-                        .await;
-                    return Err(PostError::Held);
                 }
                 // "It said OK" is not the same as "it read the whole set".
                 // Checked BEFORE the commit, so a short extraction is thrown
@@ -4899,9 +4928,10 @@ async fn process_job_ctx_from_inner(
                     )?,
                 };
                 for path in &password_required_archive_paths {
-                    diagnostics.insert(path.clone(), FileAssessment::Repairable(
-                        "archive requires a password; set *Unpack:Password and retry extraction".into(),
-                    ));
+                    diagnostics.insert(
+                        path.clone(),
+                        FileAssessment::Corrupt(ENCRYPTED_ARCHIVE_DIAGNOSTIC.into()),
+                    );
                 }
                 let (selected_files, file_outcomes) = select_delivery_payload(
                     &source.files,
@@ -5388,9 +5418,7 @@ async fn record_failure_assessment(
     for path in password_required {
         diagnostics.insert(
             path.clone(),
-            FileAssessment::Repairable(
-                "archive requires a password; set *Unpack:Password and retry extraction".into(),
-            ),
+            FileAssessment::Corrupt(ENCRYPTED_ARCHIVE_DIAGNOSTIC.into()),
         );
     }
     let (selected, outcomes) = select_delivery_payload(
@@ -9359,6 +9387,23 @@ mod decision_tests {
             &Default::default(),
         );
         assert!(recovery_reason(&repairable).is_some());
+        // An encrypted archive no known password opened is not awaiting
+        // anything: its source follows retention instead of review.
+        let (_, encrypted) = select_delivery_payload(
+            &[payload_entry("secret.rar")],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &[(
+                "secret.rar".into(),
+                FileAssessment::Corrupt(ENCRYPTED_ARCHIVE_DIAGNOSTIC.into()),
+            )]
+            .into_iter()
+            .collect(),
+            &Default::default(),
+        );
+        assert!(recovery_reason(&encrypted).is_none());
+        assert_eq!(encrypted[0].outcome, "excluded_source_cleanup");
     }
 
     fn file(id: u32, name: &str, crc32: Option<u32>) -> FileEntry {

@@ -7525,7 +7525,7 @@ impl Owner {
             deadline_in_s: None,
             deadline_unix: None,
         };
-        let deadline_secs = self.tuning.hold_deadline_secs(&cause);
+        let deadline_secs = self.tuning.hold_deadline_secs();
         // The deadline runs from when this episode began, so a hold that
         // changes cause mid-outage does not restart the clock.
         let deadline_unix = control

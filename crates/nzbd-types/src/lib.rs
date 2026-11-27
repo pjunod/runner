@@ -637,7 +637,7 @@ pub const CONTROL_PARAM: &str = "*Control:v1";
 /// form stays the string in `JobControl::cause`.
 ///
 /// Every cause is *environmental*: something that comes back by itself or
-/// from a person (storage, space, a mount, a tool, a password). A failure
+/// from a person (storage, space, a mount, a tool). A failure
 /// that would fail the same way every time is not a hold — it is a terminal
 /// [`FailureReason`] (pipeline contract v2 §2.2–2.3). Every hold carries a
 /// deadline after which runner ends the job `failed/hold_expired`.
@@ -659,9 +659,6 @@ pub enum HoldCause {
     MountUnavailable,
     /// An extractor or script binary is missing.
     MissingTool,
-    /// An encrypted archive needs a password a person has to supply. Retried
-    /// on the ladder; its (longer) deadline is what ends it.
-    PasswordRequired,
     /// A cause written by another build (or a legacy terminal cause that the
     /// boot conversion did not recognise). Treated as storage: scheduled
     /// retry with a deadline, never a dead end.
@@ -697,7 +694,7 @@ impl HoldPolicy {
 
 impl HoldCause {
     /// Every cause this build writes, for tests that must cover the set.
-    pub const ALL: [HoldCause; 8] = [
+    pub const ALL: [HoldCause; 7] = [
         HoldCause::EngineUnavailable,
         HoldCause::StorageUnavailable,
         HoldCause::Capacity,
@@ -705,7 +702,6 @@ impl HoldCause {
         HoldCause::Allocation,
         HoldCause::MountUnavailable,
         HoldCause::MissingTool,
-        HoldCause::PasswordRequired,
     ];
 
     pub fn as_str(&self) -> &str {
@@ -717,7 +713,6 @@ impl HoldCause {
             HoldCause::Allocation => "allocation",
             HoldCause::MountUnavailable => "mount_unavailable",
             HoldCause::MissingTool => "missing_tool",
-            HoldCause::PasswordRequired => "password_required",
             HoldCause::Unrecognized(s) => s,
         }
     }
@@ -741,8 +736,6 @@ impl HoldCause {
                 HoldPolicy::ResumeSameJob
             }
             HoldCause::MountUnavailable => HoldPolicy::ReobserveMount,
-            // Retried on the ladder; the (longer) deadline is what ends it.
-            HoldCause::PasswordRequired => HoldPolicy::ScheduledRetry,
         }
     }
 
@@ -753,6 +746,10 @@ impl HoldCause {
         match s {
             "io" => Some(FailureReason::Io),
             "identity_conflict" => Some(FailureReason::Identity),
+            // An archive no known password opened. Earlier builds held it,
+            // though nothing could ever supply the password; it is the
+            // release's failure (contract §2.3, 2026-11-27).
+            "password_required" => Some(FailureReason::Unpack),
             "post_failure" => Some(FailureReason::Publish),
             _ => None,
         }
@@ -784,10 +781,8 @@ pub const HOLD_RETRY_DELAYS_SECONDS: [i64; 4] = [30, 60, 120, 300];
 /// off, while a job that ran fine for an hour starts its next blip at 30 s.
 pub const HOLD_EPISODE_SECONDS: i64 = 3600;
 
-/// Contract §2.3 defaults for `[post] hold_deadline_secs` and
-/// `[post] password_hold_deadline_secs`.
+/// Contract §2.3 default for `[post] hold_deadline_secs`.
 pub const HOLD_DEADLINE_SECONDS_DEFAULT: i64 = 24 * 3600;
-pub const PASSWORD_HOLD_DEADLINE_SECONDS_DEFAULT: i64 = 7 * 24 * 3600;
 
 /// Why a job ended `failed` (contract §2.2). Closed; the serde form is the
 /// wire form.

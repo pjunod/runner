@@ -594,6 +594,36 @@ fn terminal_archive_diagnostic(diagnostic: &str) -> bool {
 }
 
 impl Extractors {
+    /// Extract with each candidate password in turn, the way NZBGet walks
+    /// `UnpackPassFile` and SABnzbd its password file: stop at the first
+    /// attempt that is not a password failure. No candidates is one attempt
+    /// without a password. Each candidate gets a fresh sibling destination
+    /// inside the same journal-owned attempt, so a rejected password's
+    /// partial output never mixes with the next one's.
+    pub async fn extract_with_passwords(
+        &self,
+        archive: &Path,
+        kind: ArchiveKind,
+        dest: &Path,
+        passwords: &[String],
+    ) -> Result<ExtractOutcome, PostError> {
+        let Some((first, rest)) = passwords.split_first() else {
+            return self.extract(archive, kind, dest, None).await;
+        };
+        let mut outcome = self.extract(archive, kind, dest, Some(first)).await?;
+        for (index, password) in rest.iter().enumerate() {
+            if !outcome.password_error {
+                break;
+            }
+            let next = dest.with_extension(format!("password-{}", index + 1));
+            std::fs::create_dir(&next).at("create directory", &next)?;
+            // Every rejected candidate says the same thing; the outcome
+            // carries the last tool run, not one diagnostic per password.
+            outcome = self.extract(archive, kind, &next, Some(password)).await?;
+        }
+        Ok(outcome)
+    }
+
     pub async fn extract(
         &self,
         archive: &Path,
