@@ -416,7 +416,7 @@ impl Owner {
 
         if self.post_admissions.contains_key(&job)
             || self.record_transitions.contains(&job)
-            || self.pending_name_inspections.contains_key(&job)
+            || self.pending_file_inspections.contains_key(&job)
             || self.terminals_in_flight.contains(&job)
             || self.deferred_terminals.contains_key(&job)
             || self
@@ -428,6 +428,8 @@ impl Owner {
                 .get(&job)
                 .is_some_and(|writers| writers.iter().any(|writer| !*writer.stopped.borrow()))
         {
+            // A running extractor need not finish for a job being disposed of.
+            self.cancel_file_inspections(job);
             self.reply_disposition_wait(
                 receipt,
                 JobDispositionState::Pending,

@@ -177,12 +177,17 @@ impl ClusterRuntime {
             max_active_downloads,
             pp,
             None,
+            None,
         )
         .await
     }
 
     /// Start with an independently enrolled lifecycle inventory identity.
     /// The original constructor remains suitable for first-time enrollment.
+    /// `archive_probe` judges finished archive volumes on this node's
+    /// download executors (`nzbd_engine::archive_probe`). Pass one only when
+    /// this node's `[post]` config is one that unpacks the cluster's jobs
+    /// (it post-processes): the verdict predicts unpack's.
     #[allow(clippy::too_many_arguments)] // Preserve the existing constructor plus its enrollment identity.
     pub async fn start_expected(
         cfg: ClusterConfig,
@@ -193,6 +198,7 @@ impl ClusterRuntime {
         max_active_downloads: Option<u32>,
         mut pp: Option<PpSetup>,
         expected_installation_id: Option<String>,
+        archive_probe: Option<std::sync::Arc<dyn nzbd_engine::archive_probe::ArchiveProbe>>,
     ) -> Result<ClusterRuntime, ClusterError> {
         nzbd_state::artifacts::Inventory::validate_expected(
             &cfg.control_dir.join("file-lifecycle"),
@@ -277,6 +283,7 @@ impl ClusterRuntime {
             persist_queue: false, // adopted on taking office
             journal_suffix: cfg.node_name.clone(),
             persist_guard: Some(guard.clone()),
+            archive_probe,
         })
         .await?;
 

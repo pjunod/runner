@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 
+pub mod archive_lock;
 mod attempt;
 pub mod deobfuscate;
 mod fingerprint;

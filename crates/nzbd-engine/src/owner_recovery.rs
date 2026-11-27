@@ -244,7 +244,7 @@ impl Owner {
                 .get(&job)
                 .is_some_and(|state| state.running)
             || self
-                .pending_name_inspections
+                .pending_file_inspections
                 .get(&job)
                 .is_some_and(|count| *count > 0)
             || before.files.iter().any(|file| {

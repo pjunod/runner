@@ -1010,10 +1010,11 @@ pub(crate) enum EngineMsg {
         job: JobId,
         generation: u64,
     },
-    ScopedNameInspected {
+    ScopedFileInspected {
         job: JobId,
         generation: u64,
         name: Option<String>,
+        archive: Option<crate::archive_probe::ArchiveVerdict>,
     },
     PersistenceFinished {
         revision: u64,
@@ -1216,7 +1217,17 @@ pub(crate) struct Owner {
     /// A terminal event must not overtake them: history and post-processing
     /// consume that event immediately and would otherwise preserve the
     /// requestor placeholder even when the par2 answer was milliseconds away.
-    pending_name_inspections: HashMap<JobId, u32>,
+    pending_file_inspections: HashMap<JobId, u32>,
+    /// Post-processing's judge of finished archive volumes
+    /// (`crate::archive_probe`); `None` when nothing unpacks these jobs.
+    pub(crate) archive_probe: Option<Arc<dyn crate::archive_probe::ArchiveProbe>>,
+    /// Jobs whose encrypted archive a known password opens (or that a
+    /// first volume cannot judge): later volumes are not asked about.
+    archives_judged: HashSet<JobId>,
+    /// Cancels a job's in-flight finished-file inspections (a running
+    /// extractor) when the job is disposed of or removed; a child of the
+    /// engine's own token. Lives while `pending_file_inspections` does.
+    inspection_cancels: HashMap<JobId, CancellationToken>,
     file_sizes: HashMap<FileId, u64>,
     /// Jobs whose bytes did not survive the trip to disk, and why.
     ///
@@ -1813,7 +1824,10 @@ impl Owner {
             allocated_jobs,
             finalize_sent: HashSet::new(),
             pending_finalize: Vec::new(),
-            pending_name_inspections: HashMap::new(),
+            pending_file_inspections: HashMap::new(),
+            archive_probe: None,
+            archives_judged: HashSet::new(),
+            inspection_cancels: HashMap::new(),
             file_sizes,
             write_failures: HashMap::new(),
             delegated: HashMap::new(),
@@ -2018,7 +2032,7 @@ impl Owner {
                 && workers_stopped
                 && callbacks_drained
                 && self.verification_roots.is_empty()
-                && self.pending_name_inspections.is_empty()
+                && self.pending_file_inspections.is_empty()
             {
                 break;
             }
@@ -2169,23 +2183,18 @@ impl Owner {
                 self.start_verifications();
                 self.bump_epoch();
             }
-            EngineMsg::ScopedNameInspected {
+            EngineMsg::ScopedFileInspected {
                 job,
                 generation,
                 name,
+                archive,
             } => {
                 if self.job_epochs.get(&job) == Some(&generation)
                     && !self.verification.contains_key(&job)
                 {
-                    self.on_job_name_inspected(job, name);
+                    self.on_file_inspected(job, name, archive);
                 } else {
-                    match self.pending_name_inspections.get_mut(&job) {
-                        Some(count) if *count > 1 => *count -= 1,
-                        Some(_) => {
-                            self.pending_name_inspections.remove(&job);
-                        }
-                        None => {}
-                    }
+                    self.file_inspection_answered(job);
                 }
                 self.drain_replacements();
             }
@@ -2532,7 +2541,7 @@ impl Owner {
         }
         if let Some(job) = replacement {
             let busy = self
-                .pending_name_inspections
+                .pending_file_inspections
                 .get(&job)
                 .is_some_and(|count| *count > 0)
                 || self.retiring_writers.contains_key(&job)
@@ -6303,7 +6312,11 @@ impl Owner {
             self.file_sizes.remove(&file.id);
             self.finalize_sent.remove(&file.id);
         }
-        self.pending_name_inspections.remove(&job);
+        self.pending_file_inspections.remove(&job);
+        self.archives_judged.remove(&job);
+        if let Some(token) = self.inspection_cancels.remove(&job) {
+            token.cancel();
+        }
         self.allocated_jobs.remove(&job);
         self.allocation_cache.remove(&job);
         self.pending_finalize
@@ -7274,52 +7287,90 @@ impl Owner {
     /// End an unviable download through the durable failure path immediately.
     /// Pending-only exhaustion leaves leased retries and paused PAR files alive.
     fn maybe_abort_unhealthy(&mut self, job_id: JobId) {
-        if !self.tuning.health_abort
-            || self.terminals_in_flight.contains(&job_id)
-            || self.deferred_terminals.contains_key(&job_id)
-        {
+        if !self.tuning.health_abort {
             return;
         }
-        let Some(job) = self.state.job(job_id) else {
+        let Some(job) = self.download_ending_early(job_id) else {
             return;
         };
-        if !matches!(
-            job.status,
-            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused | JobStatus::Held
-        ) || open_post_stage(job).is_some()
-            || job.control().is_some_and(|control| control.post_side())
-            || job
-                .params
-                .iter()
-                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM)
-        {
-            return;
-        }
         let health = Health::calc(&job.totals);
         let critical = Health::calc_critical(&job.totals, true);
         if health.0 >= critical.0 {
             return;
         }
-        let name = job.name.clone();
-        // Stop producers and fence their late acknowledgements before disposal.
-        self.retire_job_writers(job_id);
-        self.attempts.retain(|r, _| r.job != job_id);
-        self.fail_job_terminal_then(
+        self.end_download_early(
             job_id,
             nzbd_types::FailureReason::Health,
-            None,
             "health",
             &format!(
                 "download health {} below critical health {}",
                 health.0, critical.0
             ),
+        );
+    }
+
+    /// End a download whose first archive volume is encrypted against
+    /// every known password (`crate::archive_probe`): the terminal unpack
+    /// would reach, `failed/unpack`, now instead of after the rest.
+    fn abort_locked_archive(&mut self, job_id: JobId, message: &str) {
+        if self.download_ending_early(job_id).is_none() {
+            return; // already post-side or terminal: unpack judges it
+        }
+        self.end_download_early(job_id, nzbd_types::FailureReason::Unpack, "unpack", message);
+    }
+
+    /// The job, while its download may still be ended early: not terminal
+    /// or ending, and not yet handed to post-processing.
+    fn download_ending_early(&self, job_id: JobId) -> Option<&Job> {
+        if self.terminals_in_flight.contains(&job_id)
+            || self.deferred_terminals.contains_key(&job_id)
+        {
+            return None;
+        }
+        let job = self.state.job(job_id)?;
+        let downloading = matches!(
+            job.status,
+            JobStatus::Queued | JobStatus::Downloading | JobStatus::Paused | JobStatus::Held
+        ) && open_post_stage(job).is_none()
+            && !job.control().is_some_and(|control| control.post_side())
+            && !job
+                .params
+                .iter()
+                .any(|(key, _)| key == nzbd_types::PP_DONE_PARAM);
+        downloading.then_some(job)
+    }
+
+    /// End an unviable download through the durable failure path now:
+    /// writers retired, outstanding article attempts dropped (their
+    /// connections go back to the pool), terminal recorded.
+    fn end_download_early(
+        &mut self,
+        job_id: JobId,
+        reason: nzbd_types::FailureReason,
+        stage: &str,
+        message: &str,
+    ) {
+        let Some(job) = self.state.job(job_id) else {
+            return;
+        };
+        let name = job.name.clone();
+        let health = Health::calc(&job.totals).0;
+        // Stop producers and fence their late acknowledgements before disposal.
+        self.retire_job_writers(job_id);
+        self.attempts.retain(|r, _| r.job != job_id);
+        self.fail_job_terminal_then(
+            job_id,
+            reason,
+            None,
+            stage,
+            message,
             Box::new(move |owner, row| {
                 if row.is_some() {
                     owner.emit(Event::JobFinished {
                         job: job_id,
                         name,
                         status: JobStatus::Failed,
-                        health: health.0,
+                        health,
                     });
                 }
             }),
@@ -8163,10 +8214,10 @@ impl Owner {
         self.space_op_succeeded(&crate::space_probe::SpaceOp::Finalize { job, file });
         tracing::info!(job = job.0, file = file.0, %filename, ok, path = ?final_path, "file finished");
         // A completed file may be the recovery index that knows what this
-        // whole job actually is. Only worth asking when the job still has
-        // no real name.
+        // whole job actually is, or the first volume of an encrypted
+        // archive that decides the whole job's fate.
         if let Some(path) = final_path.clone() {
-            self.maybe_learn_name_from(job, path);
+            self.inspect_finished_file(job, file, path);
         }
         self.emit(Event::FileFinished {
             job,
@@ -8178,69 +8229,141 @@ impl Owner {
         self.check_job_complete(job);
     }
 
-    /// Ask a just-completed file whether it is a par2 index, and if so
-    /// whether it names the job.
+    /// Ask a just-completed file the questions only its bytes answer:
     ///
-    /// This is the "as soon as possible" half of naming an obfuscated
-    /// post. The evidence exists from the moment the recovery index lands
-    /// — for the 4.8 GiB job #182 that was **one minute** into the
-    /// download — and waiting for post-processing to discover it means the
-    /// queue shows a 40-character hash for the entire hour it runs.
+    /// * Is it a par2 index, and does it name the job? This is the "as soon
+    ///   as possible" half of naming an obfuscated post. The evidence
+    ///   exists from the moment the recovery index lands — for the 4.8 GiB
+    ///   job #182 that was **one minute** into the download — and waiting
+    ///   for post-processing to discover it means the queue shows a
+    ///   40-character hash for the entire hour it runs. Only asked while
+    ///   the job has no real name.
+    /// * Is it the first volume of an encrypted archive no known password
+    ///   opens (`crate::archive_probe`)? Unpack would end the job
+    ///   `failed/unpack` on exactly this evidence, so the rest of the
+    ///   download is waste. Only asked about a file whose every segment
+    ///   landed intact — damage must stay par2's to repair, never read as
+    ///   a wrong password — and until one archive in the job is judged.
     ///
     /// Content-sniffed, never extension-matched: an obfuscated post hides
-    /// its par2 files exactly like everything else (#182's index arrived
-    /// as `LKKp171CWZ3IrtvUyiLuNWIqWtos`), so `is_par2` — which is a guess
-    /// off the NZB subject — is `false` for precisely the files this needs
-    /// to read. The read happens on a blocking thread: the owner loop is
-    /// the single writer for the whole queue and must never sit on a
-    /// network mount's I/O.
-    fn maybe_learn_name_from(&mut self, job: JobId, path: PathBuf) {
+    /// its par2 files and archive volumes exactly like everything else
+    /// (#182's index arrived as `LKKp171CWZ3IrtvUyiLuNWIqWtos`), so
+    /// `is_par2` — which is a guess off the NZB subject — is `false` for
+    /// precisely the files this needs to read. The read happens on a
+    /// blocking thread, under the job's terminal-use guard: the owner loop
+    /// is the single writer for the whole queue and must never sit on a
+    /// network mount's I/O or an extractor.
+    fn inspect_finished_file(&mut self, job: JobId, file: FileId, path: PathBuf) {
         let Some(j) = self.state.job(job) else { return };
-        if !crate::queue::name_is_open(j) {
-            return; // already named by something real
+        let learn_name = crate::queue::name_is_open(j);
+        let intact = j.files.iter().any(|entry| {
+            entry.id == file
+                && !entry.segments.is_empty()
+                && entry
+                    .segments
+                    .iter()
+                    .all(|segment| matches!(segment.state, SegmentState::Done { .. }))
+        });
+        let archive = self
+            .archive_probe
+            .clone()
+            .filter(|_| intact && !self.archives_judged.contains(&job))
+            .map(|probe| {
+                let context = crate::archive_probe::ArchiveProbeJob {
+                    job,
+                    category: j.category.clone(),
+                    passwords: j
+                        .params
+                        .iter()
+                        .filter(|(key, _)| key == crate::queue::UNPACK_PASSWORD_PARAM)
+                        .map(|(_, value)| value.clone())
+                        .filter(|value| !value.is_empty())
+                        .collect(),
+                };
+                (probe, context)
+            });
+        if !learn_name && archive.is_none() {
+            return;
         }
-        *self.pending_name_inspections.entry(job).or_default() += 1;
+        *self.pending_file_inspections.entry(job).or_default() += 1;
         let tx = self.engine_tx.clone();
         let generation = *self.job_epochs.entry(job).or_insert_with(fresh_epoch);
         let inventory = self.artifacts.clone();
-        let cancellation = self.cancel.clone();
+        let engine_cancel = &self.cancel;
+        let cancellation = self
+            .inspection_cancels
+            .entry(job)
+            .or_insert_with(|| engine_cancel.child_token())
+            .clone();
         self.tracker.spawn_blocking(move || {
             let checkpoint = || {
                 if cancellation.is_cancelled() {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
-                        "name inspection cancelled",
+                        "file inspection cancelled",
                     ))
                 } else {
                     Ok(())
                 }
             };
             let guard = inventory.acquire_terminal_use(job.0, &checkpoint);
-            let name = match guard {
-                Ok(Some(_guard)) if checkpoint().is_ok() => read_par2_name(&path),
-                _ => None,
+            let (name, archive) = match guard {
+                Ok(Some(_guard)) if checkpoint().is_ok() => (
+                    learn_name.then(|| read_par2_name(&path)).flatten(),
+                    archive.map(|(probe, context)| probe.probe(&path, &context, &cancellation)),
+                ),
+                _ => (None, None),
             };
             // This runs on the blocking pool, so waiting for channel room
             // cannot stall the queue owner. Every inspection must answer,
             // including a negative one, or completion could wait forever.
-            let _ = tx.blocking_send(EngineMsg::ScopedNameInspected {
+            let _ = tx.blocking_send(EngineMsg::ScopedFileInspected {
                 job,
                 generation,
                 name,
+                archive,
             });
         });
     }
 
-    fn on_job_name_inspected(&mut self, job: JobId, name: Option<String>) {
-        match self.pending_name_inspections.get_mut(&job) {
+    /// One finished-file inspection of `job` answered (or was discarded).
+    fn file_inspection_answered(&mut self, job: JobId) {
+        match self.pending_file_inspections.get_mut(&job) {
             Some(pending) if *pending > 1 => *pending -= 1,
             Some(_) => {
-                self.pending_name_inspections.remove(&job);
+                self.pending_file_inspections.remove(&job);
+                self.inspection_cancels.remove(&job);
             }
             None => {}
         }
+    }
+
+    /// Stop `job`'s in-flight inspections early (they still answer).
+    pub(super) fn cancel_file_inspections(&self, job: JobId) {
+        if let Some(token) = self.inspection_cancels.get(&job) {
+            token.cancel();
+        }
+    }
+
+    fn on_file_inspected(
+        &mut self,
+        job: JobId,
+        name: Option<String>,
+        archive: Option<crate::archive_probe::ArchiveVerdict>,
+    ) {
+        self.file_inspection_answered(job);
         if let Some(name) = name {
             self.adopt_learned_name(job, name);
+        }
+        match archive {
+            Some(crate::archive_probe::ArchiveVerdict::Opens) => {
+                self.archives_judged.insert(job);
+            }
+            Some(crate::archive_probe::ArchiveVerdict::Locked(message)) => {
+                self.archives_judged.insert(job);
+                self.abort_locked_archive(job, &message);
+            }
+            Some(crate::archive_probe::ArchiveVerdict::Plain) | None => {}
         }
         // The last writer may already have finalized while this blocking
         // read was in flight. Re-evaluate now that it can no longer be
@@ -8320,7 +8443,7 @@ impl Owner {
             return; // completes via the executor's report, not locally
         }
         if self
-            .pending_name_inspections
+            .pending_file_inspections
             .get(&job_id)
             .is_some_and(|pending| *pending > 0)
         {
@@ -9038,7 +9161,7 @@ impl Owner {
                 QueueCommand::AdoptReplicatedAuthority { .. } | QueueCommand::AdoptAuthority { .. }
             ) {
                 let busy = self.state.jobs.iter().any(|job| {
-                    self.pending_name_inspections
+                    self.pending_file_inspections
                         .get(&job.id)
                         .is_some_and(|count| *count > 0)
                         || self.retiring_writers.contains_key(&job.id)
@@ -9077,7 +9200,7 @@ impl Owner {
                 }
             };
             if self
-                .pending_name_inspections
+                .pending_file_inspections
                 .get(&job)
                 .is_some_and(|count| *count > 0)
                 || self.retiring_writers.contains_key(&job)
