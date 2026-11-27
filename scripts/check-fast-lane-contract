@@ -2,11 +2,52 @@
 set -euo pipefail
 
 lane=.github/workflows/main-fast-lane.yml
-grep -Fq 'ready_for_review' "$lane"
-grep -Fq 'converted_to_draft' "$lane"
-grep -Fq 'github.event.pull_request.draft == false' "$lane"
+supply=.github/workflows/supply-chain.yml
 grep -Fq 'cancel-in-progress: true' "$lane"
 grep -Fq 'name: Main promotion gate' "$lane"
+
+# Print one job's body from a workflow file.
+job_body() {
+  awk -v job="  $2:" '$0 == job { in_job = 1; next }
+       in_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+       in_job { print }' "$1"
+}
+
+# Required checks fail closed (PR #362). GitHub counts a skipped required
+# check as passing, and the event payload's draft flag is a stale snapshot,
+# so no required job may skip on it. Each one instead runs
+# scripts/ci-merge-candidate, which fails unless the live PR is ready.
+for workflow in "$lane" "$supply"; do
+  grep -Fq 'ready_for_review' "$workflow"
+  grep -Fq 'converted_to_draft' "$workflow"
+  if grep -v '^ *#' "$workflow" | grep -Eq 'pull_request(\.draft|\[)'; then
+    echo "$workflow must read the live draft state, not the event payload" >&2
+    exit 1
+  fi
+done
+grep -Eq '^  pull-requests: read$' "$supply"
+grep -Fq '      pull-requests: read' <<<"$(job_body "$lane" scope)"
+# A guarded job may not skip itself (if), soften its result
+# (continue-on-error), or skip through a dependency (needs).
+for spec in "$lane:scope" "$supply:reviewed-exceptions" "$supply:policy" "$supply:advisories"; do
+  body="$(job_body "${spec%%:*}" "${spec#*:}")"
+  if [[ -z "$body" ]] || grep -Eq '^    (if|continue-on-error|needs):' <<<"$body"; then
+    echo "${spec} must exist and must never skip or soft-fail" >&2
+    exit 1
+  fi
+  grep -Fq 'run: scripts/ci-merge-candidate' <<<"$body"
+  grep -Fq 'PR_NUMBER: ${{ github.event.pull_request.number }}' <<<"$body"
+done
+# The gate always reports and needs every lane, so a failed or skipped scope
+# (a draft) or a cancelled lane fails it. Its check step runs unconditionally.
+gate="$(job_body "$lane" gate)"
+grep -Fxq '    if: always()' <<<"$gate"
+grep -Fxq '    needs: [scope, preflight, rust, mobile]' <<<"$gate"
+grep -Fq '*) echo "Selected lane ended with: $result"; exit 1 ;;' <<<"$gate"
+if grep -Eq '^      +(if|continue-on-error):' <<<"$gate"; then
+  echo "the promotion gate's check must run unconditionally and block" >&2
+  exit 1
+fi
 
 for workflow in lint.yml coverage.yml; do
   grep -A2 '^on:' ".github/workflows/$workflow" | grep -Fq 'workflow_dispatch:'
@@ -26,15 +67,10 @@ if grep -Eq '^  pull_request:' .github/workflows/bittorrent-m0.yml; then
 fi
 grep -Fq 'workflow_dispatch:' .github/workflows/bittorrent-fuzz.yml
 grep -Fq 'schedule:' .github/workflows/bittorrent-fuzz.yml
-test "$(grep -c "github.event.pull_request.draft == false" .github/workflows/supply-chain.yml)" -eq 3
 # The fuzz campaigns stay off pull requests, so the required supply-chain job
 # must keep the derived fuzz lock in step with the product lock.
 # Anchor the step inside that required job and keep it blocking.
-reviewed_exceptions_job="$(
-  awk '/^  reviewed-exceptions:$/ { in_job = 1; next }
-       in_job && /^  [A-Za-z0-9_-]+:$/ { exit }
-       in_job { print }' .github/workflows/supply-chain.yml
-)"
+reviewed_exceptions_job="$(job_body "$supply" reviewed-exceptions)"
 grep -Fq 'run: make fuzz-deps' <<<"$reviewed_exceptions_job"
 if grep -Eq 'continue-on-error|^ +if: *(\$\{\{ *)?false *(\}\})? *$' <<<"$reviewed_exceptions_job"; then
   echo "the reviewed dependency exceptions job must stay blocking" >&2
